@@ -94,15 +94,16 @@ python -m s2s.prep.hotel_data $CFG --train 4000 --eval 200
 python -m s2s.eval.text_tools $CFG --manifest data/manifests/hotel_eval_text.jsonl
 ```
 
-Measured here on CPU (40 template examples, default system prompt, **before any training**):
+Measured on CPU with the default system prompt, **before any training**, on the same 20 template
+examples (small sample, so treat these as rough):
 
-| thinker | overall | answers from reservation context | tool calls |
-|---|---|---|---|
-| Qwen3-0.6B | 32.5 % | 8/9 | 5/31 |
-| Qwen3-1.7B | see step 2 result in the PR/commit notes, or run it | | |
+| thinker | correct | typical misses |
+|---|---|---|
+| Qwen3-0.6B | 6/20 (30 %) | mostly doesn't call tools; replies "I can't…" or invents facts |
+| Qwen3-1.7B | 16/20 (80 %) | wrong argument values (`"water"` vs `"bottle of water"`, category `other`), one refusal, one wrong fact from context |
 
-So the base models do **not** call tools reliably. Stage 3 (LoRA on spoken tool requests) is
-required, not optional. Re-run this eval with `--lora-dir checkpoints/speech_llm_tools/lora` after
+So 0.6B is not usable for tools without training, and 1.7B is close but still wrong on argument
+values. Stage 3 (LoRA on spoken tool requests) is required, not optional. Re-run this eval with `--lora-dir checkpoints/speech_llm_tools/lora` after
 stage 3.
 
 ### Step 3: behaviour-alignment targets
