@@ -1,0 +1,134 @@
+# Full V0.1 configuration: Qwen3-1.7B thinker, full-size talker.
+# Every script accepts `--config <file>` and `--set key.sub=value` overrides.
+
+paths:
+  data_dir: data            # manifests, audio, extracted features
+  ckpt_dir: checkpoints     # all trained weights
+
+device: auto                # auto | cuda | cpu
+seed: 1234
+
+codec:
+  model: kyutai/mimi        # Hugging Face id or local path
+  num_codebooks: 8          # Mimi codebooks used for speech OUTPUT (Moshi uses 8)
+  extract_batch_size: 16
+  trailing_silence_s: 0.64  # silence appended to every input utterance at extraction (8 frames)
+
+thinker:
+  model: Qwen/Qwen3-1.7B
+  dtype: auto               # auto -> bf16 if the GPU supports it, else fp16 (T4/P100)
+  attn_implementation: sdpa
+  gradient_checkpointing: true
+  lora:
+    r: 16
+    alpha: 32
+    dropout: 0.05
+    target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  system_prompt: >-
+    You are a friendly hotel voice assistant and you are speaking out loud. When the
+    guest asks for an item, reports a problem, asks about hotel facilities or wants a
+    wake-up call, you MUST call the matching tool; never guess hotel facts. Answer
+    questions about the guest's own reservation directly from the reservation details.
+    Reply in plain conversational English, usually one or two short sentences, with
+    no markdown, lists or emojis.
+  transcribe_instruction: "Transcribe the audio exactly."
+
+adapter:
+  d_model: 1024
+  n_layers: 4
+  n_heads: 16
+  ff_mult: 4
+  dropout: 0.1
+  ctc_upsample: 4           # 12.5 Hz frames -> 50 Hz CTC outputs (chars need > 12.5 Hz)
+  max_frames: 750           # 60 s of speech
+
+talker:
+  d_model: 1024
+  n_layers: 12
+  n_heads: 16
+  ff_mult: 4
+  dropout: 0.1
+  depth_d_model: 512
+  depth_layers: 6
+  depth_heads: 8
+  hidden_layers: [0.5, 0.75, 1.0]   # fractions of thinker depth fused into the talker input
+  first_text_chunk: 8               # text tokens fed before the first audio frame
+  text_chunk: 4                     # then N text tokens ...
+  audio_chunk: 10                   # ... per M audio frames (10 frames = 0.8 s)
+  acoustic_delay: 1                 # codebooks 2..8 lag codebook 1 by this many frames
+  semantic_loss_weight: 1.0
+  max_frames: 500                   # 40 s max generated audio
+  talker_prompt_user: "Please answer."
+
+train_probe:
+  d_model: 512
+  n_layers: 2
+  n_heads: 8
+  batch_size: 32
+  lr: 5.0e-4
+  max_steps: 3000
+  eval_every: 500
+
+train_speech_llm:
+  train_manifests:          # list of {path, weight}
+    - {path: data/manifests/librispeech_train.jsonl, weight: 1.0}
+  valid_manifest: data/manifests/librispeech_dev.jsonl
+  output_dir: checkpoints/speech_llm_align
+  init_from: null           # directory of a previous speech_llm checkpoint
+  train_lora: true
+  batch_size: 8
+  grad_accum: 2
+  adapter_lr: 3.0e-4
+  lora_lr: 1.0e-4
+  weight_decay: 0.01
+  warmup_steps: 500
+  max_steps: 20000
+  max_grad_norm: 1.0
+  transcribe_prob: 0.3      # fraction of samples trained on the transcription task
+  ctc_weight: 0.3
+  eot_weight: 0.1
+  max_trailing_frames: 8    # random 0..N trailing silence frames kept per sample
+  max_target_tokens: 160
+  eval_every: 1000
+  eval_batches: 20
+  save_every: 1000
+  log_every: 20
+  num_workers: 2
+
+train_talker:
+  train_manifests:
+    - {path: data/manifests/talker_train.jsonl, weight: 1.0}
+  valid_manifest: data/manifests/talker_valid.jsonl
+  output_dir: checkpoints/talker
+  thinker_dir: checkpoints/thinker_merged   # merged thinker (stage 3 output); falls back to thinker.model
+  init_from: null
+  batch_size: 8
+  grad_accum: 2
+  lr: 3.0e-4
+  weight_decay: 0.01
+  warmup_steps: 1000
+  max_steps: 60000
+  max_grad_norm: 1.0
+  max_frames: 375           # clips longer than 30 s are skipped
+  eval_every: 2000
+  eval_batches: 20
+  save_every: 2000
+  log_every: 20
+  num_workers: 2
+
+runtime:
+  speech_llm_dir: checkpoints/speech_llm_tools   # adapter.pt + lora/
+  talker_dir: checkpoints/talker
+  max_new_tokens: 200
+  temperature: 0.0          # thinker: 0 = greedy
+  talker_temperature: 0.8
+  talker_top_k: 250
+  decode_context_frames: 25 # left context when decoding Mimi chunks (2 s)
+  emit_every_frames: 2      # decode + emit audio every N frames (160 ms)
+  max_tool_rounds: 3
+  endpoint:
+    energy_threshold_db: -45.0
+    min_speech_ms: 240
+    min_silence_ms: 240     # earliest end-of-turn decision (needs EOT head agreement)
+    max_silence_ms: 800     # end of turn regardless of EOT head
+    eot_threshold: 0.5

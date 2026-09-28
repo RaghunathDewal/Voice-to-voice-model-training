@@ -1,0 +1,152 @@
+"""Integration tests on tiny random Qwen3 + Mimi models (CPU, ~1 min)."""
+
+from __future__ import annotations
+
+import os
+
+import numpy as np
+import pytest
+import torch
+
+from s2s.config import load_config
+from s2s.data.hotel import HOTEL_TOOLS, HotelBackend, make_reservation, reservation_context
+from s2s.models.adapter import SpeechAdapter
+from s2s.models.codec import MimiCodec, StreamingDecoder
+from s2s.models.speech_llm import assemble_inputs, talker_features, target_lm_loss
+from s2s.models.talker import Talker
+from s2s.models.thinker import Thinker
+from s2s.utils import save_json
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def test_codec_batching_and_streaming_decode(tiny_models, cpu):
+    codec = MimiCodec(tiny_models["mimi"], cpu, 8)
+    rng = np.random.default_rng(0)
+    a, b = rng.standard_normal(24000).astype(np.float32) * 0.1, rng.standard_normal(9000).astype(np.float32) * 0.1
+    batched = codec.encode_latents([a, b])
+    single = codec.encode_latents([b])[0]
+    assert batched[1].shape == single.shape == (codec.num_frames(9000), codec.latent_dim)
+    assert torch.allclose(batched[1], single, atol=1e-4)  # causal: padding does not leak
+    codes = codec.encode_codes([a])[0]
+    full = codec.decode(codes)
+    dec = StreamingDecoder(codec, context_frames=1000)
+    frames = [codes[:, i] for i in range(codes.shape[1])]
+    chunks = [dec.push(frames[i:i + 3]) for i in range(0, len(frames), 3)]
+    assert np.allclose(np.concatenate(chunks), full, atol=1e-4)
+
+
+def test_prompt_layout(tiny_models):
+    from s2s.models.thinker import PromptBuilder
+
+    pb = PromptBuilder.from_pretrained(tiny_models["qwen"])
+    pre, suf = pb.prompt_parts("SYS", HOTEL_TOOLS, None)
+    assert pb.tokenizer.decode(pre).endswith("<|im_start|>user\n")
+    assert pb.tokenizer.decode(suf) == "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    call = {"name": "order_product", "arguments": {"product": "towel", "quantity": 2}}
+    assert pb.target_text("SYS", HOTEL_TOOLS, tool_calls=[call]) == (
+        '<tool_call>\n{"name": "order_product", "arguments": {"product": "towel", "quantity": 2}}\n</tool_call><|im_end|>')
+    assert pb.tokenizer.decode(pb.tool_response_ids([{"ok": True}])).startswith("\n<|im_start|>user\n<tool_response>")
+
+
+def test_labels_align_with_targets(tiny_models, cpu):
+    th = Thinker(tiny_models["qwen"], cpu, torch.float32)
+    ad = SpeechAdapter(64, th.hidden_size, d_model=32, n_layers=1, n_heads=4)
+    speech = ad(torch.randn(2, 9, 64))["embeds"]
+    pre, suf = th.prompts.prompt_parts("SYS", None, None)
+    tgt = [th.prompts.target_ids("SYS", None, content="Hi there."), th.prompts.target_ids("SYS", None, content="Ok.")]
+    emb, mask, labels = assemble_inputs(th, ad, speech, torch.tensor([9, 5]), [pre, pre], [suf, suf], tgt)
+    for i, n in enumerate([9, 5]):
+        length = len(pre) + 1 + n + 1 + len(suf) + len(tgt[i])
+        assert int(mask[i].sum()) == length
+        assert labels[i][labels[i] != -100].tolist() == tgt[i]
+        assert labels[i, length - len(tgt[i]) - 1] == -100
+    # memory-light loss (logits only at target positions) == Hugging Face's full-sequence loss
+    reference = th.model(inputs_embeds=emb, attention_mask=mask, labels=labels).loss
+    assert torch.allclose(target_lm_loss(th, emb, mask, labels), reference, atol=1e-5)
+    # same with a LoRA-wrapped thinker
+    lora = Thinker(tiny_models["qwen"], cpu, torch.float32,
+                   new_lora={"r": 4, "alpha": 8, "dropout": 0.0, "target_modules": ["q_proj", "v_proj"]})
+    ref2 = lora.model(inputs_embeds=emb, attention_mask=mask, labels=labels).loss
+    assert torch.allclose(target_lm_loss(lora, emb, mask, labels), ref2, atol=1e-5)
+
+
+def test_talker_features_pairing(tiny_models, cpu):
+    """Feature for response token i must be the hidden state that predicted it."""
+    th = Thinker(tiny_models["qwen"], cpu, torch.float32)
+    prefix = th.prompts.text_prompt_ids("SYS", "hello")
+    resp = th.prompts.ids("Your towels are on the way.")
+    layers = th.hidden_layer_indices([0.5, 1.0])
+    toks, hids = talker_features(th, prefix, [resp, resp[:3]], layers)
+    for i in (0, 2, len(resp) - 1):
+        out = th.model(input_ids=torch.tensor([prefix + resp[:i]]), output_hidden_states=True)
+        expect = torch.stack([out.hidden_states[j][0, -1] for j in layers])
+        assert torch.allclose(hids[0][i], expect, atol=1e-4)
+    assert torch.allclose(hids[1], hids[0][:3], atol=1e-4)  # padding does not change features
+    assert torch.allclose(toks[0], th.embed(torch.tensor(resp)))
+
+
+@pytest.fixture()
+def agent(tiny_models, tmp_path, cpu):
+    th = Thinker(tiny_models["qwen"], cpu, torch.float32)
+    speech_dir, talker_dir = tmp_path / "speech", tmp_path / "talker"
+    os.makedirs(speech_dir)
+    os.makedirs(talker_dir)
+    ad = SpeechAdapter(64, th.hidden_size, d_model=32, n_layers=1, n_heads=4)
+    ad.init_scale(th.text_embedding_rms())
+    ad.save(str(speech_dir / "adapter.pt"))
+    layers = th.hidden_layer_indices([0.5, 1.0])
+    Talker(th.hidden_size, len(layers), num_codebooks=8, card=64, d_model=32, n_layers=1, n_heads=4,
+           depth_d_model=16, depth_layers=1, depth_heads=2, max_frames=30).save(str(talker_dir / "talker.pt"))
+    save_json(str(talker_dir / "meta.json"), {"thinker": tiny_models["qwen"], "layer_idx": layers})
+    cfg = load_config(os.path.join(ROOT, "configs", "default.yaml"), [
+        f"codec.model={tiny_models['mimi']}", f"thinker.model={tiny_models['qwen']}", "device=cpu"])
+    from s2s.runtime.agent import VoiceAgent
+
+    return VoiceAgent(cfg, str(speech_dir), str(talker_dir))
+
+
+def test_runtime_tool_loop_and_audio(agent, monkeypatch):
+    import s2s.runtime.agent as agent_mod
+
+    p = agent.thinker.prompts
+    call = '\n{"name": "order_product", "arguments": {"product": "towel", "quantity": 2}}\n'
+    script = (p.ids("Sure, one moment.") + [p.tool_call_start_id] + p.ids(call) + [p.tool_call_end_id, p.im_end_id]
+              + p.ids("Two towels are on the way.") + [p.im_end_id])
+    monkeypatch.setattr(agent_mod, "sample_logits", lambda *a, **k: script.pop(0) if script else p.im_end_id)
+
+    res = make_reservation()
+    backend = HotelBackend(res)
+    session = agent.new_session(context=reservation_context(res), tools=HOTEL_TOOLS, backend=backend)
+    wav = np.random.default_rng(0).standard_normal(24000).astype(np.float32) * 0.05
+    events = list(session.respond(wav))
+    kinds = [e["type"] for e in events]
+    texts = [e["text"] for e in events if e["type"] == "assistant_text"]
+    assert texts == ["Sure, one moment.", "Two towels are on the way."]
+    assert backend.orders and backend.orders[0]["quantity"] == 2
+    results = [e["result"] for e in events if e["type"] == "tool_result"]
+    assert results and results[0]["success"] is True
+    audio = [e["audio"] for e in events if e["type"] == "audio"]
+    assert audio and all(a.dtype == np.float32 for a in audio)
+    assert kinds[-2:] == ["timings", "done"]
+    assert session.past.get_seq_length() == session.n_tokens
+
+    # second turn reuses the cache
+    before = session.n_tokens
+    script.extend(p.ids("Anything else?") + [p.im_end_id])
+    list(session.respond(wav))
+    assert session.n_tokens > before and session.past.get_seq_length() == session.n_tokens
+
+
+def test_streaming_turn_matches_whole_utterance(agent):
+    rng = np.random.default_rng(1)
+    wav = np.concatenate([rng.standard_normal(24000).astype(np.float32) * 0.1, np.zeros(24000, np.float32)])
+    res = make_reservation()
+    s1 = agent.new_session(context=reservation_context(res), tools=HOTEL_TOOLS)
+    s2 = agent.new_session(context=reservation_context(res), tools=HOTEL_TOOLS)
+    turn = s1.stream_input()
+    for i in range(0, len(wav), 1000):  # odd chunk size on purpose
+        turn.feed(wav[i:i + 1000])
+    whole = s2.a.codec.encode_latents([wav[: turn.latents.shape[0] * s2.a.codec.hop]])[0]
+    assert torch.allclose(turn.latents, whole, atol=1e-4)
+    assert s1.n_tokens == len(s1.prefix_ids) + 1 + whole.shape[0]

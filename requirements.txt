@@ -1,0 +1,11 @@
+torch>=2.2
+transformers>=4.51
+peft>=0.11
+accelerate>=0.30
+numpy
+scipy
+soundfile
+pyyaml
+jiwer
+tqdm
+pytest
