@@ -16,6 +16,8 @@ import contextlib
 import os
 import time
 
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")  # forked DataLoader workers + tokenizer threads can deadlock
+
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
@@ -23,7 +25,7 @@ from torch.utils.data import DataLoader
 from s2s.audio import save_audio
 from s2s.cli_common import base_parser, config_from_args
 from s2s.config import save_config
-from s2s.dist import barrier, cleanup, init_distributed
+from s2s.dist import arm_watchdog, barrier, cleanup, disarm_watchdog, init_distributed
 from s2s.data.datasets import TalkerDataset, collate_talker, load_manifest, load_mixture, mixture_sampler
 from s2s.models.speech_llm import talker_features
 from s2s.models.talker import Talker, TalkerStream, apply_delay
@@ -164,6 +166,7 @@ def main() -> None:
 
     step, accum, running, t0 = 0, 0, {}, time.time()
     last_batch = None
+    arm_watchdog()
     for batch in train_loader:
         if batch is None:  # every item in the batch was filtered out
             if world == 1 or last_batch is None:
@@ -186,6 +189,7 @@ def main() -> None:
             g["lr"] = tc.lr * scale
         gnorm = optimizer_step(opt, scaler, params, tc.max_grad_norm)
         step += 1
+        arm_watchdog()
         if step % tc.log_every == 0:
             avg = {k: v / tc.log_every for k, v in running.items()}
             log(f"step {step} {fmt(avg)} gnorm {gnorm:.2f} lr_scale {scale:.3f} {(time.time() - t0) / step:.2f}s/step")
@@ -210,6 +214,7 @@ def main() -> None:
             barrier()
         if step >= tc.max_steps:
             break
+    disarm_watchdog()
     cleanup()
 
 

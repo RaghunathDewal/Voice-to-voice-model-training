@@ -60,6 +60,24 @@ def mean_across_ranks(value: float, device: torch.device) -> float:
     return float(t.item()) / dist.get_world_size()
 
 
+def arm_watchdog(seconds: float | None = None) -> None:
+    """(Re)start a hang detector: if not re-armed within `seconds`, every thread's
+    Python stack is printed to stderr (the process keeps running). Call once per
+    training step. S2S_WATCHDOG_S sets the timeout (default 600 s, 0 disables)."""
+    import faulthandler
+
+    seconds = float(os.environ.get("S2S_WATCHDOG_S", "600")) if seconds is None else seconds
+    faulthandler.cancel_dump_traceback_later()
+    if seconds > 0:
+        faulthandler.dump_traceback_later(seconds, repeat=True, exit=False)
+
+
+def disarm_watchdog() -> None:
+    import faulthandler
+
+    faulthandler.cancel_dump_traceback_later()
+
+
 # --------------------------------------------------------- sharded workers
 def gpu_count() -> int:
     return torch.cuda.device_count() if torch.cuda.is_available() else 0

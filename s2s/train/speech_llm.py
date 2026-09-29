@@ -15,10 +15,11 @@ Checkpoint directory layout: adapter.pt, lora/ (PEFT), config.yaml, state.json
 
 from __future__ import annotations
 
+import contextlib
 import os
 import time
 
-import contextlib
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")  # forked DataLoader workers + tokenizer threads can deadlock
 
 import numpy as np
 import torch
@@ -27,7 +28,7 @@ from torch.utils.data import DataLoader
 
 from s2s.cli_common import base_parser, config_from_args
 from s2s.config import save_config
-from s2s.dist import barrier, cleanup, init_distributed
+from s2s.dist import arm_watchdog, barrier, cleanup, disarm_watchdog, init_distributed
 from s2s.data.datasets import SpeechLLMDataset, collate_speech_llm, load_manifest, load_mixture, mixture_sampler
 from s2s.models.adapter import SpeechAdapter
 from s2s.models.speech_llm import assemble_inputs, greedy_generate, speech_llm_losses
@@ -173,6 +174,7 @@ def main() -> None:
     step, accum = 0, 0
     t0 = time.time()
     running: dict[str, float] = {}
+    arm_watchdog()
     for batch in train_loader:
         last_micro = accum + 1 == grad_accum
         sync = model.no_sync() if (world > 1 and not last_micro) else contextlib.nullcontext()
@@ -191,6 +193,7 @@ def main() -> None:
             g["lr"] = g["base_lr"] * scale
         gnorm = optimizer_step(opt, scaler, adapter_params + lora_params, tc.max_grad_norm)
         step += 1
+        arm_watchdog()
         if step % tc.log_every == 0:
             avg = {k: v / tc.log_every for k, v in running.items()}
             log(f"step {step} {fmt(avg)} gnorm {gnorm:.2f} lr_scale {scale:.3f} {(time.time() - t0) / step:.2f}s/step")
@@ -208,6 +211,7 @@ def main() -> None:
             barrier()
         if step >= tc.max_steps:
             break
+    disarm_watchdog()
     cleanup()
 
 
