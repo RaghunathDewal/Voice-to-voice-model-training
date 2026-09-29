@@ -29,6 +29,7 @@ def main() -> None:
     cfg = config_from_args(args)
     root = os.path.join(cfg.paths.data_dir, "ljspeech")
     manifests = os.path.join(cfg.paths.data_dir, "manifests")
+    os.makedirs(manifests, exist_ok=True)
     corpus = os.path.join(root, "LJSpeech-1.1")
     if not os.path.isdir(corpus):
         archive = os.path.join(root, "LJSpeech-1.1.tar.bz2")

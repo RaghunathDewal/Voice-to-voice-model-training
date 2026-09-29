@@ -32,6 +32,7 @@ def main() -> None:
     cfg = config_from_args(args)
     root = os.path.join(cfg.paths.data_dir, "librispeech")
     manifests = os.path.join(cfg.paths.data_dir, "manifests")
+    os.makedirs(manifests, exist_ok=True)  # relative "../" paths below need it to exist
 
     by_split: dict[str, list[dict]] = {}
     for subset in args.subsets:
@@ -56,7 +57,7 @@ def main() -> None:
         if args.max_utts:
             rows = rows[: args.max_utts]
         for r in rows[:1]:
-            info = sf.info(os.path.join(manifests, r["audio"]))
+            info = sf.info(os.path.normpath(os.path.join(manifests, r["audio"])))
             print(f"[{split}] sample {r['id']}: {info.samplerate} Hz, {info.duration:.1f}s")
         out = os.path.join(manifests, f"librispeech_{split}_raw.jsonl")
         n = write_jsonl(out, rows)
