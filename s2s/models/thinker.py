@@ -59,6 +59,34 @@ def ignore_incompatible_torchao() -> None:
         pass
 
 
+def skip_peft_tp_sharding_without_tp() -> None:
+    """Let PEFT load a saved LoRA under torch.distributed (DDP) with transformers 5.0.
+
+    When a process group is initialised, PEFT (0.19) calls
+    `_maybe_shard_state_dict_for_tp`, which first imports `EmbeddingParallel`
+    from transformers - a name that transformers 5.0.0 does not have - and only
+    then skips every layer that is not tensor-parallel. This project never uses
+    tensor parallelism, so the function is skipped when no layer carries a TP
+    plan / device mesh; otherwise PEFT's original function runs unchanged.
+    """
+    try:
+        from peft.utils import save_and_load
+    except ImportError:
+        return
+    original = getattr(save_and_load, "_maybe_shard_state_dict_for_tp", None)
+    if original is None or getattr(original, "_s2s_wrapped", False):
+        return
+
+    def maybe_shard(model, state_dict, adapter_name):
+        if not any(getattr(m, "_hf_tp_plan", None) is not None and getattr(m, "_hf_device_mesh", None) is not None
+                   for m in model.modules()):
+            return None  # not tensor-parallel: PEFT's function would change nothing
+        return original(model, state_dict, adapter_name)
+
+    maybe_shard._s2s_wrapped = True
+    save_and_load._maybe_shard_state_dict_for_tp = maybe_shard
+
+
 def load_causal_lm(name_or_path: str, dtype: torch.dtype, device: torch.device, attn_implementation: str = "sdpa"):
     from transformers import AutoModelForCausalLM
 
@@ -84,6 +112,7 @@ class Thinker:
             p.requires_grad_(False)
         if lora_dir or new_lora:
             ignore_incompatible_torchao()
+            skip_peft_tp_sharding_without_tp()
         if lora_dir:
             from peft import PeftModel
 

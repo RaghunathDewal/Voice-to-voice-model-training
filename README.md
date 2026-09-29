@@ -156,6 +156,19 @@ torchrun --standalone --nproc_per_node=$NGPU -m s2s.train.speech_llm $CFG --set 
   train_speech_llm.max_steps=4000 train_speech_llm.warmup_steps=200
 ```
 
+**In a notebook**, don't write this command with `$CFG`/`$NGPU`: the `{path: …}` braces make Jupyter
+skip all `$` substitution, so `--nproc_per_node` ends up empty. Build it as a Python string and
+run it with `!{cmd}`:
+```python
+cmd = (f"torchrun --standalone --nproc_per_node={NGPU} -m s2s.train.speech_llm {CFG} --set "
+       "train_speech_llm.init_from=checkpoints/speech_llm_align train_speech_llm.output_dir=checkpoints/speech_llm_tools "
+       "'train_speech_llm.train_manifests=[{path: data/manifests/hotel_train.jsonl, weight: 0.5}, "
+       "{path: data/manifests/librispeech_train.jsonl, weight: 0.5}]' "
+       "train_speech_llm.valid_manifest=data/manifests/hotel_eval.jsonl train_speech_llm.max_steps=4000 "
+       "train_speech_llm.warmup_steps=200")
+!{cmd}
+```
+
 The eval voices differ from the training voices, so the eval checks speaker generalisation.
 Voice names are from Kokoro-82M's voice list (checked). The first Kokoro run also downloads a
 small spaCy English model.
