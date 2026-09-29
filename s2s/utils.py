@@ -21,11 +21,17 @@ def resolve_device(name: str = "auto") -> torch.device:
 
 
 def resolve_dtype(name: str, device: torch.device) -> torch.dtype:
-    """`auto` -> bf16 on GPUs that support it, fp16 on older GPUs (T4, P100), fp32 on CPU."""
+    """`auto` -> bf16 on GPUs with native bf16 (compute capability >= 8.0: A100, L4, RTX 30xx+),
+    fp16 on older GPUs (T4, P100, V100), fp32 on CPU.
+
+    torch.cuda.is_bf16_supported() also returns True when bf16 is only *emulated*
+    (e.g. on a T4), which is much slower, so the hardware generation is checked instead.
+    """
     if name == "auto":
         if device.type != "cuda":
             return torch.float32
-        return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        major, _ = torch.cuda.get_device_capability(device)
+        return torch.bfloat16 if major >= 8 else torch.float16
     return {"bf16": torch.bfloat16, "bfloat16": torch.bfloat16, "fp16": torch.float16,
             "float16": torch.float16, "fp32": torch.float32, "float32": torch.float32}[name]
 
