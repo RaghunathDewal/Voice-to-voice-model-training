@@ -27,6 +27,38 @@ def _dtype_kwargs(dtype: torch.dtype) -> dict:
     return {"torch_dtype": dtype}
 
 
+def ignore_incompatible_torchao() -> None:
+    """Let PEFT create LoRA layers when an old torchao is installed.
+
+    Recent PEFT raises ImportError while building *any* LoRA layer if torchao is
+    installed but older than it supports (Kaggle images ship torchao 0.10). This
+    project never uses torchao-quantised weights, so in that case PEFT is told
+    torchao is unavailable. A compatible or absent torchao is left alone.
+    """
+    import sys
+
+    import peft  # noqa: F401  (loads peft.import_utils)
+    from peft import import_utils
+
+    check = getattr(import_utils, "is_torchao_available", None)
+    if check is None:
+        return
+    try:
+        check()
+        return
+    except ImportError:
+        pass
+    for name, module in list(sys.modules.items()):
+        if (name == "peft" or name.startswith("peft.")) and getattr(module, "is_torchao_available", None) is check:
+            module.is_torchao_available = lambda: False
+    try:  # modules imported later bind the patched name from import_utils
+        import peft.tuners.lora.torchao as lora_torchao
+
+        lora_torchao.is_torchao_available = lambda: False
+    except ImportError:
+        pass
+
+
 def load_causal_lm(name_or_path: str, dtype: torch.dtype, device: torch.device, attn_implementation: str = "sdpa"):
     from transformers import AutoModelForCausalLM
 
@@ -50,6 +82,8 @@ class Thinker:
         model = load_causal_lm(model_name, dtype, device, attn_implementation)
         for p in model.parameters():
             p.requires_grad_(False)
+        if lora_dir or new_lora:
+            ignore_incompatible_torchao()
         if lora_dir:
             from peft import PeftModel
 

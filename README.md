@@ -248,6 +248,9 @@ tests/              pytest suite (CPU)
   (same for `train_talker`). Gradient checkpointing is already on for the thinker, and the LM loss
   only computes logits at target positions. GPU memory use has **not** been measured on a T4 yet,
   so the default batch sizes are a starting point.
+* **`ImportError: Found an incompatible version of torchao`** (Kaggle ships torchao 0.10 next to
+  a newer PEFT): handled automatically since this project doesn't use torchao. If you still see it
+  from your own code, `pip uninstall -y torchao`.
 * **OpenSLR download slow or failing**: `--mirror https://us.openslr.org/resources/12`.
 * **Talker samples silent or endless**: check `acc per codebook` in the logs. Codebook 1 accuracy
   must rise first. Endless outputs hit `talker.max_frames` and are counted by experiment 4.
