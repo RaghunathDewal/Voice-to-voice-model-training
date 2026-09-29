@@ -35,8 +35,20 @@ states. Design details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | Session limit | ~12 h per session, weekly GPU quota | varies, can disconnect |
 | Keep outputs in | `/kaggle/working` (saved with the notebook version, space-limited) | Google Drive |
 
-The scripts use one GPU. Training stages save checkpoints regularly; if a session dies, restart the
-stage with `--set train_...init_from=<last checkpoint dir>`.
+**Both GPUs are used** (Kaggle T4 ×2):
+* data prep (`extract_mimi`, `distill`) starts one worker per visible GPU automatically. Use
+  `--gpus 1` to use a single GPU.
+* training stages 2–4 run with PyTorch DDP through `torchrun --nproc_per_node=$NGPU`. With 2 GPUs,
+  `grad_accum` is halved, so the effective batch (and the results) stay the same and each stage
+  finishes in about half the time. Checkpoints, evaluation and samples are written by GPU 0 only.
+* the CTC probe, the evals and the runtime use one GPU. They are short.
+
+Set `NGPU` once per session: `NGPU=2` on Kaggle T4 ×2, `NGPU=1` on Colab. In a notebook, use a
+Python cell: `NGPU = 2`.
+
+Training stages save checkpoints regularly. If a session dies, restart the stage with
+`--set train_...init_from=<last checkpoint dir>`. Feature extraction and distillation skip work
+that is already done, so you can simply re-run them.
 
 **Start with `configs/small.yaml`** (Qwen3-0.6B, smaller adapter/talker) to get the whole pipeline
 working, then switch to `configs/default.yaml` (Qwen3-1.7B).
@@ -119,7 +131,7 @@ produce the same answer, so the model responds to speech instead of just transcr
 ### Step 4: Stage 2: speech alignment (adapter + CTC/EOT heads + LoRA)
 
 ```bash
-python -m s2s.train.speech_llm $CFG
+torchrun --standalone --nproc_per_node=$NGPU -m s2s.train.speech_llm $CFG
 ```
 
 The script logs `lm`, `ctc` and `eot` losses. Every `eval_every` steps it prints CTC WER, EOT accuracy
@@ -136,7 +148,7 @@ for s in train eval; do
   python -m s2s.prep.extract_mimi $CFG --mode latents \
     --in data/manifests/hotel_${s}_audio.jsonl --out data/manifests/hotel_${s}.jsonl
 done
-python -m s2s.train.speech_llm $CFG --set \
+torchrun --standalone --nproc_per_node=$NGPU -m s2s.train.speech_llm $CFG --set \
   train_speech_llm.init_from=checkpoints/speech_llm_align \
   train_speech_llm.output_dir=checkpoints/speech_llm_tools \
   "train_speech_llm.train_manifests=[{path: data/manifests/hotel_train.jsonl, weight: 0.5}, {path: data/manifests/librispeech_train.jsonl, weight: 0.5}]" \
@@ -182,7 +194,7 @@ for s in train valid; do
   python -m s2s.prep.extract_mimi $CFG --mode codes \
     --in data/manifests/talker_${s}_raw.jsonl --out data/manifests/talker_${s}.jsonl
 done
-python -m s2s.train.talker $CFG
+torchrun --standalone --nproc_per_node=$NGPU -m s2s.train.talker $CFG
 ```
 
 Every eval writes `checkpoints/talker/samples/step_N/*.wav`. **Listen to them.** Loss and

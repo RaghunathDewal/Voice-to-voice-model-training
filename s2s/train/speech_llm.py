@@ -18,19 +18,37 @@ from __future__ import annotations
 import os
 import time
 
+import contextlib
+
 import numpy as np
 import torch
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
 from s2s.cli_common import base_parser, config_from_args
 from s2s.config import save_config
+from s2s.dist import barrier, cleanup, init_distributed
 from s2s.data.datasets import SpeechLLMDataset, collate_speech_llm, load_manifest, load_mixture, mixture_sampler
 from s2s.models.adapter import SpeechAdapter
 from s2s.models.speech_llm import assemble_inputs, greedy_generate, speech_llm_losses
 from s2s.models.thinker import Thinker
 from s2s.text import ctc_greedy_decode, wer
 from s2s.train.common import fmt, make_grad_scaler, optimizer_step
-from s2s.utils import autocast_ctx, cosine_lr, count_params, resolve_device, resolve_dtype, save_json, set_seed
+from s2s.utils import autocast_ctx, cosine_lr, count_params, resolve_dtype, save_json, set_seed
+
+
+class SpeechLLMTrainModule(torch.nn.Module):
+    """Adapter + (LoRA) thinker as one module so DDP can synchronise their gradients."""
+
+    def __init__(self, thinker: Thinker, adapter: SpeechAdapter, ctc_weight: float, eot_weight: float):
+        super().__init__()
+        self.adapter = adapter
+        self.lm = thinker.model
+        self._thinker = [thinker]  # plain list: not registered as a submodule twice
+        self.ctc_weight, self.eot_weight = ctc_weight, eot_weight
+
+    def forward(self, batch: dict) -> dict:
+        return speech_llm_losses(self._thinker[0], self.adapter, batch, self.ctc_weight, self.eot_weight)
 
 
 def build_models(cfg, device, dtype, init_from: str | None, train_lora: bool, latent_dim: int):
@@ -108,10 +126,16 @@ def main() -> None:
     args = p.parse_args()
     cfg = config_from_args(args)
     tc = cfg.train_speech_llm
-    set_seed(cfg.seed)
-    device = resolve_device(cfg.device)
+    rank, world, device = init_distributed(cfg.device)
+    main_proc = rank == 0
+    log = print if main_proc else (lambda *a, **k: None)
+    set_seed(cfg.seed)  # same seed on every rank -> identical initial weights
     dtype = resolve_dtype(cfg.thinker.dtype, device)
-    print(f"device {device}, thinker dtype {dtype}")
+    grad_accum = int(tc.grad_accum)
+    if world > 1 and grad_accum % world == 0:
+        grad_accum //= world  # keep the effective batch size, finish in ~1/world of the time
+    log(f"device {device} x {world} process(es), thinker dtype {dtype}, "
+        f"effective batch {int(tc.batch_size) * grad_accum * world} (batch {tc.batch_size} x accum {grad_accum} x {world} GPU)")
 
     rows, weights = load_mixture(tc.train_manifests)
     valid_rows = load_manifest(tc.valid_manifest)
@@ -119,6 +143,8 @@ def main() -> None:
     thinker, adapter = build_models(cfg, device, dtype, tc.init_from, bool(tc.train_lora), latent_dim)
     thinker.model.train()
     adapter.train()
+    module = SpeechLLMTrainModule(thinker, adapter, tc.ctc_weight, tc.eot_weight)
+    model = DDP(module, device_ids=[device.index] if device.type == "cuda" else None) if world > 1 else module
 
     common = dict(prompts=thinker.prompts, system_prompt=cfg.thinker.system_prompt,
                   transcribe_instruction=cfg.thinker.transcribe_instruction, transcribe_prob=tc.transcribe_prob,
@@ -126,8 +152,10 @@ def main() -> None:
                   max_target_tokens=tc.max_target_tokens)
     train_ds = SpeechLLMDataset(rows, train=True, **common)
     valid_ds = SpeechLLMDataset(valid_rows, train=False, **common)
-    total_samples = int(tc.max_steps) * int(tc.batch_size) * int(tc.grad_accum)
-    train_loader = DataLoader(train_ds, batch_size=tc.batch_size, sampler=mixture_sampler(weights, total_samples, cfg.seed),
+    total_samples = int(tc.max_steps) * int(tc.batch_size) * grad_accum
+    # every rank draws its own stream of samples (different seed per rank)
+    train_loader = DataLoader(train_ds, batch_size=tc.batch_size,
+                              sampler=mixture_sampler(weights, total_samples, cfg.seed + 1000 * rank),
                               collate_fn=collate_speech_llm, num_workers=tc.num_workers, drop_last=True)
     valid_loader = DataLoader(valid_ds, batch_size=tc.batch_size, shuffle=False, collate_fn=collate_speech_llm,
                               num_workers=tc.num_workers)
@@ -139,20 +167,23 @@ def main() -> None:
         groups.append({"params": lora_params, "lr": tc.lora_lr, "base_lr": tc.lora_lr})
     opt = torch.optim.AdamW(groups, weight_decay=tc.weight_decay)
     scaler = make_grad_scaler(enabled=device.type == "cuda" and dtype == torch.float16)
-    print(f"adapter params {count_params(adapter) / 1e6:.1f}M, trainable thinker params {sum(p.numel() for p in lora_params) / 1e6:.1f}M")
-    print(f"train rows {len(rows)}, valid rows {len(valid_rows)}")
+    log(f"adapter params {count_params(adapter) / 1e6:.1f}M, trainable thinker params {sum(p.numel() for p in lora_params) / 1e6:.1f}M")
+    log(f"train rows {len(rows)}, valid rows {len(valid_rows)}")
 
     step, accum = 0, 0
     t0 = time.time()
     running: dict[str, float] = {}
     for batch in train_loader:
-        with autocast_ctx(device, dtype):
-            out = speech_llm_losses(thinker, adapter, batch, tc.ctc_weight, tc.eot_weight)
-        scaler.scale(out["loss"] / tc.grad_accum).backward()
+        last_micro = accum + 1 == grad_accum
+        sync = model.no_sync() if (world > 1 and not last_micro) else contextlib.nullcontext()
+        with sync:
+            with autocast_ctx(device, dtype):
+                out = model(batch)
+            scaler.scale(out["loss"] / grad_accum).backward()
         for k in ("loss", "lm", "ctc", "eot"):
-            running[k] = running.get(k, 0.0) + float(out[k].detach()) / tc.grad_accum
+            running[k] = running.get(k, 0.0) + float(out[k].detach()) / grad_accum
         accum += 1
-        if accum < tc.grad_accum:
+        if accum < grad_accum:
             continue
         accum = 0
         scale = cosine_lr(step, tc.warmup_steps, tc.max_steps)
@@ -162,17 +193,22 @@ def main() -> None:
         step += 1
         if step % tc.log_every == 0:
             avg = {k: v / tc.log_every for k, v in running.items()}
-            print(f"step {step} {fmt(avg)} gnorm {gnorm:.2f} lr_scale {scale:.3f} {(time.time() - t0) / step:.2f}s/step")
+            log(f"step {step} {fmt(avg)} gnorm {gnorm:.2f} lr_scale {scale:.3f} {(time.time() - t0) / step:.2f}s/step")
             running = {}
         if step % tc.eval_every == 0 or step == tc.max_steps:
-            res = evaluate(cfg, thinker, adapter, valid_loader, tc.eval_batches)
-            print(f"[eval step {step}] lm_loss {res['lm_loss']:.4f} ctc_wer {res['ctc_wer'] * 100:.2f}% eot_acc {res['eot_acc'] * 100:.1f}%")
-            for s in res["samples"]:
-                print(f"  [{s['task']}] REF: {s['ref']}\n      TARGET: {s['target']!r}\n      GEN:    {s['generated']!r}")
+            if main_proc:
+                res = evaluate(cfg, thinker, adapter, valid_loader, tc.eval_batches)
+                log(f"[eval step {step}] lm_loss {res['lm_loss']:.4f} ctc_wer {res['ctc_wer'] * 100:.2f}% eot_acc {res['eot_acc'] * 100:.1f}%")
+                for s in res["samples"]:
+                    log(f"  [{s['task']}] REF: {s['ref']}\n      TARGET: {s['target']!r}\n      GEN:    {s['generated']!r}")
+            barrier()
         if step % tc.save_every == 0 or step == tc.max_steps:
-            save_checkpoint(tc.output_dir, cfg, thinker, adapter, {"step": step})
+            if main_proc:
+                save_checkpoint(tc.output_dir, cfg, thinker, adapter, {"step": step, "world_size": world})
+            barrier()
         if step >= tc.max_steps:
             break
+    cleanup()
 
 
 if __name__ == "__main__":

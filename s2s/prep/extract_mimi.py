@@ -15,7 +15,7 @@ so an interrupted run can simply be restarted.
 from __future__ import annotations
 
 import os
-
+import sys
 import zlib
 
 import numpy as np
@@ -27,7 +27,22 @@ from s2s.audio import add_silence, load_audio
 from s2s.cli_common import base_parser, config_from_args
 from s2s.data.datasets import load_manifest
 from s2s.models.codec import MimiCodec
+from s2s.dist import resolve_num_workers, run_sharded, strip_gpu_args
 from s2s.utils import resolve_device, write_jsonl
+
+
+def save_npy_atomic(path: str, arr: np.ndarray) -> None:
+    """Write via a temp file so an interrupted run never leaves a truncated feature file."""
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        np.save(f, arr)
+    os.replace(tmp, path)
+
+
+def argparse_hidden() -> str:
+    import argparse
+
+    return argparse.SUPPRESS
 
 
 def main() -> None:
@@ -38,8 +53,16 @@ def main() -> None:
     p.add_argument("--feat-dir", default=None, help="default: <data_dir>/features/<manifest name>")
     p.add_argument("--max-seconds", type=float, default=35.0, help="skip longer utterances")
     p.add_argument("--max-utts", type=int, default=0)
+    p.add_argument("--gpus", type=int, default=0, help="worker processes, one per GPU (0 = all visible GPUs)")
+    p.add_argument("--shard", type=int, default=None, help=argparse_hidden())
+    p.add_argument("--num-shards", type=int, default=1, help=argparse_hidden())
     args = p.parse_args()
     cfg = config_from_args(args)
+
+    n_workers = resolve_num_workers(args.gpus)
+    if args.shard is None and n_workers > 1 and cfg.device != "cpu":
+        # each GPU encodes its share of the files; this process then writes the manifest
+        run_sharded("s2s.prep.extract_mimi", strip_gpu_args(sys.argv[1:]), n_workers)
     device = resolve_device(cfg.device)
 
     rows = load_manifest(args.inp)
@@ -57,10 +80,14 @@ def main() -> None:
     suffix = "lat" if args.mode == "latents" else "codes"
 
     done, pending = [], []
-    for r in rows:
+    for i, r in enumerate(rows):
         path = os.path.join(feat_dir, f"{r['id']}.{suffix}.npy")
         r["_feat"] = path
+        if args.shard is not None and i % args.num_shards != args.shard:
+            continue  # another GPU's share
         (done if os.path.exists(path) else pending).append(r)
+    if args.shard is not None:
+        done = []  # shard workers only write feature files; the parent writes the manifest
 
     out_rows, skipped = [], 0
 
@@ -74,7 +101,7 @@ def main() -> None:
             row["speech_frames"] = n_speech_frames
         out_rows.append(row)
 
-    for r in tqdm(done, desc="existing", disable=not done):
+    for r in tqdm(done, desc="existing features", disable=not done, mininterval=5):
         info = sf.info(r["audio"])
         n_samples = int(round(info.frames * sr / info.samplerate))
         finish(r, codec.num_frames(n_samples), n_samples / sr)
@@ -89,13 +116,14 @@ def main() -> None:
         for (r, w), feat in zip(batch, feats):
             n_speech = codec.num_frames(int(r["_n_samples"]))
             if args.mode == "latents":
-                np.save(r["_feat"], feat.cpu().numpy().astype(np.float16))
+                save_npy_atomic(r["_feat"], feat.cpu().numpy().astype(np.float16))
             else:
-                np.save(r["_feat"], feat.cpu().numpy().astype(np.int16))
+                save_npy_atomic(r["_feat"], feat.cpu().numpy().astype(np.int16))
             finish(r, n_speech, r["_n_samples"] / sr)
         batch.clear()
 
-    for r in tqdm(pending, desc=f"mimi {args.mode}"):
+    tag = f" [GPU shard {args.shard}]" if args.shard is not None else ""
+    for r in tqdm(pending, desc=f"mimi {args.mode}{tag}", mininterval=5):
         try:
             wav = load_audio(r["audio"], sr)
         except Exception as e:  # noqa: BLE001 - keep going on a broken file
@@ -118,6 +146,9 @@ def main() -> None:
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
+    if args.shard is not None:
+        print(f"[shard {args.shard}] done (skipped {skipped})")
+        return
     order = {r["id"]: i for i, r in enumerate(rows)}
     out_rows.sort(key=lambda x: order.get(x["id"], 0))
     write_jsonl(args.out, out_rows)

@@ -12,21 +12,24 @@ and a few generated samples/*.wav at every evaluation.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import time
 
 import torch
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
 from s2s.audio import save_audio
 from s2s.cli_common import base_parser, config_from_args
 from s2s.config import save_config
+from s2s.dist import barrier, cleanup, init_distributed
 from s2s.data.datasets import TalkerDataset, collate_talker, load_manifest, load_mixture, mixture_sampler
 from s2s.models.speech_llm import talker_features
 from s2s.models.talker import Talker, TalkerStream, apply_delay
 from s2s.models.thinker import Thinker
 from s2s.train.common import fmt, make_grad_scaler, optimizer_step
-from s2s.utils import (autocast_ctx, cosine_lr, count_params, load_json, resolve_device, resolve_dtype,
+from s2s.utils import (autocast_ctx, cosine_lr, count_params, load_json, resolve_dtype,
                        save_json, set_seed)
 
 
@@ -51,11 +54,12 @@ def features_for_batch(thinker: Thinker, prefix: list[int], text_ids: list[list[
     return [t.float() for t in toks], [h.float() for h in hids]
 
 
-def talker_loss(talker: Talker, thinker: Thinker, prefix, batch, layer_idx, device, dtype) -> dict:
+def talker_loss(talker: Talker, thinker: Thinker, prefix, batch, layer_idx, device, dtype, model=None) -> dict:
+    """`model` is the (optionally DDP-wrapped) module that runs the forward pass; defaults to `talker`."""
     toks, hids = features_for_batch(thinker, prefix, batch["text_ids"], layer_idx)
     grids = [apply_delay(c.to(device), talker.delay, talker.card) for c in batch["codes"]]
     with autocast_ctx(device, dtype):
-        return talker(toks, hids, grids)
+        return (model or talker)(toks, hids, grids)
 
 
 @torch.no_grad()
@@ -102,9 +106,14 @@ def main() -> None:
     args = p.parse_args()
     cfg = config_from_args(args)
     tc = cfg.train_talker
-    set_seed(cfg.seed)
-    device = resolve_device(cfg.device)
+    rank, world, device = init_distributed(cfg.device)
+    main_proc = rank == 0
+    log = print if main_proc else (lambda *a, **k: None)
+    set_seed(cfg.seed)  # same seed on every rank -> identical initial weights
     dtype = resolve_dtype(cfg.thinker.dtype, device)
+    grad_accum = int(tc.grad_accum)
+    if world > 1 and grad_accum % world == 0:
+        grad_accum //= world  # keep the effective batch size, finish in ~1/world of the time
 
     thinker_path = resolve_thinker_path(cfg)
     thinker = Thinker(thinker_path, device, dtype, attn_implementation=cfg.thinker.attn_implementation)
@@ -121,22 +130,29 @@ def main() -> None:
     else:
         talker = Talker.from_config(cfg.talker, thinker.hidden_size, len(layer_idx), K, codec_card(cfg))
     talker.to(device).train()
-    print(f"talker params {count_params(talker) / 1e6:.1f}M, thinker layers {layer_idx}, thinker {thinker_path}")
+    model = DDP(talker, device_ids=[device.index] if device.type == "cuda" else None) if world > 1 else talker
+    log(f"talker params {count_params(talker) / 1e6:.1f}M, thinker layers {layer_idx}, thinker {thinker_path}")
+    log(f"{world} process(es), effective batch {int(tc.batch_size) * grad_accum * world} "
+        f"(batch {tc.batch_size} x accum {grad_accum} x {world} GPU)")
 
+    max_seconds = float(tc.max_frames) / 12.5
     rows, weights = load_mixture(tc.train_manifests)
+    keep = [i for i, r in enumerate(rows) if r.get("codes") and str(r.get("text", "")).strip()
+            and (r.get("duration") is None or r["duration"] <= max_seconds)]
+    rows, weights = [rows[i] for i in keep], [weights[i] for i in keep]
     valid_rows = load_manifest(tc.valid_manifest)
     train_ds = TalkerDataset(rows, thinker.prompts, K, tc.max_frames)
     valid_ds = TalkerDataset(valid_rows, thinker.prompts, K, tc.max_frames)
-    weights = [w for r, w in zip(rows, weights) if r.get("codes")]
-    total = int(tc.max_steps) * int(tc.batch_size) * int(tc.grad_accum)
-    train_loader = DataLoader(train_ds, batch_size=tc.batch_size, sampler=mixture_sampler(weights, total, cfg.seed),
+    total = int(tc.max_steps) * int(tc.batch_size) * grad_accum
+    train_loader = DataLoader(train_ds, batch_size=tc.batch_size,
+                              sampler=mixture_sampler(weights, total, cfg.seed + 1000 * rank),
                               collate_fn=collate_talker, num_workers=tc.num_workers, drop_last=True)
     valid_loader = DataLoader(valid_ds, batch_size=tc.batch_size, collate_fn=collate_talker,
                               num_workers=tc.num_workers)
     sample_texts = [r["text"] for r in valid_rows[:3]]
 
     codec = None
-    if not args.no_samples:
+    if not args.no_samples and main_proc:
         from s2s.models.codec import MimiCodec
 
         codec = MimiCodec(cfg.codec.model, device, K)
@@ -147,15 +163,22 @@ def main() -> None:
     meta = {"thinker": thinker_path, "layer_idx": layer_idx, "num_codebooks": K, "codec": cfg.codec.model}
 
     step, accum, running, t0 = 0, 0, {}, time.time()
+    last_batch = None
     for batch in train_loader:
-        if batch is None:
-            continue
-        out = talker_loss(talker, thinker, prefix, batch, layer_idx, device, dtype)
-        scaler.scale(out["loss"] / tc.grad_accum).backward()
-        running["loss"] = running.get("loss", 0.0) + float(out["loss"].detach()) / tc.grad_accum
-        running["acc_cb1"] = running.get("acc_cb1", 0.0) + float(out["acc_per_codebook"][0]) / tc.grad_accum
+        if batch is None:  # every item in the batch was filtered out
+            if world == 1 or last_batch is None:
+                continue
+            batch = last_batch  # all ranks must run the same number of steps under DDP
+        last_batch = batch
+        last_micro = accum + 1 == grad_accum
+        sync = model.no_sync() if (world > 1 and not last_micro) else contextlib.nullcontext()
+        with sync:
+            out = talker_loss(talker, thinker, prefix, batch, layer_idx, device, dtype, model=model)
+            scaler.scale(out["loss"] / grad_accum).backward()
+        running["loss"] = running.get("loss", 0.0) + float(out["loss"].detach()) / grad_accum
+        running["acc_cb1"] = running.get("acc_cb1", 0.0) + float(out["acc_per_codebook"][0]) / grad_accum
         accum += 1
-        if accum < tc.grad_accum:
+        if accum < grad_accum:
             continue
         accum = 0
         scale = cosine_lr(step, tc.warmup_steps, tc.max_steps)
@@ -165,24 +188,29 @@ def main() -> None:
         step += 1
         if step % tc.log_every == 0:
             avg = {k: v / tc.log_every for k, v in running.items()}
-            print(f"step {step} {fmt(avg)} gnorm {gnorm:.2f} lr_scale {scale:.3f} {(time.time() - t0) / step:.2f}s/step")
+            log(f"step {step} {fmt(avg)} gnorm {gnorm:.2f} lr_scale {scale:.3f} {(time.time() - t0) / step:.2f}s/step")
             running = {}
         if step % tc.eval_every == 0 or step == tc.max_steps:
-            res = evaluate(talker, thinker, prefix, valid_loader, layer_idx, device, dtype, tc.eval_batches)
-            accs = " ".join(f"{a * 100:.1f}" for a in res["acc"])
-            print(f"[eval step {step}] loss {res['loss']:.4f} acc per codebook % [{accs}]")
-            if codec is not None:
-                generate_samples(talker, thinker, prefix, layer_idx, sample_texts,
-                                 os.path.join(tc.output_dir, "samples", f"step_{step}"), codec, cfg.runtime)
+            if main_proc:
+                res = evaluate(talker, thinker, prefix, valid_loader, layer_idx, device, dtype, tc.eval_batches)
+                accs = " ".join(f"{a * 100:.1f}" for a in res["acc"])
+                log(f"[eval step {step}] loss {res['loss']:.4f} acc per codebook % [{accs}]")
+                if codec is not None:
+                    generate_samples(talker, thinker, prefix, layer_idx, sample_texts,
+                                     os.path.join(tc.output_dir, "samples", f"step_{step}"), codec, cfg.runtime)
+            barrier()
         if step % tc.save_every == 0 or step == tc.max_steps:
-            os.makedirs(tc.output_dir, exist_ok=True)
-            talker.save(os.path.join(tc.output_dir, "talker.pt"))
-            save_json(os.path.join(tc.output_dir, "meta.json"), meta)
-            save_config(cfg, os.path.join(tc.output_dir, "config.yaml"))
-            save_json(os.path.join(tc.output_dir, "state.json"), {"step": step})
-            print(f"saved talker -> {tc.output_dir}")
+            if main_proc:
+                os.makedirs(tc.output_dir, exist_ok=True)
+                talker.save(os.path.join(tc.output_dir, "talker.pt"))
+                save_json(os.path.join(tc.output_dir, "meta.json"), meta)
+                save_config(cfg, os.path.join(tc.output_dir, "config.yaml"))
+                save_json(os.path.join(tc.output_dir, "state.json"), {"step": step, "world_size": world})
+                log(f"saved talker -> {tc.output_dir}")
+            barrier()
         if step >= tc.max_steps:
             break
+    cleanup()
 
 
 if __name__ == "__main__":
