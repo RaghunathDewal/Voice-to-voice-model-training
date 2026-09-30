@@ -25,6 +25,6 @@ train_speech_llm:
   save_every: 500
 
 train_talker:
-  max_steps: 20000
+  max_steps: 10000
   eval_every: 1000
   save_every: 1000

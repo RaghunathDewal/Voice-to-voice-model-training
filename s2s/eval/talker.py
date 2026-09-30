@@ -44,12 +44,18 @@ def main() -> None:
     codec = MimiCodec(cfg.codec.model, device, talker.K)
     prefix = thinker.prompts.text_prompt_ids(cfg.thinker.system_prompt, cfg.talker.talker_prompt_user)
 
-    from transformers import pipeline
+    # Whisper is called directly: the ASR pipeline breaks on some transformers versions (KeyError 'num_frames')
+    from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
-    asr = pipeline("automatic-speech-recognition", model=args.asr, device=0 if device.type == "cuda" else -1)
+    asr_proc = WhisperProcessor.from_pretrained(args.asr)
+    asr_model = WhisperForConditionalGeneration.from_pretrained(args.asr).to(device).eval()
 
+    @torch.no_grad()
     def transcribe(wav24: np.ndarray) -> str:
-        return asr({"raw": resample(wav24, codec.sample_rate, 16000), "sampling_rate": 16000})["text"]
+        wav16 = resample(wav24, codec.sample_rate, 16000)[: 30 * 16000]
+        feats = asr_proc.feature_extractor(wav16, sampling_rate=16000, return_tensors="pt").input_features
+        ids = asr_model.generate(feats.to(device), language="en", task="transcribe", max_new_tokens=200)
+        return asr_proc.batch_decode(ids, skip_special_tokens=True)[0].strip()
 
     rows = [r for r in load_manifest(args.manifest) if r.get("text")][: args.max]
     os.makedirs(args.out_dir, exist_ok=True)

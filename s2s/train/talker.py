@@ -6,8 +6,9 @@ embeddings and hidden states that the talker would receive at inference time.
 
     python -m s2s.train.talker --config configs/default.yaml
 
-Writes talker.pt, meta.json (which thinker/layers it was trained on), config.yaml
-and a few generated samples/*.wav at every evaluation.
+Writes talker.pt (the checkpoint with the lowest validation loss), meta.json (which
+thinker/layers it was trained on), config.yaml and a few generated samples/*.wav at
+every evaluation. The most recent weights are also kept in last/.
 """
 
 from __future__ import annotations
@@ -164,6 +165,16 @@ def main() -> None:
     scaler = make_grad_scaler(enabled=device.type == "cuda" and dtype == torch.float16)
     meta = {"thinker": thinker_path, "layer_idx": layer_idx, "num_codebooks": K, "codec": cfg.codec.model}
 
+    best = {"loss": float("inf"), "step": 0}
+
+    def save_talker(out_dir: str, at_step: int) -> None:
+        os.makedirs(out_dir, exist_ok=True)
+        talker.save(os.path.join(out_dir, "talker.pt"))
+        save_json(os.path.join(out_dir, "meta.json"), meta)
+        save_config(cfg, os.path.join(out_dir, "config.yaml"))
+        save_json(os.path.join(out_dir, "state.json"), {"step": at_step, "world_size": world,
+                                                         "best_eval_loss": best["loss"], "best_step": best["step"]})
+
     step, accum, running, t0 = 0, 0, {}, time.time()
     last_batch = None
     arm_watchdog()
@@ -199,18 +210,18 @@ def main() -> None:
                 res = evaluate(talker, thinker, prefix, valid_loader, layer_idx, device, dtype, tc.eval_batches)
                 accs = " ".join(f"{a * 100:.1f}" for a in res["acc"])
                 log(f"[eval step {step}] loss {res['loss']:.4f} acc per codebook % [{accs}]")
+                if res["loss"] < best["loss"]:
+                    best = {"loss": res["loss"], "step": step}
+                    save_talker(tc.output_dir, step)
+                    log(f"new best eval loss -> saved {tc.output_dir}/talker.pt")
                 if codec is not None:
                     generate_samples(talker, thinker, prefix, layer_idx, sample_texts,
                                      os.path.join(tc.output_dir, "samples", f"step_{step}"), codec, cfg.runtime)
             barrier()
         if step % tc.save_every == 0 or step == tc.max_steps:
             if main_proc:
-                os.makedirs(tc.output_dir, exist_ok=True)
-                talker.save(os.path.join(tc.output_dir, "talker.pt"))
-                save_json(os.path.join(tc.output_dir, "meta.json"), meta)
-                save_config(cfg, os.path.join(tc.output_dir, "config.yaml"))
-                save_json(os.path.join(tc.output_dir, "state.json"), {"step": step, "world_size": world})
-                log(f"saved talker -> {tc.output_dir}")
+                save_talker(os.path.join(tc.output_dir, "last"), step)
+                log(f"saved latest talker -> {tc.output_dir}/last")
             barrier()
         if step >= tc.max_steps:
             break
