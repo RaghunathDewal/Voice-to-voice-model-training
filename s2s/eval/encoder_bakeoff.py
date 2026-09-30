@@ -180,34 +180,47 @@ def run_one(cfg, args, spec: str) -> dict:
     res = {"encoder": spec, "dim": enc.dim, "params_m": round(enc.params_m, 1), "streaming": enc.streaming}
     res.update(measure_latency(enc, device))
     log(f"loaded: {res}")
-    feat_root = os.path.join(out_dir, "features")
+    feat_root = os.path.join(args.feat_dir or out_dir, "features", slug(spec))
     all_train = take_hours(load_manifest(args.train), args.train_hours)
-    n_hold = min(300, max(20, len(all_train) // 20))
-    train = extract(enc, all_train[n_hold:], os.path.join(feat_root, "train"), args.train_augment, "train",
-                    args.batch_size)
-    held = extract(enc, all_train[:n_hold], os.path.join(feat_root, "held"), args.train_augment, "held-out",
-                   args.batch_size)
-    tests = {}
-    for name, path, aug in parse_tests(args.test):
-        rows = load_manifest(path)[: args.test_max]
-        tests[name] = extract(enc, rows, os.path.join(feat_root, name), 1.0 if aug else 0.0, name, args.batch_size)
-    del enc
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-    res["train_hours"] = round(sum(float(r.get("duration") or 0) for r in all_train[n_hold:]) / 3600, 1)
-    log(f"features extracted ({res['train_hours']} h train) in {(time.time() - t0) / 60:.1f} min; training probe")
-    model = train_probe(cfg, train, held, device, args.steps, log)
-    for name, rows in tests.items():
-        dl = DataLoader(LatentCTCDataset(rows, int(cfg.adapter.max_frames)), batch_size=32, collate_fn=collate)
-        r = evaluate(model, dl, device)
-        res[f"wer_{name}"] = round(r["wer"] * 100, 2)
-        log(f"{name}: WER {res[f'wer_{name}']}% on {r['n']} utts")
-        for ref, hyp in r["examples"][:2]:
-            log(f"    REF: {ref.lower()}\n    HYP: {hyp}")
-    res["minutes"] = round((time.time() - t0) / 60, 1)
-    save_json(os.path.join(out_dir, "result.json"), res)
-    if not args.keep_features:
-        shutil.rmtree(feat_root, ignore_errors=True)
+    tests_spec = parse_tests(args.test)
+    # fail fast (and cleanly) instead of filling the disk: features are float16 at 12.5 Hz
+    hours = sum(float(r.get("duration") or 5.0) for r in all_train) / 3600 + 0.5 * len(tests_spec)
+    need_gb = hours * 3600 * 12.5 * enc.dim * 2 / 1e9 * 1.1
+    os.makedirs(feat_root, exist_ok=True)
+    free_gb = shutil.disk_usage(feat_root).free / 1e9
+    log(f"features need ~{need_gb:.1f} GB, {free_gb:.1f} GB free")
+    if need_gb > free_gb - args.min_free_gb:
+        raise RuntimeError(f"not enough disk for {spec}: need ~{need_gb:.1f} GB, free {free_gb:.1f} GB "
+                           f"(keeping {args.min_free_gb} GB spare); lower --train-hours")
+    try:
+        n_hold = min(300, max(20, len(all_train) // 20))
+        train = extract(enc, all_train[n_hold:], os.path.join(feat_root, "train"), args.train_augment, "train",
+                        args.batch_size)
+        held = extract(enc, all_train[:n_hold], os.path.join(feat_root, "held"), args.train_augment, "held-out",
+                       args.batch_size)
+        tests = {}
+        for name, path, aug in tests_spec:
+            rows = load_manifest(path)[: args.test_max]
+            tests[name] = extract(enc, rows, os.path.join(feat_root, name), 1.0 if aug else 0.0, name,
+                                  args.batch_size)
+        del enc
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        res["train_hours"] = round(sum(float(r.get("duration") or 0) for r in all_train[n_hold:]) / 3600, 1)
+        log(f"features extracted ({res['train_hours']} h train) in {(time.time() - t0) / 60:.1f} min; training probe")
+        model = train_probe(cfg, train, held, device, args.steps, log)
+        for name, rows in tests.items():
+            dl = DataLoader(LatentCTCDataset(rows, int(cfg.adapter.max_frames)), batch_size=32, collate_fn=collate)
+            r = evaluate(model, dl, device)
+            res[f"wer_{name}"] = round(r["wer"] * 100, 2)
+            log(f"{name}: WER {res[f'wer_{name}']}% on {r['n']} utts")
+            for ref, hyp in r["examples"][:2]:
+                log(f"    REF: {ref.lower()}\n    HYP: {hyp}")
+        res["minutes"] = round((time.time() - t0) / 60, 1)
+        save_json(os.path.join(out_dir, "result.json"), res)
+    finally:  # also on failure: leftover features filled the disk once
+        if not args.keep_features:
+            shutil.rmtree(feat_root, ignore_errors=True)
     return res
 
 
@@ -238,6 +251,8 @@ def main() -> None:
     p.add_argument("--out-dir", default="outputs/encoder_bakeoff")
     p.add_argument("--gpus", type=int, default=0, help="parallel workers (0 = all visible GPUs)")
     p.add_argument("--keep-features", action="store_true")
+    p.add_argument("--feat-dir", default=None, help="where temporary features go (default: --out-dir); use a big disk")
+    p.add_argument("--min-free-gb", type=float, default=3.0, help="skip an encoder rather than leave less free disk")
     p.add_argument("--worker", default=None, help=__import__("argparse").SUPPRESS)
     args = p.parse_args()
     cfg = config_from_args(args)
