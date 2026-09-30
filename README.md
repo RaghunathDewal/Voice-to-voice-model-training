@@ -228,7 +228,8 @@ gives the best achievable WER for comparison. The eval also counts runaway gener
 ```bash
 python -m s2s.cli.chat $CFG --wav my_question.wav my_followup.wav            # one file per turn
 python -m s2s.cli.chat $CFG --wav my_question.wav --stream                   # 80 ms chunks + endpointing
-pip install gradio && python -m s2s.cli.gradio_app $CFG --share              # microphone demo in the browser
+pip install gradio && python -m s2s.cli.gradio_app $CFG --share              # microphone demo in the browser (record, then submit)
+pip install gradio && python -m s2s.cli.gradio_live $CFG --share             # hands-free: just talk, end of turn is detected
 python -m s2s.eval.latency $CFG --wav data/tts/hotel_eval_audio/*.wav --max 20
 ```
 
@@ -261,7 +262,7 @@ s2s/prep/           librispeech, ljspeech, extract_mimi, distill, hotel_data, sy
 s2s/train/          probe_ctc (exp 1), speech_llm (stages 2+3), talker (stage 4)
 s2s/eval/           text_tools (exp 2), speech_llm (exp 3), talker (exp 4), latency (exp 5)
 s2s/runtime/        agent.py (sessions, KV cache, tool loop, streaming talker), endpoint.py
-s2s/cli/            chat.py (wav files), gradio_app.py (microphone)
+s2s/cli/            chat.py (wav files), gradio_app.py (record + submit), gradio_live.py (hands-free)
 scripts/            smoke_test.sh
 tests/              pytest suite (CPU)
 ```
