@@ -258,6 +258,7 @@ buffering are not included.
 configs/            default.yaml (1.7B), small.yaml (0.6B)
 s2s/models/         codec.py (Mimi), adapter.py, thinker.py (Qwen3 + prompts), talker.py, speech_llm.py (glue/losses)
 s2s/data/           datasets.py (manifests, collators), hotel.py (tools, mock backend, data generator)
+s2s/eval/encoder_bakeoff.py   compare input encoders (Mimi, Whisper, Parakeet, Moonshine-streaming): probe WER, latency, memory
 s2s/prep/           librispeech, ljspeech, hf_asr (Common Voice, People's Speech, EdAcc ...), extract_mimi (+ augmentation), distill, hotel_data, synth_kokoro, merge_lora, smoke
 s2s/train/          probe_ctc (exp 1), speech_llm (stages 2+3), talker (stage 4)
 s2s/eval/           text_tools (exp 2), speech_llm (exp 3), talker (exp 4), latency (exp 5)
