@@ -81,6 +81,7 @@ def main() -> None:
     p.add_argument("--max-utts", type=int, default=0)
     p.add_argument("--max-per-accent", type=float, default=0.0,
                    help="cap hours per accent label (balances accents; unlabelled rows are capped too)")
+    p.add_argument("--max-shards", type=int, default=0, help="download at most this many parquet shards (0 = no cap)")
     p.add_argument("--min-seconds", type=float, default=1.0)
     p.add_argument("--max-seconds", type=float, default=20.0)
     p.add_argument("--min-words", type=int, default=2)
@@ -98,6 +99,8 @@ def main() -> None:
     if not files:
         raise SystemExit(f"no parquet files matching {preset['repo']}/{prefix}*")
     random.Random(args.seed).shuffle(files)  # spread speakers/topics across the whole split
+    if args.max_shards:
+        files = files[: args.max_shards]
     print(f"{preset['repo']} {args.split}: {len(files)} parquet shards")
 
     audio_dir = os.path.join(cfg.paths.data_dir, "hf_asr", args.name)
