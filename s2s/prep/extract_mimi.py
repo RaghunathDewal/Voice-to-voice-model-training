@@ -4,6 +4,10 @@
     python -m s2s.prep.extract_mimi --mode latents --in data/manifests/librispeech_dev_raw.jsonl \
         --out data/manifests/librispeech_dev.jsonl
 
+    # the same, sounding like real microphones (noise, reverb, phone/laptop EQ) for 60% of clips
+    python -m s2s.prep.extract_mimi --mode latents --augment-prob 0.6 --in data/manifests/cv_train_raw.jsonl \
+        --out data/manifests/cv_train.jsonl
+
     # speech OUTPUT targets for the talker (discrete codes)
     python -m s2s.prep.extract_mimi --mode codes --in data/manifests/talker_train_raw.jsonl \
         --out data/manifests/talker_train.jsonl
@@ -24,6 +28,7 @@ import torch
 from tqdm import tqdm
 
 from s2s.audio import add_silence, load_audio
+from s2s.augment import augment
 from s2s.cli_common import base_parser, config_from_args
 from s2s.data.datasets import load_manifest
 from s2s.models.codec import MimiCodec
@@ -53,6 +58,8 @@ def main() -> None:
     p.add_argument("--feat-dir", default=None, help="default: <data_dir>/features/<manifest name>")
     p.add_argument("--max-seconds", type=float, default=35.0, help="skip longer utterances")
     p.add_argument("--max-utts", type=int, default=0)
+    p.add_argument("--augment-prob", type=float, default=0.0,
+                   help="latents only: fraction of utterances passed through s2s.augment (noise, reverb, mic EQ)")
     p.add_argument("--gpus", type=int, default=0, help="worker processes, one per GPU (0 = all visible GPUs)")
     p.add_argument("--shard", type=int, default=None, help=argparse_hidden())
     p.add_argument("--num-shards", type=int, default=1, help=argparse_hidden())
@@ -139,6 +146,9 @@ def main() -> None:
         r["_n_samples"] = len(wav)
         if silence:
             wav = add_silence(wav, sr, silence, seed=zlib.crc32(r["id"].encode()))
+        key = f"{name}/{r['id']}"  # a second manifest name gives a different augmentation of the same clip
+        if args.mode == "latents" and args.augment_prob and zlib.crc32(key.encode()) % 10000 < args.augment_prob * 10000:
+            wav = augment(wav, sr, key)  # after the silence: real mics hear the room after you stop, too
         batch.append((r, wav))
         if len(batch) >= bs:
             flush()

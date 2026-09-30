@@ -10,7 +10,14 @@ Stage 3 (tools): continue from stage 2 with spoken hotel requests mixed with ali
               'train_speech_llm.train_manifests=[{path: data/manifests/hotel_train.jsonl, weight: 0.5}, {path: data/manifests/librispeech_train.jsonl, weight: 0.5}]' \
               train_speech_llm.valid_manifest=data/manifests/hotel_eval.jsonl train_speech_llm.max_steps=4000
 
-Checkpoint directory layout: adapter.pt, lora/ (PEFT), config.yaml, state.json
+Robustness (adapter only): retrain the speech input on accented / noisy speech while the
+thinker stays exactly as merged in stage 3, so the talker (trained on that thinker) stays valid
+    mkdir -p checkpoints/adapter_init && cp checkpoints/speech_llm_tools/adapter.pt checkpoints/adapter_init/
+    python -m s2s.train.speech_llm --config configs/default.yaml \
+        --set thinker.model=checkpoints/thinker_merged train_speech_llm.train_lora=false \
+              train_speech_llm.init_from=checkpoints/adapter_init train_speech_llm.output_dir=checkpoints/speech_llm_robust ...
+
+Checkpoint directory layout: adapter.pt, lora/ (PEFT, only when a LoRA is trained), config.yaml, state.json
 """
 
 from __future__ import annotations
@@ -66,7 +73,8 @@ def build_models(cfg, device, dtype, init_from: str | None, train_lora: bool, la
         adapter = SpeechAdapter.from_config(cfg.adapter, latent_dim, thinker.hidden_size)
         adapter.init_scale(thinker.text_embedding_rms())
     adapter.to(device)
-    if cfg.thinker.gradient_checkpointing and train_lora:
+    if cfg.thinker.gradient_checkpointing:
+        # also without LoRA: gradients still flow through the frozen thinker back to the adapter
         thinker.enable_gradient_checkpointing()
     return thinker, adapter
 

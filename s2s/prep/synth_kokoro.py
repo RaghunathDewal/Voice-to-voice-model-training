@@ -38,6 +38,7 @@ def main() -> None:
     p.add_argument("--text-field", default="text")
     p.add_argument("--voices", nargs="+", default=["af_heart"])
     p.add_argument("--speed", type=float, default=1.0)
+    p.add_argument("--speed-jitter", type=float, default=0.0, help="random speed in speed*(1 +/- jitter) per row")
     p.add_argument("--max-utts", type=int, default=0)
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
@@ -57,6 +58,7 @@ def main() -> None:
     out_rows = []
     for r in tqdm(rows, desc="kokoro"):
         voice = rng.choice(args.voices)
+        speed = args.speed * rng.uniform(1 - args.speed_jitter, 1 + args.speed_jitter) if args.speed_jitter else args.speed
         lang = voice[0]  # 'a' = American English, 'b' = British English
         if lang not in pipelines:
             pipelines[lang] = KPipeline(lang_code=lang)
@@ -64,7 +66,7 @@ def main() -> None:
         text = r[args.text_field]
         if not os.path.exists(path):
             chunks = []
-            for result in pipelines[lang](text, voice=voice, speed=args.speed):
+            for result in pipelines[lang](text, voice=voice, speed=speed):
                 audio = result[2] if isinstance(result, tuple) else getattr(result, "audio", None)
                 if audio is None:
                     continue
