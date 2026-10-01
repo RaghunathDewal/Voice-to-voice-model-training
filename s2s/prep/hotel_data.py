@@ -14,6 +14,7 @@ import os
 
 from s2s.cli_common import base_parser, config_from_args
 from s2s.data.hotel import generate_examples
+from s2s.data.hotel_v2 import generate_examples_v2
 from s2s.utils import write_jsonl
 
 
@@ -21,15 +22,19 @@ def main() -> None:
     p = base_parser(__doc__)
     p.add_argument("--train", type=int, default=4000)
     p.add_argument("--eval", type=int, default=200)
+    p.add_argument("--version", type=int, default=1, choices=[1, 2],
+                   help="2 = varied phrasings, reservation summary, small talk, out-of-scope, follow-up turns")
+    p.add_argument("--prefix", default="hotel", help="manifest name prefix")
     args = p.parse_args()
     cfg = config_from_args(args)
     out = os.path.join(cfg.paths.data_dir, "manifests")
-    train = generate_examples(args.train, seed=1)
-    eval_rows = generate_examples(args.eval, seed=2)
+    gen = generate_examples_v2 if args.version == 2 else generate_examples
+    train = gen(args.train, seed=1)
+    eval_rows = gen(args.eval, seed=2)
     for r in eval_rows:
-        r["id"] = r["id"].replace("hotel_", "hotel_eval_")
-    print(write_jsonl(os.path.join(out, "hotel_train_text.jsonl"), train), "train rows")
-    print(write_jsonl(os.path.join(out, "hotel_eval_text.jsonl"), eval_rows), "eval rows")
+        r["id"] = r["id"].replace("hotel", "hotel_eval", 1)
+    print(write_jsonl(os.path.join(out, f"{args.prefix}_train_text.jsonl"), train), "train rows")
+    print(write_jsonl(os.path.join(out, f"{args.prefix}_eval_text.jsonl"), eval_rows), "eval rows")
 
 
 if __name__ == "__main__":

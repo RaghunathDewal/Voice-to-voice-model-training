@@ -71,10 +71,11 @@ def main() -> None:
 
         if r.get("tools"):
             n_tool += 1
-            pre, suf = thinker.prompts.prompt_parts(system, tools, None)
+            history = r.get("history") or None
+            pre, suf = thinker.prompts.prompt_parts(system, tools, None, history)
             speech_out = run(pre, suf, 120)
             ok_s = score_example(r, extract_calls(speech_out), speech_out)
-            ids = thinker.prompts.text_prompt_ids(system, r["text"], tools)
+            ids = thinker.prompts.text_prompt_ids(system, r["text"], tools, history)
             text_out = thinker.tokenizer.decode(
                 greedy_generate(thinker, thinker.embed(torch.tensor([ids], device=device)), 120), skip_special_tokens=False)
             ok_t = score_example(r, extract_calls(text_out), text_out)

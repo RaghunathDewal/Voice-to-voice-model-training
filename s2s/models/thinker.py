@@ -222,24 +222,34 @@ class PromptBuilder:
             return f"{system_prompt}\n\n{context}"
         return system_prompt
 
-    def prompt_parts(self, system: str, tools: list | None = None, instruction: str | None = None) -> tuple[list[int], list[int]]:
-        """(prefix_ids, suffix_ids): speech embeddings go between them."""
-        key = (system, json.dumps(tools, sort_keys=True) if tools else "", instruction or "")
+    def prompt_parts(self, system: str, tools: list | None = None, instruction: str | None = None,
+                     history: list[dict] | None = None) -> tuple[list[int], list[int]]:
+        """(prefix_ids, suffix_ids): speech embeddings go between them.
+        `history`: earlier turns as text chat messages ({"role", "content"}), placed before the spoken turn."""
+        key = (system, json.dumps(tools, sort_keys=True) if tools else "", instruction or "",
+               json.dumps(history) if history else "")
         if key not in self._parts_cache:
-            self._parts_cache[key] = self._build_parts(system, tools, instruction)
+            if len(self._parts_cache) > 4096:  # histories make keys unique; keep the cache bounded
+                self._parts_cache.clear()
+            self._parts_cache[key] = self._build_parts(system, tools, instruction, history)
         return self._parts_cache[key]
 
-    def _build_parts(self, system: str, tools: list | None, instruction: str | None) -> tuple[list[int], list[int]]:
+    @staticmethod
+    def _messages(system: str, history: list[dict] | None, user: str) -> list[dict]:
+        return ([{"role": "system", "content": system}] + [dict(m) for m in (history or [])]
+                + [{"role": "user", "content": user}])
+
+    def _build_parts(self, system: str, tools: list | None, instruction: str | None,
+                     history: list[dict] | None = None) -> tuple[list[int], list[int]]:
         user = PLACEHOLDER + (f"\n{instruction}" if instruction else "")
-        text = self._render([{"role": "system", "content": system}, {"role": "user", "content": user}],
-                            tools, add_generation_prompt=True)
+        text = self._render(self._messages(system, history, user), tools, add_generation_prompt=True)
         before, after = text.split(PLACEHOLDER)
         return self.ids(before), self.ids(after)
 
-    def text_prompt_ids(self, system: str, user_text: str, tools: list | None = None) -> list[int]:
+    def text_prompt_ids(self, system: str, user_text: str, tools: list | None = None,
+                        history: list[dict] | None = None) -> list[int]:
         """Full prompt for a *text* user turn, ending with the assistant header."""
-        text = self._render([{"role": "system", "content": system}, {"role": "user", "content": user_text}],
-                            tools, add_generation_prompt=True)
+        text = self._render(self._messages(system, history, user_text), tools, add_generation_prompt=True)
         return self.ids(text)
 
     def user_turn_parts(self) -> tuple[list[int], list[int]]:
@@ -251,9 +261,9 @@ class PromptBuilder:
         return self.ids("\n" + before), self.ids(after)
 
     def target_text(self, system: str, tools: list | None, content: str = "",
-                    tool_calls: list[dict] | None = None) -> str:
+                    tool_calls: list[dict] | None = None, history: list[dict] | None = None) -> str:
         """Assistant reply exactly as the chat template renders it, ending with <|im_end|>."""
-        base = [{"role": "system", "content": system}, {"role": "user", "content": PLACEHOLDER}]
+        base = self._messages(system, history, PLACEHOLDER)
         prompt = self._render(base, tools, add_generation_prompt=True)
         msg: dict = {"role": "assistant", "content": content}
         if tool_calls:
@@ -267,8 +277,8 @@ class PromptBuilder:
         return target[: end + len("<|im_end|>")]
 
     def target_ids(self, system: str, tools: list | None, content: str = "",
-                   tool_calls: list[dict] | None = None) -> list[int]:
-        return self.ids(self.target_text(system, tools, content, tool_calls))
+                   tool_calls: list[dict] | None = None, history: list[dict] | None = None) -> list[int]:
+        return self.ids(self.target_text(system, tools, content, tool_calls, history))
 
     def tool_response_ids(self, results: list) -> list[int]:
         """Tokens appended after a tool-call turn (cache ends at <|im_end|>) with the tool results."""

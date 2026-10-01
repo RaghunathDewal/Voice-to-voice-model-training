@@ -155,3 +155,15 @@ def test_hotel_tools():
                        [{"name": "create_issue", "arguments": {"category": "noise", "description": "y"}}])
     assert not calls_match([{"name": "order_product", "arguments": {"product": "towel", "quantity": 1}}],
                            [{"name": "order_product", "arguments": {"product": "towel", "quantity": 2}}])
+
+
+def test_hotel_v2_examples_are_valid_and_varied():
+    from s2s.data.hotel import validate_call
+    from s2s.data.hotel_v2 import generate_examples_v2
+
+    rows = generate_examples_v2(2000, seed=3)
+    assert all(validate_call(c) is None for r in rows for c in r["tool_calls"])
+    assert all(r["tool_calls"] or (r.get("reply") and r.get("answer_contains")) for r in rows)
+    assert len({r["text"] for r in rows}) > 1200                       # many distinct phrasings
+    assert 0.2 < sum(1 for r in rows if r.get("history")) / len(rows) < 0.4
+    assert any("reservation" in r["text"].lower() and not r["tool_calls"] for r in rows)

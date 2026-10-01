@@ -8,6 +8,7 @@ Speech-LLM rows (stage 2/3):
     speech_frames  number of frames before the appended trailing silence
     text           transcript of the audio
     response       (optional) distilled thinker reply to the text -> "respond" task
+    history        (optional) earlier turns as text chat messages [{"role", "content"}], before the spoken turn
     tool_calls     (optional) gold tool calls  -> tool task
     reply          (optional) gold spoken reply -> tool/respond task
     context        (optional) extra system context (e.g. reservation JSON)
@@ -106,13 +107,14 @@ class SpeechLLMDataset(Dataset):
         task = self.task_for(row, rng)
         system = PromptBuilder.system_content(self.system_prompt, row.get("context"))
         tools = tools_by_name(row.get("tools"))
+        history = row.get("history") or None  # earlier turns as text (multi-turn rows)
         if task == "tool":
-            prefix, suffix = self.prompts.prompt_parts(system, tools, None)
+            prefix, suffix = self.prompts.prompt_parts(system, tools, None, history)
             target = self.prompts.target_ids(system, tools, content=row.get("reply", ""),
-                                             tool_calls=row.get("tool_calls") or None)
+                                             tool_calls=row.get("tool_calls") or None, history=history)
         elif task == "respond":
-            prefix, suffix = self.prompts.prompt_parts(system, tools, None)
-            target = self.prompts.target_ids(system, tools, content=row["response"])
+            prefix, suffix = self.prompts.prompt_parts(system, tools, None, history)
+            target = self.prompts.target_ids(system, tools, content=row["response"], history=history)
         else:
             prefix, suffix = self.prompts.prompt_parts(system, None, self.transcribe_instruction)
             target = self.prompts.target_ids(system, None, content=sentence_case(row["text"]))

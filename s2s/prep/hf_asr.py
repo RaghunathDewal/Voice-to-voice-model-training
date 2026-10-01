@@ -8,6 +8,9 @@ like LibriSpeech. Only the parquet shards needed for --max-hours are downloaded.
     python -m s2s.prep.hf_asr --preset commonvoice --split train --max-hours 150 --name cv_train
     # People's Speech (clean): spontaneous / broadcast English
     python -m s2s.prep.hf_asr --preset peoples --split train --max-hours 60 --name peoples_train
+    # SLURP: real voice-assistant commands; SpokenWOZ: real phone dialogues with history
+    python -m s2s.prep.hf_asr --preset slurp --split train --max-utts 8000 --name slurp_train
+    python -m s2s.prep.hf_asr --preset spokenwoz --split train --max-utts 8000 --name spokenwoz_train
     # EdAcc: accented conversational English (evaluation)
     python -m s2s.prep.hf_asr --preset edacc --split validation --name edacc_valid
 
@@ -40,7 +43,24 @@ PRESETS = {
                            "text": "normalized_text", "accent": "accent"},
     "fleurs": {"repo": "google/fleurs", "prefix": "parquet-data/en_us/{split}-", "text": "transcription"},
     "svarah": {"repo": "ai4bharat/Svarah", "prefix": "data/{split}-", "text": "text"},  # accept its terms on HF first
+    # real people giving voice-assistant commands, close-talk and far-field mics (CC BY 4.0)
+    "slurp": {"repo": "marcel-gohsen/slurp", "prefix": "data/{split}-", "text": "transcript", "accent": "intent"},
+    # real customer-service phone calls, one user turn per row, with the dialogue so far (see the dataset card)
+    "spokenwoz": {"repo": "pirxus/spokenwoz-whisper", "prefix": "data/{split}-", "text": "text", "history": "context"},
 }
+
+
+def spokenwoz_history(ctx, max_exchanges: int = 2) -> list[dict]:
+    """SpokenWOZ `context` column -> the last user/agent exchanges as chat messages."""
+    if not isinstance(ctx, dict):
+        return []
+    users, agents = ctx.get("text") or [], ctx.get("agent_text") or []
+    msgs = []
+    for u, a in list(zip(users, agents))[-max_exchanges:]:
+        u, a = clean_text(u), clean_text(a)
+        if u and a:
+            msgs += [{"role": "user", "content": u}, {"role": "assistant", "content": a}]
+    return msgs
 
 SR = 16000
 # EdAcc / People's Speech markup that is not speech
@@ -148,6 +168,10 @@ def main() -> None:
                    "duration": round(dur, 3), "source": args.preset}
             if "accent" in preset:
                 row["accent"] = accent
+            if preset.get("history"):
+                hist = spokenwoz_history(rec.get(preset["history"]))
+                if hist:
+                    row["history"] = hist
             rows.append(row)
             total_s += dur
             per_accent[accent] = per_accent.get(accent, 0.0) + dur
