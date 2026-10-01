@@ -25,6 +25,7 @@ from typing import Iterator
 import numpy as np
 import torch
 
+from s2s.audio import resample
 from s2s.models.adapter import SpeechAdapter
 from s2s.models.codec import MimiCodec, StreamingDecoder
 from s2s.models.talker import Talker, TalkerStream, sample_logits
@@ -64,7 +65,32 @@ class VoiceAgent:
         self.talker = Talker.load(os.path.join(talker_dir, "talker.pt")).to(self.device).eval()
         self.layer_idx = self.talker_meta.get("layer_idx") or self.thinker.hidden_layer_indices(list(cfg.talker.hidden_layers))
         self.codec = MimiCodec(cfg.codec.model, self.device, self.talker.K)
+        # speech INPUT encoder: whatever the adapter was trained on (Mimi output codec is separate)
+        self.encoder_spec = self.adapter.hparams.get("encoder", "mimi")
+        if self.encoder_spec == "mimi":
+            self.input_encoder = None
+        else:
+            from s2s.models.encoders import build_encoder
+
+            self.input_encoder = build_encoder(self.encoder_spec, self.device)
+        # only Mimi is causal: its frames never change, so they can be prefilled while the user speaks
+        self.incremental_input = self.input_encoder is None
+        print(f"[agent] input encoder: {self.encoder_spec}")
         print(f"[agent] thinker: {thinker_desc}; talker layers {self.layer_idx}; device {self.device} {self.dtype}")
+
+    @torch.no_grad()
+    def encode_input(self, wavs: list[np.ndarray]) -> list[torch.Tensor]:
+        """24 kHz float32 waveforms -> list of [T, D] input features at 12.5 Hz."""
+        if self.input_encoder is None:
+            return self.codec.encode_latents(wavs)
+        sr = self.input_encoder.sample_rate
+        return self.input_encoder.encode([resample(w, self.codec.sample_rate, sr) for w in wavs])
+
+    @torch.no_grad()
+    def eot_probability(self, wav: np.ndarray) -> float:
+        """End-of-turn probability at the last frame of a (partial) 24 kHz utterance."""
+        out = self.adapter(self.encode_input([wav])[0][None].to(self.device))
+        return float(torch.sigmoid(out["eot_logits"][0, -1]))
 
     def new_session(self, system_prompt: str | None = None, context: str | None = None,
                     tools: list | None = None, backend=None) -> "VoiceSession":
@@ -112,8 +138,9 @@ class VoiceSession:
         """Whole user utterance (24 kHz float32 numpy) -> reply events."""
         timer = timer or Timer()
         turn = StreamingTurn(self, timer=timer)
-        turn.add_latents(self.a.codec.encode_latents([wav])[0], wav_frames=None)
         timer.mark("endpoint")
+        turn.add_latents(self.a.encode_input([wav])[0], wav_frames=None)
+        timer.mark("input_encoded")
         yield from turn.finish()
 
     def _open_turn(self) -> None:
@@ -260,10 +287,29 @@ class StreamingTurn:
         n_frames = len(self.audio) // hop
         if n_frames == prev_frames:
             return False
+        if not self.s.a.incremental_input:
+            return self._feed_buffered(prev_frames, n_frames)
         # Mimi is causal: re-encoding the buffer leaves earlier frames unchanged.
         # (Simple and correct; a production build would keep Mimi's streaming state.)
         lat = self.codec.encode_latents([self.audio[: n_frames * hop]])[0]
         self.add_latents(lat, wav_frames=(prev_frames, n_frames))
+        return self.ended
+
+    def _feed_buffered(self, prev_frames: int, n_frames: int) -> bool:
+        """Whole-utterance encoders (e.g. Parakeet): endpoint on the buffer, encode once in finish().
+        The end-of-turn head is only run once enough silence has passed (it needs a full encode)."""
+        hop, ep = self.codec.hop, self.endpointer
+        for f in range(prev_frames, n_frames):
+            frame = self.audio[f * hop:(f + 1) * hop]
+            eot = 0.0
+            if (not ep.is_speech(frame) and ep.speech_ms >= ep.min_speech_ms
+                    and ep.silence_ms + ep.frame_ms >= ep.min_silence_ms):
+                eot = self.s.a.eot_probability(self.audio[: (f + 1) * hop])
+                self.eot_probs.append(eot)
+            if ep.update(frame, eot):
+                self.ended = True
+                self.timer.mark("endpoint")
+                break
         return self.ended
 
     @torch.no_grad()
@@ -289,6 +335,9 @@ class StreamingTurn:
     @torch.no_grad()
     def finish(self) -> Iterator[dict]:
         a = self.s.a
+        if self.latents is None and len(self.audio):  # whole-utterance encoder: encode the turn now
+            self.add_latents(a.encode_input([self.audio])[0], wav_frames=None)
+            self.timer.mark("input_encoded")
         if self.latents is not None:
             ctc = a.adapter(self.latents[None].to(a.device))["ctc_logits"][0].argmax(-1).tolist()
             transcript = ctc_greedy_decode(ctc)

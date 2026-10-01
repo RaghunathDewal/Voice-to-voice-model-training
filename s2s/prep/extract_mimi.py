@@ -4,6 +4,10 @@
     python -m s2s.prep.extract_mimi --mode latents --in data/manifests/librispeech_dev_raw.jsonl \
         --out data/manifests/librispeech_dev.jsonl
 
+    # input features from another frozen encoder (here NVIDIA Parakeet, 1024-d at 12.5 Hz)
+    python -m s2s.prep.extract_mimi --mode latents --encoder parakeet:nvidia/parakeet-ctc-0.6b \
+        --in data/manifests/cv_train_raw.jsonl --out data/manifests/cv_train_pk.jsonl
+
     # the same, sounding like real microphones (noise, reverb, phone/laptop EQ) for 60% of clips
     python -m s2s.prep.extract_mimi --mode latents --augment-prob 0.6 --in data/manifests/cv_train_raw.jsonl \
         --out data/manifests/cv_train.jsonl
@@ -60,6 +64,8 @@ def main() -> None:
     p.add_argument("--max-utts", type=int, default=0)
     p.add_argument("--augment-prob", type=float, default=0.0,
                    help="latents only: fraction of utterances passed through s2s.augment (noise, reverb, mic EQ)")
+    p.add_argument("--encoder", default="mimi",
+                   help="latents only: input encoder, e.g. parakeet:nvidia/parakeet-ctc-0.6b (s2s/models/encoders.py)")
     p.add_argument("--gpus", type=int, default=0, help="worker processes, one per GPU (0 = all visible GPUs)")
     p.add_argument("--shard", type=int, default=None, help=argparse_hidden())
     p.add_argument("--num-shards", type=int, default=1, help=argparse_hidden())
@@ -80,8 +86,16 @@ def main() -> None:
     os.makedirs(feat_dir, exist_ok=True)
     out_dir = os.path.dirname(os.path.abspath(args.out))
 
-    codec = MimiCodec(cfg.codec.model, device, cfg.codec.num_codebooks)
-    sr = codec.sample_rate
+    use_mimi = args.mode == "codes" or args.encoder == "mimi"
+    if use_mimi:
+        codec = MimiCodec(cfg.codec.model, device, cfg.codec.num_codebooks)
+        sr, encode, num_frames = codec.sample_rate, codec.encode_latents, codec.num_frames
+    else:  # another frozen input encoder; same 12.5 Hz frame grid as Mimi
+        from s2s.models.encoders import build_encoder, n_frames
+
+        enc = build_encoder(args.encoder, device)
+        sr, encode = enc.sample_rate, enc.encode
+        num_frames = lambda n: n_frames(n, sr)  # noqa: E731
     silence = float(cfg.codec.trailing_silence_s) if args.mode == "latents" else 0.0
     bs = int(cfg.codec.extract_batch_size)
     suffix = "lat" if args.mode == "latents" else "codes"
@@ -106,12 +120,13 @@ def main() -> None:
         row["duration"] = round(duration, 3)
         if args.mode == "latents":
             row["speech_frames"] = n_speech_frames
+            row["encoder"] = args.encoder
         out_rows.append(row)
 
     for r in tqdm(done, desc="existing features", disable=not done, mininterval=5):
         info = sf.info(r["audio"])
         n_samples = int(round(info.frames * sr / info.samplerate))
-        finish(r, codec.num_frames(n_samples), n_samples / sr)
+        finish(r, num_frames(n_samples), n_samples / sr)
 
     batch: list[tuple[dict, np.ndarray]] = []
 
@@ -119,9 +134,9 @@ def main() -> None:
         if not batch:
             return
         wavs = [w for _, w in batch]
-        feats = codec.encode_latents(wavs) if args.mode == "latents" else codec.encode_codes(wavs)
+        feats = encode(wavs) if args.mode == "latents" else codec.encode_codes(wavs)
         for (r, w), feat in zip(batch, feats):
-            n_speech = codec.num_frames(int(r["_n_samples"]))
+            n_speech = num_frames(int(r["_n_samples"]))
             if args.mode == "latents":
                 save_npy_atomic(r["_feat"], feat.cpu().numpy().astype(np.float16))
             else:
@@ -130,7 +145,7 @@ def main() -> None:
         batch.clear()
 
     tag = f" [GPU shard {args.shard}]" if args.shard is not None else ""
-    for r in tqdm(pending, desc=f"mimi {args.mode}{tag}", mininterval=5):
+    for r in tqdm(pending, desc=f"{args.encoder.split(':')[0]} {args.mode}{tag}", mininterval=5):
         try:
             wav = load_audio(r["audio"], sr)
         except Exception as e:  # noqa: BLE001 - keep going on a broken file

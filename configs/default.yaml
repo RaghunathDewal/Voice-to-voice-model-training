@@ -34,6 +34,7 @@ thinker:
   transcribe_instruction: "Transcribe the audio exactly."
 
 adapter:
+  encoder: mimi             # input encoder: mimi | parakeet:nvidia/parakeet-ctc-0.6b | whisper:<id> (s2s/models/encoders.py)
   d_model: 1024
   n_layers: 4
   n_heads: 16

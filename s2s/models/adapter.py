@@ -1,6 +1,10 @@
-"""Speech adapter: Mimi latents (12.5 Hz) -> Qwen input embeddings.
+"""Speech adapter: frozen-encoder features (12.5 Hz) -> Qwen input embeddings.
 
-    latents [B,T,512] -> LayerNorm -> Linear -> causal transformer -> hidden [B,T,d]
+The input encoder is Mimi (512-d latents) or any encoder from s2s/models/encoders.py
+(e.g. Parakeet, 1024-d); its spec is stored in the checkpoint (hparams["encoder"]),
+so the runtime always encodes speech with the encoder the adapter was trained on.
+
+    latents [B,T,D] -> LayerNorm -> Linear -> causal transformer -> hidden [B,T,d]
         hidden -> Linear -> RMSNorm * scale -> speech embeddings [B,T,H_llm]
         hidden -> CTC head (upsampled x4 -> 50 Hz, character vocab)   [aux: transcripts]
         hidden -> end-of-turn head (per frame logit)                  [aux: endpointing]
@@ -20,10 +24,13 @@ from s2s.text import CTC_VOCAB
 
 class SpeechAdapter(nn.Module):
     def __init__(self, latent_dim: int, llm_dim: int, d_model: int = 1024, n_layers: int = 4,
-                 n_heads: int = 16, ff_mult: int = 4, dropout: float = 0.1, ctc_upsample: int = 4):
+                 n_heads: int = 16, ff_mult: int = 4, dropout: float = 0.1, ctc_upsample: int = 4,
+                 encoder: str = "mimi"):
         super().__init__()
         self.hparams = dict(latent_dim=latent_dim, llm_dim=llm_dim, d_model=d_model, n_layers=n_layers,
-                            n_heads=n_heads, ff_mult=ff_mult, dropout=dropout, ctc_upsample=ctc_upsample)
+                            n_heads=n_heads, ff_mult=ff_mult, dropout=dropout, ctc_upsample=ctc_upsample,
+                            encoder=encoder)
+        self.encoder_spec = encoder
         self.in_norm = nn.LayerNorm(latent_dim)
         self.in_proj = nn.Linear(latent_dim, d_model)
         self.encoder = CausalTransformer(d_model, n_layers, n_heads, ff_mult, dropout)
@@ -40,7 +47,8 @@ class SpeechAdapter(nn.Module):
     @classmethod
     def from_config(cls, cfg, latent_dim: int, llm_dim: int) -> "SpeechAdapter":
         return cls(latent_dim=latent_dim, llm_dim=llm_dim, d_model=cfg.d_model, n_layers=cfg.n_layers,
-                   n_heads=cfg.n_heads, ff_mult=cfg.ff_mult, dropout=cfg.dropout, ctc_upsample=cfg.ctc_upsample)
+                   n_heads=cfg.n_heads, ff_mult=cfg.ff_mult, dropout=cfg.dropout, ctc_upsample=cfg.ctc_upsample,
+                   encoder=str(cfg.get("encoder", "mimi")))
 
     @torch.no_grad()
     def init_scale(self, text_embedding_rms: float) -> None:

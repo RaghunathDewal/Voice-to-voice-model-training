@@ -45,6 +45,10 @@ def main() -> None:
     thinker.model.eval()
     adapter = SpeechAdapter.load(os.path.join(args.speech_llm_dir, "adapter.pt")).to(device).eval()
     rows = load_manifest(args.manifest)[: args.max or None]
+    enc_spec = adapter.hparams.get("encoder", "mimi")
+    found = {r.get("encoder", "mimi") for r in rows}
+    if found != {enc_spec}:
+        raise ValueError(f"adapter was trained on {enc_spec} features but {args.manifest} has {sorted(found)}")
     trail = int(cfg.train_speech_llm.max_trailing_frames) // 2
 
     tool_speech, tool_text, n_tool = 0, 0, 0

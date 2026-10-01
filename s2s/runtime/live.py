@@ -22,7 +22,6 @@ from collections import deque
 from typing import Callable
 
 import numpy as np
-import torch
 
 from s2s.runtime.endpoint import Endpointer
 
@@ -45,11 +44,8 @@ class LiveListener:
         codec = agent.codec
         ep = Endpointer.from_config(agent.cfg.runtime.endpoint, 1000.0 / codec.frame_rate)
 
-        @torch.no_grad()
         def eot_fn(wav: np.ndarray) -> float:
-            lat = codec.encode_latents([wav])[0]
-            out = agent.adapter(lat[None].to(agent.device))
-            return float(torch.sigmoid(out["eot_logits"][0, -1]))
+            return agent.eot_probability(wav)  # encodes with the adapter's input encoder (Mimi, Parakeet, ...)
 
         return cls(ep, codec.hop, eot_fn, sample_rate=codec.sample_rate, **kw)
 

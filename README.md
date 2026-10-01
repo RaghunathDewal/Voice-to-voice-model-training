@@ -7,6 +7,12 @@ user audio ─► Mimi encoder ─► speech adapter ─► Qwen3 thinker ─►
                 (frozen)        (trained)       (LoRA, tools)    (trained)     (frozen)
 ```
 
+**Input encoder.** Mimi is the default input encoder, but an encoder bake-off
+(`s2s/eval/encoder_bakeoff.py`) showed that **NVIDIA Parakeet-CTC-0.6B** exposes far more of the spoken
+content to the adapter (probe WER 28.7 % vs 89.2 % for Mimi on Common Voice; also best on accented and
+noisy speech). Any adapter can be trained on another encoder's features (section 3b); the checkpoint
+stores the encoder, and the runtime uses it automatically. Mimi remains the output codec.
+
 There is **no ASR text → LLM → TTS pipeline at runtime**. The thinker receives speech embeddings,
 and the talker generates Mimi codec tokens straight from the thinker's token embeddings and hidden
 states. Design details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
@@ -238,6 +244,27 @@ The latency report splits **endpoint wait** (silence needed before the turn ends
 reports input processing per 80 ms frame, which must stay below 80 ms. Network and playback
 buffering are not included.
 
+## 3b. Switching the input encoder (e.g. Parakeet), thinker and talker unchanged
+
+```bash
+E=parakeet:nvidia/parakeet-ctc-0.6b
+# features from the new encoder (same 12.5 Hz frames, trailing silence and augmentation as for Mimi)
+python -m s2s.prep.extract_mimi $CFG --mode latents --encoder $E --augment-prob 0.5 \
+    --in data/manifests/cv_train_raw.jsonl --out data/manifests/cv_train_pk.jsonl
+# a new adapter from scratch; the merged thinker stays frozen, so the talker needs no retraining
+torchrun --standalone --nproc_per_node=$NGPU -m s2s.train.speech_llm $CFG --set adapter.encoder=$E \
+    thinker.model=checkpoints/thinker_merged train_speech_llm.train_lora=false \
+    train_speech_llm.output_dir=checkpoints/speech_llm_parakeet \
+    'train_speech_llm.train_manifests=[{path: data/manifests/cv_train_pk.jsonl, weight: 1.0}]' \
+    train_speech_llm.valid_manifest=data/manifests/edacc_valid_pk.jsonl
+# runtime picks the encoder from the adapter checkpoint
+python -m s2s.cli.gradio_live $CFG --speech-llm-dir checkpoints/speech_llm_parakeet --share
+```
+
+Training and evaluation refuse to mix features from different encoders. Parakeet is not causal: the
+runtime buffers the turn (end-of-turn detection still runs in pauses) and encodes it once when the
+user stops (~90 ms for 5 s of speech on a T4 in fp32), instead of prefilling while the user speaks.
+
 ## 4. Configuration reference
 
 | Key | Meaning |
@@ -245,6 +272,7 @@ buffering are not included.
 | `thinker.model` | `Qwen/Qwen3-1.7B` (default) or `Qwen/Qwen3-0.6B` (small) |
 | `thinker.dtype` | `auto` → bf16 on Ampere+, fp16 on T4/P100. Use `fp32` if you see NaN losses |
 | `thinker.system_prompt` | used in distillation, training and runtime. **Keep it identical** across stages |
+| `adapter.encoder` | input encoder for a *new* adapter: `mimi` (default) or e.g. `parakeet:nvidia/parakeet-ctc-0.6b` |
 | `adapter.*` | adapter size, CTC upsampling |
 | `talker.first_text_chunk / text_chunk / audio_chunk` | interleaving schedule (8 / 4 / 10). Changing it needs retraining |
 | `talker.acoustic_delay` | codebooks 2..8 lag codebook 1 by this many frames |
@@ -258,6 +286,7 @@ buffering are not included.
 configs/            default.yaml (1.7B), small.yaml (0.6B)
 s2s/models/         codec.py (Mimi), adapter.py, thinker.py (Qwen3 + prompts), talker.py, speech_llm.py (glue/losses)
 s2s/data/           datasets.py (manifests, collators), hotel.py (tools, mock backend, data generator)
+s2s/models/encoders.py      frozen input encoders (Mimi, Whisper, Parakeet, Moonshine) at 12.5 Hz
 s2s/eval/encoder_bakeoff.py   compare input encoders (Mimi, Whisper, Parakeet, Moonshine-streaming): probe WER, latency, memory
 s2s/prep/           librispeech, ljspeech, hf_asr (Common Voice, People's Speech, EdAcc ...), extract_mimi (+ augmentation), distill, hotel_data, synth_kokoro, merge_lora, smoke
 s2s/train/          probe_ctc (exp 1), speech_llm (stages 2+3), talker (stage 4)

@@ -17,7 +17,12 @@ thinker stays exactly as merged in stage 3, so the talker (trained on that think
         --set thinker.model=checkpoints/thinker_merged train_speech_llm.train_lora=false \
               train_speech_llm.init_from=checkpoints/adapter_init train_speech_llm.output_dir=checkpoints/speech_llm_robust ...
 
-Checkpoint directory layout: adapter.pt, lora/ (PEFT, only when a LoRA is trained), config.yaml, state.json
+Another input encoder (features from extract_mimi --encoder ...): train a new adapter from scratch
+    python -m s2s.train.speech_llm --config configs/default.yaml \
+        --set adapter.encoder=parakeet:nvidia/parakeet-ctc-0.6b thinker.model=checkpoints/thinker_merged \
+              train_speech_llm.train_lora=false train_speech_llm.output_dir=checkpoints/speech_llm_parakeet ...
+
+Checkpoint directory layout: adapter.pt (stores the encoder spec), lora/ (PEFT, only when a LoRA is trained), config.yaml, state.json
 """
 
 from __future__ import annotations
@@ -150,6 +155,12 @@ def main() -> None:
     valid_rows = load_manifest(tc.valid_manifest)
     latent_dim = np.load(rows[0]["latent"], mmap_mode="r").shape[1]
     thinker, adapter = build_models(cfg, device, dtype, tc.init_from, bool(tc.train_lora), latent_dim)
+    enc_spec = adapter.hparams.get("encoder", "mimi")
+    found = {r.get("encoder", "mimi") for r in rows + valid_rows}
+    if found != {enc_spec} or adapter.hparams["latent_dim"] != latent_dim:
+        raise ValueError(f"adapter expects {enc_spec} features ({adapter.hparams['latent_dim']}-d) but the manifests "
+                         f"contain {sorted(found)} ({latent_dim}-d); set adapter.encoder / init_from to match")
+    log(f"input encoder: {enc_spec} ({latent_dim}-d features)")
     thinker.model.train()
     adapter.train()
     module = SpeechLLMTrainModule(thinker, adapter, tc.ctc_weight, tc.eot_weight)
