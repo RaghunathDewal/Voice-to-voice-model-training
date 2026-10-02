@@ -21,6 +21,7 @@ from __future__ import annotations
 import collections
 import os
 import random
+import sys
 import threading
 import time
 
@@ -133,6 +134,7 @@ def main() -> None:
     p.add_argument("--upload-repo", default=None, help="push each saved LoRA to this HF model repo")
     p.add_argument("--resume", action="store_true", help="continue from <out>/lora and <out>/state.json")
     args = p.parse_args()
+    sys.stdout.reconfigure(line_buffering=True)  # show progress live when piped (Colab/Kaggle `| tee`)
     cfg = config_from_args(args)
     set_seed(cfg.seed)
     device = resolve_device(cfg.device)
