@@ -157,13 +157,18 @@ def _wakeup(rng, wrap=True):
     nxt = ["six", "seven", "eight", "nine", "ten"][hour - 5]
     forms = {0: [f"{word} AM", f"{word} o'clock", f"{hour} AM", f"{hour}:00"],
              15: [f"{word} fifteen", f"quarter past {word}", f"{hour}:15"],
-             30: [f"{word} thirty", f"half past {word}", f"{hour}:30"],
+             30: [f"{word} thirty", f"half past {word}", f"{hour}:30", f"half {word}"],
              45: [f"{word} forty five", f"quarter to {nxt}", f"{hour}:45"]}[minute]
     t = rng.choice(forms)
     core = rng.choice([
         "can I get a wake up call at {t}?", "please wake me up at {t} tomorrow.", "set a wake-up call for {t}.",
         "I need a wake up call at {t} in the morning.", "wake me up at {t} please.",
         "kindly give me a wake up call at {t}.", "could you call my room at {t} to wake me up?",
+        # without the words "wake" / "wake-up": guests often just ask to be called
+        "call me at {t} tomorrow morning.", "ring me at {t} please.", "can you give my room a ring at {t}?",
+        "I need to be up at {t}.", "get me up at {t}, please.", "I have an early start, call me at {t}.",
+        "don't let me sleep past {t}.", "I've got a flight, can you call the room at {t}?",
+        "phone me at {t} in the morning.", "I have to be up by {t}, can you call me?",
     ]).format(t=t)
     call = {"name": "schedule_wakeup_call", "arguments": {"time": f"{hour:02d}:{minute:02d}"}}
     reply = f"Done, you'll get a wake-up call at {hour}:{minute:02d} AM."

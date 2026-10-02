@@ -30,6 +30,8 @@ PROBES = [
     ("Mind if I ask when breakfast starts?", "get_property_information:topic=breakfast"),
     ("Is there somewhere I can go for a swim?", "get_property_information:topic=pool"),
     ("I gotta be up at six thirty tomorrow, can you ring me?", "schedule_wakeup_call:time=06:30"),
+    ("Could someone buzz my room at seven fifteen?", "schedule_wakeup_call:time=07:15"),
+    ("Please don't let me oversleep, I need a call at eight.", "schedule_wakeup_call:time=08:00"),
     ("Who are you?", "answer"),
     ("What's the capital of France?", "answer"),
     ("Where can I buy some medicine around here?", "front desk"),
