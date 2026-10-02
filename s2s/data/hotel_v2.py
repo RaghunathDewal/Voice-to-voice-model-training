@@ -224,12 +224,36 @@ def _smalltalk(rng, res):
     return rng.choice(qs), None, (reply, facts)
 
 
+# requests the hotel handles, but not through our tools: hand over to the front desk, never invent a tool call
+_FRONT_DESK = [
+    "I'd like to extend my stay by another night.", "can I get a late checkout tomorrow?", "I want to change to a bigger room.",
+    "can you cancel my booking?", "can I pay my bill now?", "can you email me the invoice?", "can I add one more guest to my room?",
+    "can you upgrade me to a suite?", "I lost my room key card.", "can I check out early today?", "is there a pharmacy nearby?",
+    "can you recommend a good restaurant nearby?", "how do I get to the train station?", "can you arrange an airport pickup?",
+    "can I leave my luggage here after checkout?", "can I book a second room for my parents?", "where is the nearest ATM?",
+    "can you change my booking to next weekend?", "can I get a refund for last night?", "is there a doctor I can see nearby?",
+]
+_FRONT_DESK_REPLIES = ["I can't do that myself, but the front desk will be happy to help you with that.",
+                       "That's something the front desk can arrange for you. Please give them a call.",
+                       "I'm not able to do that, but the front desk can help you right away."]
+# health and safety: point to the front desk and emergency services, never a tool call
+_URGENT = ["I need a doctor, I'm not feeling well.", "my kid has a high fever.", "someone fainted in my room.",
+           "I think I need an ambulance.", "I cut my hand badly.", "my husband is having trouble breathing."]
+_URGENT_REPLY = ("I'm sorry to hear that. Please call the front desk right away so they can get you medical help, "
+                 "and in an emergency call your local emergency number.")
+_ELSEWHERE = ["Can you book me a taxi to the airport?", "What's the weather like tomorrow?", "Can you play some music?",
+              "Book me a table at a restaurant downtown.", "Can you order me a pizza from outside?",
+              "What's the score of the cricket match?", "Can you book a flight for me?", "Set a reminder for my meeting."]
+
+
 def _out_of_scope(rng, res):
-    qs = ["Can you book me a taxi to the airport?", "What's the weather like tomorrow?", "Can you play some music?",
-          "Book me a table at a restaurant downtown.", "Can you order me a pizza from outside?",
-          "What's the score of the cricket match?", "Can you book a flight for me?", "Set a reminder for my meeting."]
+    r = rng.random()
+    if r < 0.45:
+        return _wrap(rng, rng.choice(_FRONT_DESK)), None, (rng.choice(_FRONT_DESK_REPLIES), ["front desk"])
+    if r < 0.6:
+        return _wrap(rng, rng.choice(_URGENT)), None, (_URGENT_REPLY, ["front desk"])
     reply = "Sorry, I can't help with that, but the front desk will be happy to assist you."
-    return _wrap(rng, rng.choice(qs)), None, (reply, ["front desk"])
+    return _wrap(rng, rng.choice(_ELSEWHERE)), None, (reply, ["front desk"])
 
 
 _ACTION = [_order, _issue, _info, _wakeup]
@@ -242,7 +266,7 @@ def _single(rng, res):
     if r < 0.62:
         text, call, reply = rng.choice(_ACTION)(rng)
         return text, call, reply, None
-    fn = rng.choices(_CONTEXT, weights=[0.40, 0.25, 0.20, 0.15])[0]
+    fn = rng.choices(_CONTEXT, weights=[0.36, 0.22, 0.17, 0.25])[0]
     text, _, (reply, facts) = fn(rng, res)
     return text, None, reply, facts
 
