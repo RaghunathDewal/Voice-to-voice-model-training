@@ -112,6 +112,7 @@ def main() -> None:
     cfg = config_from_args(args)
     tc = cfg.train_talker
     rank, world, device = init_distributed(cfg.device)
+    arm_watchdog()  # a hang during setup (model load, NCCL / DDP init) also prints every stack
     main_proc = rank == 0
     log = print if main_proc else (lambda *a, **k: None)
     set_seed(cfg.seed)  # same seed on every rank -> identical initial weights

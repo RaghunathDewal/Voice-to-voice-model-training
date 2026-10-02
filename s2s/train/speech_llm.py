@@ -143,6 +143,7 @@ def main() -> None:
     cfg = config_from_args(args)
     tc = cfg.train_speech_llm
     rank, world, device = init_distributed(cfg.device)
+    arm_watchdog()  # a hang during setup (model load, NCCL / DDP init) also prints every stack
     main_proc = rank == 0
     log = print if main_proc else (lambda *a, **k: None)
     set_seed(cfg.seed)  # same seed on every rank -> identical initial weights
@@ -153,6 +154,7 @@ def main() -> None:
     log(f"device {device} x {world} process(es), thinker dtype {dtype}, "
         f"effective batch {int(tc.batch_size) * grad_accum * world} (batch {tc.batch_size} x accum {grad_accum} x {world} GPU)")
 
+    log("loading manifests ...")
     rows, weights = load_mixture(tc.train_manifests)
     valid_rows = load_manifest(tc.valid_manifest)
     latent_dim = np.load(rows[0]["latent"], mmap_mode="r").shape[1]
@@ -165,6 +167,7 @@ def main() -> None:
     log(f"input encoder: {enc_spec} ({latent_dim}-d features)")
     thinker.model.train()
     adapter.train()
+    log("models ready, wrapping for DDP ..." if world > 1 else "models ready")
     module = SpeechLLMTrainModule(thinker, adapter, tc.ctc_weight, tc.eot_weight)
     model = DDP(module, device_ids=[device.index] if device.type == "cuda" else None) if world > 1 else module
 
@@ -192,6 +195,7 @@ def main() -> None:
     log(f"adapter params {count_params(adapter) / 1e6:.1f}M, trainable thinker params {sum(p.numel() for p in lora_params) / 1e6:.1f}M")
     log(f"train rows {len(rows)}, valid rows {len(valid_rows)}")
 
+    log("starting training loop")
     step, accum = 0, 0
     t0 = time.time()
     running: dict[str, float] = {}
