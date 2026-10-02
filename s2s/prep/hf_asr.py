@@ -42,7 +42,9 @@ PRESETS = {
     "voxpopuli_accented": {"repo": "facebook/voxpopuli", "prefix": "en_accented/{split}-",
                            "text": "normalized_text", "accent": "accent"},
     "fleurs": {"repo": "google/fleurs", "prefix": "parquet-data/en_us/{split}-", "text": "transcription"},
-    "svarah": {"repo": "ai4bharat/Svarah", "prefix": "data/{split}-", "text": "text"},  # accept its terms on HF first
+    # Indian-accented English (CC BY 4.0, accept its terms on HF first); only a "test" split exists
+    "svarah": {"repo": "ai4bharat/Svarah", "prefix": "data/{split}-", "text": "text", "audio": "audio_filepath",
+               "accent": "primary_language"},
     # real people giving voice-assistant commands, close-talk and far-field mics (CC BY 4.0)
     "slurp": {"repo": "marcel-gohsen/slurp", "prefix": "data/{split}-", "text": "transcript", "accent": "intent"},
     # real customer-service phone calls, one user turn per row, with the dialogue so far (see the dataset card)
@@ -152,7 +154,7 @@ def main() -> None:
                 skipped += 1
                 continue
             try:
-                wav, sr = decode_audio(rec["audio"])
+                wav, sr = decode_audio(rec[preset.get("audio", "audio")])
             except Exception:  # noqa: BLE001 - skip broken clips
                 skipped += 1
                 continue
