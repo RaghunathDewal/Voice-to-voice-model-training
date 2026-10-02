@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 
 import numpy as np
@@ -47,6 +48,27 @@ def test_prompt_layout(tiny_models):
     assert pb.target_text("SYS", HOTEL_TOOLS, tool_calls=[call]) == (
         '<tool_call>\n{"name": "order_product", "arguments": {"product": "towel", "quantity": 2}}\n</tool_call><|im_end|>')
     assert pb.tokenizer.decode(pb.tool_response_ids([{"ok": True}])).startswith("\n<|im_start|>user\n<tool_response>")
+
+
+def test_text_sft_conversation_matches_runtime_layout(tiny_models):
+    """Thinker text fine-tuning: tool call + tool result + spoken reply, laid out exactly as the runtime feeds it."""
+    from s2s.data.hotel_v2 import generate_examples_v2
+    from s2s.models.thinker import PromptBuilder
+    from s2s.prep.thinker_sft_data import hotel_conversation
+
+    pb = PromptBuilder.from_pretrained(tiny_models["qwen"])
+    row = next(r for r in generate_examples_v2(80, seed=0) if r.get("tool_calls") and r.get("history"))
+    conv = hotel_conversation(row, "SYS")
+    ids, labels = pb.conversation_ids(conv["messages"], conv["tools"])
+    msgs = conv["messages"]
+    system, history, user, tool_msg = msgs[0]["content"], msgs[1:-4], msgs[-4]["content"], msgs[-2]["content"]
+    runtime = (pb.text_prompt_ids(system, user, conv["tools"], history)
+               + pb.target_ids(system, conv["tools"], tool_calls=row["tool_calls"], history=history)
+               + pb.tool_response_ids([json.loads(tool_msg)]))
+    assert ids[: len(runtime)] == runtime
+    trained = pb.tokenizer.decode([i for i, y in zip(ids, labels) if y != -100])
+    assert trained.startswith("<tool_call>") and trained.endswith(row["reply_after_tool"] + "<|im_end|>")
+    assert "<tool_response>" not in trained and "SYS" not in trained
 
 
 def test_labels_align_with_targets(tiny_models, cpu):

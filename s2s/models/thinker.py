@@ -280,6 +280,45 @@ class PromptBuilder:
                    tool_calls: list[dict] | None = None, history: list[dict] | None = None) -> list[int]:
         return self.ids(self.target_text(system, tools, content, tool_calls, history))
 
+    def conversation_ids(self, messages: list[dict], tools: list | None) -> tuple[list[int], list[int]]:
+        """Text fine-tuning sample: (input_ids, labels), labels -100 except on the assistant turns
+        after the last user message (e.g. tool call, then the reply once the tool results are in).
+
+        Built from the same pieces the runtime feeds the model (prompt, reply ending in <|im_end|>,
+        then "\\n" + the tool-response turn and assistant header), so training matches inference.
+        """
+        last_user = max(i for i, m in enumerate(messages) if m["role"] == "user")
+        first = last_user + 1
+        if first >= len(messages) or messages[first]["role"] != "assistant":
+            raise ValueError("the conversation must end with assistant turn(s) after the last user message")
+        ids = self.ids(self._render(messages[:first], tools, add_generation_prompt=True))
+        labels = [-100] * len(ids)
+        for i in range(first, len(messages)):
+            m = messages[i]
+            if m["role"] == "assistant":
+                if i > first:  # tool results between the previous assistant turn and this one
+                    prompt = self._render(messages[:i], tools, add_generation_prompt=True)
+                    seg = prompt[prompt.rfind("<|im_start|>user"):]
+                    if "<tool_response>" not in seg:
+                        raise ValueError("expected tool results between assistant turns")
+                    seg_ids = self.ids("\n" + seg)
+                    ids += seg_ids
+                    labels += [-100] * len(seg_ids)
+                target = self.ids(self._assistant_text(messages[:i], tools, m))
+                ids += target
+                labels += target
+            elif m["role"] != "tool":
+                raise ValueError(f"unexpected {m['role']} message after the last user turn")
+        return ids, labels
+
+    def _assistant_text(self, base: list[dict], tools: list | None, msg: dict) -> str:
+        prompt = self._render(base, tools, add_generation_prompt=True)
+        full = self._render(base + [msg], tools, add_generation_prompt=False)
+        if not full.startswith(prompt):
+            raise RuntimeError("chat template produced an unexpected layout for the assistant turn")
+        target = full[len(prompt):]
+        return target[: target.rfind("<|im_end|>") + len("<|im_end|>")]
+
     def tool_response_ids(self, results: list) -> list[int]:
         """Tokens appended after a tool-call turn (cache ends at <|im_end|>) with the tool results."""
         call = {"type": "function", "function": {"name": "f", "arguments": {}}}

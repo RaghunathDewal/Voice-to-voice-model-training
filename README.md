@@ -265,6 +265,22 @@ Training and evaluation refuse to mix features from different encoders. Parakeet
 runtime buffers the turn (end-of-turn detection still runs in pauses) and encodes it once when the
 user stops (~90 ms for 5 s of speech on a T4 in fp32), instead of prefilling while the user speaks.
 
+## 3c. Thinker LoRA from text (production step 2, one T4, ~1–1.5 h)
+
+Teaches the thinker hotel tool use, the spoken reply after a tool result, reservation answers and
+follow-ups from text only (hotel_v2 + xLAM + Hermes function calling; all commercially usable,
+xLAM needs its terms accepted on the Hub). The adapter and talker are trained on the thinker, so
+retrain both on the merged result.
+
+```bash
+python -m s2s.prep.thinker_sft_data $CFG --hotel 16000 --xlam 4000 --hermes 1500
+python -m s2s.train.thinker_text $CFG --base checkpoints/thinker_merged --out checkpoints/thinker_text \
+    --steps 1500 --batch 4 --accum 4 --upload-repo <user>/s2s-checkpoints     # --resume after a disconnect
+python -m s2s.prep.merge_lora $CFG --set thinker.model=checkpoints/thinker_merged \
+    --speech-llm-dir checkpoints/thinker_text --out checkpoints/thinker_merged_v2
+python -m s2s.eval.text_tools $CFG --model checkpoints/thinker_merged_v2 --manifest <hotel eval manifest>
+```
+
 ## 4. Configuration reference
 
 | Key | Meaning |

@@ -56,7 +56,7 @@ def main() -> None:
     results = []
     for r in tqdm(rows, desc="text tool eval"):
         system = Thinker.system_content(cfg.thinker.system_prompt, r.get("context"))
-        ids = thinker.prompts.text_prompt_ids(system, r["text"], tools_by_name(r.get("tools")))
+        ids = thinker.prompts.text_prompt_ids(system, r["text"], tools_by_name(r.get("tools")), r.get("history"))
         emb = thinker.embed(torch.tensor([ids], device=device))
         out = thinker.tokenizer.decode(greedy_generate(thinker, emb, 120), skip_special_tokens=False)
         pred = extract_calls(out)

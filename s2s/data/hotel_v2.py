@@ -12,7 +12,7 @@ only; a model trained on it echoed unfamiliar requests back to the guest. v2 add
     "No, I meant my reservation details", "Also send a toothbrush", "What about the pool?")
 
 Rows use the same fields as v1 (text, context, tools, tool_calls | reply + answer_contains)
-plus an optional `history` list of {"role", "content"} chat messages, so the
+plus `reply_after_tool` on tool rows (the spoken confirmation once the tool has run) and an optional `history` list of {"role", "content"} chat messages, so the
 existing scorer (hotel.score_example) works unchanged.
 """
 
@@ -293,6 +293,7 @@ def generate_examples_v2(n: int, seed: int = 0, follow_up_prob: float = 0.3) -> 
         row["text"] = text
         if call is not None:
             row["tool_calls"] = [call]
+            row["reply_after_tool"] = reply  # what the assistant says once the tool has run
         else:
             row.update(tool_calls=[], reply=reply, answer_contains=facts)
         rows.append(row)
