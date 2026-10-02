@@ -102,7 +102,7 @@ def hotel_accuracy(thinker: Thinker, system_prompt: str, rows: list[dict], show:
     return acc
 
 
-def upload_async(repo: str, folder: str, path_in_repo: str) -> None:
+def upload_async(repo: str, folder: str, path_in_repo: str) -> threading.Thread:
     def run():
         try:
             from huggingface_hub import HfApi
@@ -113,7 +113,9 @@ def upload_async(repo: str, folder: str, path_in_repo: str) -> None:
         except Exception as e:  # noqa: BLE001 - never stop training because of an upload
             print(f"[upload] failed: {e}")
 
-    threading.Thread(target=run, daemon=True).start()
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    return t
 
 
 def main() -> None:
@@ -164,13 +166,15 @@ def main() -> None:
     scaler = make_grad_scaler(enabled=device.type == "cuda" and dtype == torch.float16)
     rng = random.Random(cfg.seed + start)
 
+    uploads: list[threading.Thread] = []
+
     def save(step: int) -> None:
         os.makedirs(args.out, exist_ok=True)
         thinker.model.save_pretrained(os.path.join(args.out, "lora"))
         save_json(os.path.join(args.out, "state.json"), {"step": step, "base": args.base})
         print(f"saved LoRA at step {step} -> {args.out}/lora")
         if args.upload_repo:
-            upload_async(args.upload_repo, args.out, "checkpoints/" + os.path.basename(os.path.normpath(args.out)))
+            uploads.append(upload_async(args.upload_repo, args.out, "checkpoints/" + os.path.basename(os.path.normpath(args.out))))
 
     if start == 0:
         thinker.model.eval()
@@ -202,6 +206,8 @@ def main() -> None:
             thinker.model.train()
         if done % args.save_every == 0 or done == args.steps:
             save(done)
+    for t in uploads:  # the last upload must finish before the process exits (daemon threads are killed)
+        t.join()
 
 
 if __name__ == "__main__":
