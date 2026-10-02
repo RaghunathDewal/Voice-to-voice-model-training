@@ -13,7 +13,7 @@ Mixes three commercially usable sources into one JSONL of chat conversations:
 Writes <data_dir>/manifests/thinker_sft_train.jsonl and thinker_sft_valid.jsonl. Each row is
 {"id", "source", "messages": [...], "tools": [...] | null}; messages use the chat-template
 format (assistant tool calls in "tool_calls", tool results as role "tool").
-Hotel rows use seeds 0 (train) and 1 (valid); the hotel accuracy eval uses seed 2.
+Hotel rows use seeds 0 (train), 1 (valid) and 3 (--extra-wakeup); the hotel accuracy eval uses seed 2.
 """
 
 from __future__ import annotations
@@ -126,6 +126,8 @@ def main() -> None:
     p.add_argument("--hotel-valid", type=int, default=400)
     p.add_argument("--xlam", type=int, default=4000)
     p.add_argument("--hermes", type=int, default=1500)
+    p.add_argument("--extra-wakeup", type=int, default=0,
+                   help="extra wake-up-call conversations (spoken times: 'quarter to six', 'half past five', ...)")
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
     cfg = config_from_args(args)
@@ -135,6 +137,10 @@ def main() -> None:
     system = cfg.thinker.system_prompt
     train = [hotel_conversation(r, system) for r in generate_examples_v2(args.hotel, seed=0)]
     valid = [hotel_conversation(r, system) for r in generate_examples_v2(args.hotel_valid, seed=1)]
+    if args.extra_wakeup:  # seed 3: not the eval rows (seed 2)
+        wake = [r for r in generate_examples_v2(args.extra_wakeup * 8, seed=3)
+                if r.get("tool_calls") and r["tool_calls"][0]["name"] == "schedule_wakeup_call"]
+        train += [hotel_conversation(r, system) for r in wake[: args.extra_wakeup]]
     if args.xlam:
         path = hf_hub_download("Salesforce/xlam-function-calling-60k", "xlam_function_calling_60k.json",
                                repo_type="dataset")
