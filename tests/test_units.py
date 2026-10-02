@@ -167,3 +167,13 @@ def test_hotel_v2_examples_are_valid_and_varied():
     assert len({r["text"] for r in rows}) > 1200                       # many distinct phrasings
     assert 0.2 < sum(1 for r in rows if r.get("history")) / len(rows) < 0.4
     assert any("reservation" in r["text"].lower() and not r["tool_calls"] for r in rows)
+
+
+def test_reply_filter_drops_generic_handovers():
+    from s2s.prep.reply_texts import is_generic
+
+    assert is_generic("I can't do that myself, but the front desk will be happy to help you with that.")
+    assert is_generic("I'm sorry to hear that. Please call the front desk right away.")
+    assert is_generic("Okay.")
+    assert not is_generic("Jonathan Pine is the night manager.")
+    assert not is_generic("Sure, I've ordered two towels for you; it should arrive in about 15 minutes.")
