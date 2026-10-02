@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import sys
 import time
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")  # forked DataLoader workers + tokenizer threads can deadlock
@@ -138,6 +139,7 @@ def evaluate(cfg, thinker: Thinker, adapter: SpeechAdapter, loader: DataLoader, 
 def main() -> None:
     p = base_parser(__doc__)
     args = p.parse_args()
+    sys.stdout.reconfigure(line_buffering=True)  # live logs when piped (Kaggle/Colab `| tee`)
     cfg = config_from_args(args)
     tc = cfg.train_speech_llm
     rank, world, device = init_distributed(cfg.device)

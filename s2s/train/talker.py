@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import sys
 import time
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")  # forked DataLoader workers + tokenizer threads can deadlock
@@ -107,6 +108,7 @@ def main() -> None:
     p = base_parser(__doc__)
     p.add_argument("--no-samples", action="store_true", help="skip audio sample generation at eval")
     args = p.parse_args()
+    sys.stdout.reconfigure(line_buffering=True)  # live logs when piped (Kaggle/Colab `| tee`)
     cfg = config_from_args(args)
     tc = cfg.train_talker
     rank, world, device = init_distributed(cfg.device)
