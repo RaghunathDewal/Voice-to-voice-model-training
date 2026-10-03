@@ -177,3 +177,20 @@ def test_reply_filter_drops_generic_handovers():
     assert is_generic("Okay.")
     assert not is_generic("Jonathan Pine is the night manager.")
     assert not is_generic("Sure, I've ordered two towels for you; it should arrive in about 15 minutes.")
+
+
+def test_speakable_filters_emoji_and_markdown():
+    from s2s.runtime.agent import speakable
+
+    assert speakable(" Welcome") and speakable("!") and speakable(" 3") and speakable(",")
+    assert not speakable(" 👋") and not speakable("🙏") and not speakable(" **") and not speakable("�")
+
+
+def test_ws_live_prompt_and_tool_options(tmp_path):
+    from s2s.cli.ws_live import load_prompt, select_tools
+
+    f = tmp_path / "p.txt"
+    f.write_text('You are ARIA.\n{{\n"guest_name": "A"\n}}\n')
+    assert load_prompt(str(f)) == 'You are ARIA.\n{\n"guest_name": "A"\n}'
+    assert [t["function"]["name"] for t in select_tools("order_product,create_issue")] == ["order_product", "create_issue"]
+    assert select_tools("none") is None and len(select_tools("all")) == 4

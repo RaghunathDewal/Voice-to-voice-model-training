@@ -34,6 +34,22 @@ from s2s.runtime.endpoint import Endpointer
 from s2s.text import ctc_greedy_decode
 from s2s.utils import Timer, cuda_sync, load_json, resolve_device, resolve_dtype
 
+_MARKDOWN = set("*#_`~>|[]{}<")
+
+
+def speakable(piece: str) -> bool:
+    """False for tokens that have no sound: emoji (or emoji byte fragments), markdown markers.
+    They stay in the text reply but are not sent to the talker (it was trained on plain text)."""
+    import unicodedata
+
+    if any(ch.isalnum() for ch in piece):
+        return True
+    for ch in piece.strip():
+        if ch in _MARKDOWN or ch == "\ufffd" or unicodedata.category(ch) in ("So", "Sk", "Cs", "Cf", "Mn", "Co"):
+            continue
+        return True  # ordinary punctuation shapes the prosody
+    return False
+
 
 class VoiceAgent:
     def __init__(self, cfg, speech_llm_dir: str | None = None, talker_dir: str | None = None,
@@ -205,6 +221,9 @@ class VoiceSession:
                     piece = th.tokenizer.decode([tok])
                     if stream is None and not piece.strip():
                         pass  # leading whitespace is never spoken
+                    elif not speakable(piece):
+                        spoken.append(tok)  # emoji / markdown: kept in the text, not spoken
+                        yield {"type": "token", "text": piece}
                     else:
                         if stream is None:
                             stream = TalkerStream(talker, float(rt.talker_temperature), int(rt.talker_top_k),

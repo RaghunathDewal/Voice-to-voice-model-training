@@ -142,7 +142,27 @@ def pcm16(wav: np.ndarray) -> bytes:
     return (np.clip(wav, -1.0, 1.0) * 32767).astype("<i2").tobytes()
 
 
-def build_app(agent: VoiceAgent) -> FastAPI:
+def load_prompt(path: str) -> str:
+    """A system prompt file. `{{` / `}}` (template escaping) become single braces."""
+    with open(path, encoding="utf-8") as f:
+        return f.read().replace("{{", "{").replace("}}", "}").strip()
+
+
+def select_tools(names: str | None) -> list | None:
+    """--tools all | none | comma-separated names (order_product,create_issue,...)."""
+    if names is None or names == "all":
+        return HOTEL_TOOLS
+    if names == "none":
+        return None
+    keep = {n.strip() for n in names.split(",")}
+    unknown = keep - {t["function"]["name"] for t in HOTEL_TOOLS}
+    if unknown:
+        raise SystemExit(f"unknown tools {sorted(unknown)}")
+    return [t for t in HOTEL_TOOLS if t["function"]["name"] in keep]
+
+
+def build_app(agent: VoiceAgent, system_prompt: str | None = None, tools: list | None = HOTEL_TOOLS) -> FastAPI:
+    """system_prompt: replaces the default prompt AND the generated demo reservation (put the guest data in it)."""
     sr = agent.codec.sample_rate
     gpu_lock = threading.Lock()  # one model call at a time across connections
     app = FastAPI()
@@ -174,12 +194,17 @@ def build_app(agent: VoiceAgent) -> FastAPI:
 
             def build():
                 with gpu_lock:  # taken in the worker thread, never on the event loop
-                    return agent.new_session(context=reservation_context(res), tools=HOTEL_TOOLS,
-                                             backend=HotelBackend(res))
+                    if system_prompt:
+                        return agent.new_session(system_prompt=system_prompt, tools=tools, backend=HotelBackend({}))
+                    return agent.new_session(context=reservation_context(res), tools=tools, backend=HotelBackend(res))
 
             conv["session"] = await asyncio.to_thread(build)
             conv["listener"] = LiveListener.for_agent(agent)
-            await say(f"Reservation: {res}")
+            if system_prompt:
+                await say(f"Custom system prompt ({len(system_prompt)} chars); tools: "
+                          f"{[t['function']['name'] for t in tools or []]}")
+            else:
+                await say(f"Reservation: {res}")
             await set_state("listening")
 
         async def run_turn(wav: np.ndarray) -> None:
@@ -277,13 +302,18 @@ def main() -> None:
     p.add_argument("--port", type=int, default=7860)
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--tunnel", action="store_true", help="public https URL via a Cloudflare quick tunnel")
+    p.add_argument("--system-prompt-file", default=None,
+                   help="your own system prompt (with the guest/reservation data inside); replaces the demo one")
+    p.add_argument("--tools", default="all", help="all | none | comma-separated: order_product,create_issue,"
+                                                  "get_property_information,schedule_wakeup_call")
     args = p.parse_args()
     sys.stdout.reconfigure(line_buffering=True)
     cfg = config_from_args(args)
 
     import uvicorn
 
-    app = build_app(VoiceAgent(cfg, args.speech_llm_dir, args.talker_dir))
+    prompt = load_prompt(args.system_prompt_file) if args.system_prompt_file else None
+    app = build_app(VoiceAgent(cfg, args.speech_llm_dir, args.talker_dir), prompt, select_tools(args.tools))
     if args.tunnel:
         start_tunnel(args.port)
     print(f"serving on http://localhost:{args.port}  (use --tunnel for a public https link)", flush=True)
