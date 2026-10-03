@@ -22,7 +22,7 @@ dependencies = [
 
 [project.optional-dependencies]
 tts = ["kokoro>=0.9", "misaki[en]"]
-demo = ["gradio>=4"]
+demo = ["gradio>=4", "fastapi", "uvicorn", "websockets"]
 dev = ["pytest"]
 
 [tool.setuptools.packages.find]

@@ -281,6 +281,19 @@ python -m s2s.prep.merge_lora $CFG --set thinker.model=checkpoints/thinker_merge
 python -m s2s.eval.text_tools $CFG --model checkpoints/thinker_merged_v2 --manifest <hotel eval manifest>
 ```
 
+## 3d. Real-time voice in the browser (WebSocket, streamed audio)
+
+```bash
+pip install -e ".[demo]"
+python -m s2s.cli.ws_live $CFG --speech-llm-dir checkpoints/speech_llm_pk3 --talker-dir checkpoints/talker_v2 --tunnel
+```
+
+Open the printed `https://….trycloudflare.com` link, press *Start talking* and just speak. The browser
+streams the microphone over a WebSocket; the server detects the end of the turn and sends every
+reply chunk the moment it is decoded, so playback starts with the first audio (no waiting for the
+whole reply). Strict turn-taking: the mic is ignored while the agent thinks or speaks. The page logs
+`first audio heard by the browser … ms after the end of your turn`.
+
 ## 4. Configuration reference
 
 | Key | Meaning |

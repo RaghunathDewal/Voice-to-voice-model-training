@@ -31,7 +31,7 @@ def test_codec_batching_and_streaming_decode(tiny_models, cpu):
     assert torch.allclose(batched[1], single, atol=1e-4)  # causal: padding does not leak
     codes = codec.encode_codes([a])[0]
     full = codec.decode(codes)
-    dec = StreamingDecoder(codec, context_frames=1000)
+    dec = StreamingDecoder(codec)  # default 4 frames of conv context: exact (transformer KV cache)
     frames = [codes[:, i] for i in range(codes.shape[1])]
     chunks = [dec.push(frames[i:i + 3]) for i in range(0, len(frames), 3)]
     assert np.allclose(np.concatenate(chunks), full, atol=1e-4)
@@ -172,3 +172,46 @@ def test_streaming_turn_matches_whole_utterance(agent):
     whole = s2.a.codec.encode_latents([wav[: turn.latents.shape[0] * s2.a.codec.hop]])[0]
     assert torch.allclose(turn.latents, whole, atol=1e-4)
     assert s1.n_tokens == len(s1.prefix_ids) + 1 + whole.shape[0]
+
+
+def test_ws_live_streams_a_turn(agent, monkeypatch):
+    """Browser protocol end to end: mic PCM in, endpoint, streamed audio out, back to listening."""
+    import json as _json
+
+    from fastapi.testclient import TestClient
+
+    import s2s.runtime.agent as agent_mod
+    from s2s.cli.ws_live import build_app
+
+    p = agent.thinker.prompts
+    script = p.ids("Hello there.") + [p.im_end_id]
+    monkeypatch.setattr(agent_mod, "sample_logits", lambda *a, **k: script.pop(0) if script else p.im_end_id)
+    sr = agent.codec.sample_rate
+    t = np.arange(sr) / sr
+    speech = (0.1 * np.sin(2 * np.pi * 220 * t)).astype(np.float32)
+    mic = np.concatenate([speech, np.zeros(2 * sr, dtype=np.float32)])
+    pcm = (mic * 32767).astype("<i2")
+    with TestClient(build_app(agent)).websocket_connect("/ws") as ws:
+        ws.send_text(_json.dumps({"type": "hello", "sr": sr}))
+        step = int(0.08 * sr)
+        for i in range(0, len(pcm), step):
+            ws.send_bytes(pcm[i:i + step].tobytes())
+        states, logs, audio = [], [], 0
+        while True:
+            msg = ws.receive()
+            if msg.get("bytes"):
+                audio += len(msg["bytes"]) // 2
+                continue
+            m = _json.loads(msg["text"])
+            if m["type"] == "state":
+                states.append(m["state"])
+            elif m["type"] == "log":
+                logs.append(m["text"])
+            elif m["type"] == "reply_done":
+                break
+        assert "thinking" in states and audio > 0
+        assert any(line.startswith("ASSISTANT: Hello there.") for line in logs)
+        ws.send_text(_json.dumps({"type": "played"}))
+        while (m := _json.loads(ws.receive_text()))["type"] != "state":
+            pass
+        assert m["state"] == "listening"

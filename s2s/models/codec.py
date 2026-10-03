@@ -79,26 +79,37 @@ class MimiCodec:
 
 
 class StreamingDecoder:
-    """Decodes a growing stream of Mimi frames chunk by chunk.
+    """Decodes a growing stream of Mimi frames chunk by chunk, exactly like a full decode.
 
-    The HF Mimi decoder has no convolution state cache, so each chunk is
-    decoded together with `context_frames` of left context and only the new
-    samples are returned. Mimi's decoder is causal, so the result matches a
-    full decode exactly when the context covers the whole history, and closely
-    otherwise (attention only sees `context_frames` of history).
+    Mimi's decoder is causal. Its transformer keeps a KV cache, so each new chunk is run
+    through it once; the convolutions (upsample and SEANet) have no state cache in the HF
+    implementation, so they are re-run on the new frames plus `context_frames` frames of
+    left context, which covers their receptive field. Matches `MimiCodec.decode` on the
+    whole sequence to float precision at a fraction of the cost of re-decoding a window.
     """
 
-    def __init__(self, codec: MimiCodec, context_frames: int = 25):
+    def __init__(self, codec: MimiCodec, context_frames: int = 4):
         self.codec = codec
-        self.context = context_frames
-        self.frames: list[torch.Tensor] = []  # each [K]
+        self.context = max(1, int(context_frames))
+        self.last_code: torch.Tensor | None = None  # [K] previous frame (left context for the upsample)
+        self.kv = None                              # decoder transformer cache
+        self.post: torch.Tensor | None = None       # recent transformer outputs [1, C, T25]
 
+    @torch.no_grad()
     def push(self, new_frames: list[torch.Tensor]) -> np.ndarray:
         if not new_frames:
             return np.zeros(0, dtype=np.float32)
-        self.frames.extend(f.detach().long().cpu() for f in new_frames)
-        n_new = len(new_frames)
-        start = max(0, len(self.frames) - n_new - self.context)
-        codes = torch.stack(self.frames[start:], dim=1)  # [K, T]
-        wav = self.codec.decode(codes)
-        return wav[-n_new * self.codec.hop:]
+        m = self.codec.model
+        n = len(new_frames)
+        frames = [f.detach().long().to(self.codec.device) for f in new_frames]
+        window = ([self.last_code] if self.last_code is not None else []) + frames
+        self.last_code = frames[-1]
+        up = m.upsample(m.quantizer.decode(torch.stack(window, dim=1)[None]))
+        up = up[..., -2 * n:]                       # upsampled positions of the new frames only (2 per frame)
+        out = m.decoder_transformer(up.transpose(1, 2), past_key_values=self.kv, use_cache=True, return_dict=True)
+        self.kv = out.past_key_values
+        new_post = out.last_hidden_state.transpose(1, 2)
+        keep = 2 * (self.context + n)
+        self.post = new_post if self.post is None else torch.cat([self.post, new_post], dim=-1)[..., -keep:]
+        wav = m.decoder(self.post)[0, 0]
+        return wav[-n * self.codec.hop:].float().cpu().numpy()
