@@ -28,5 +28,8 @@ dev = ["pytest"]
 [tool.setuptools.packages.find]
 include = ["s2s*"]
 
+[tool.setuptools.package-data]
+"s2s.cli" = ["static/*.html"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
