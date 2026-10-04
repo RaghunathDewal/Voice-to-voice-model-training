@@ -1,0 +1,18 @@
+Copyright (c) 2026 Raghunath Singh Dewal. All rights reserved.
+
+This repository is published for viewing and evaluation only. You may read the source code
+and run it on your own machine to evaluate it.
+
+You may NOT, without prior written permission from the copyright holder:
+  * use this code, or models trained with it, in any commercial product or service;
+  * copy, modify, merge, publish, distribute, sublicense or sell copies of it;
+  * use it to train or build a competing product.
+
+To request a licence, contact Raghunath Singh Dewal via https://github.com/RaghunathDewal.
+
+Third-party models, datasets and libraries used by this project are covered by their own
+licences; see THIRD_PARTY_NOTICES.md. This notice does not change those licences.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED. IN NO
+EVENT SHALL THE AUTHOR BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY ARISING FROM THE
+USE OF THE SOFTWARE.

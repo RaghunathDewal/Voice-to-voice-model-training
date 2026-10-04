@@ -5,7 +5,9 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "s2s"
 version = "0.1.0"
-description = "English turn-based speech-to-speech LLM: Mimi -> adapter -> Qwen3 -> Talker -> Mimi"
+description = "English turn-based speech-to-speech LLM with tool calling: Parakeet/Mimi -> adapter -> Qwen3 -> Talker -> Mimi"
+license = {file = "LICENSE"}
+authors = [{name = "Raghunath Singh Dewal"}]
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.2",

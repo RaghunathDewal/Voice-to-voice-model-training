@@ -1,6 +1,26 @@
-# Voice-to-voice model training (English, turn-based)
+# Hotel Voice Concierge: a speech-to-speech LLM with tool calling
 
-A speech-to-speech LLM for a hotel voice agent, trainable on a free Kaggle or Colab GPU:
+An English, turn-based **speech-to-speech model** for hotel guest support, trained end to end on
+free Kaggle and Colab GPUs. The guest speaks; the model understands the audio directly, calls hotel
+tools (orders, maintenance tickets, hotel info, wake-up calls) and answers in its own voice. There is
+no separate speech-to-text or text-to-speech step at runtime.
+
+[![Demo video: the voice concierge answering five spoken requests](docs/media/demo_poster.jpg)](docs/media/demo.mp4)
+
+**▶ [Watch the 60 s demo](docs/media/demo.mp4)**: real replies, tool calls and voice from the trained model.
+
+| | |
+|---|---|
+| Tool-call accuracy from speech (synthetic hotel test) | **99.7 %** clean · **98.3 %** noisy |
+| Time to first audio (Kaggle T4, streamed over WebSocket) | **0.84–1.2 s** chat · **1.9–2.1 s** with a tool call |
+| Size | **≈ 1.3 B** parameters at runtime, **≈ 68 M** trained by me |
+| Training cost | free GPUs (Kaggle T4 ×2, Colab) and openly licensed data |
+
+Built by **Raghunath Singh Dewal** · [GitHub](https://github.com/RaghunathDewal) ·
+Licence: all rights reserved, viewing and evaluation only (see [LICENSE](LICENSE) and
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)).
+
+## How it works
 
 ```
 user audio ─► Parakeet / Mimi encoder ─► speech adapter ─► Qwen3 thinker ─► talker ─► Mimi decoder ─► reply audio
