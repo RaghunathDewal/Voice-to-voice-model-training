@@ -35,10 +35,22 @@ TALKER_TEXTS=${TALKER_TEXTS:-40000}        # sentences spoken in af_heart for th
 export HF_TOKEN PYTHONUNBUFFERED=1 TQDM_MININTERVAL=30 TOKENIZERS_PARALLELISM=false
 mkdir -p "$WORK"/{data,checkpoints,logs,done,tmp}
 cd "$REPO_DIR"
-# one venv on top of the image's ROCm torch (Ubuntu 24.04 refuses system-wide pip installs)
+# Python: where torch already exists (e.g. inside the image's `rocm` container) use that interpreter
+# directly; otherwise a venv on the host, where setup installs the ROCm build of torch.
 SYS_PY=$(command -v python3 || command -v python)
-[ -x "$WORK/venv/bin/python" ] || "$SYS_PY" -m venv --system-site-packages "$WORK/venv"
-export PATH="$WORK/venv/bin:$PATH"
+if "$SYS_PY" -c "import torch" 2>/dev/null; then
+    mkdir -p "$WORK/bin"
+    ln -sfn "$SYS_PY" "$WORK/bin/python"
+    printf '#!/bin/sh\nexec "%s" -m pip "$@"\n' "$SYS_PY" > "$WORK/bin/pip" && chmod +x "$WORK/bin/pip"
+    export PATH="$WORK/bin:$PATH" PIP_BREAK_SYSTEM_PACKAGES=1   # Ubuntu 24.04 marks system Python as managed
+else
+    if [ ! -x "$WORK/venv/bin/pip" ]; then   # also repairs a venv made before python3-venv was installed
+        rm -rf "$WORK/venv"
+        "$SYS_PY" -m venv --system-site-packages "$WORK/venv" || {
+            echo "python3-venv missing: run  apt-get install -y python3-venv  and start again"; exit 1; }
+    fi
+    export PATH="$WORK/venv/bin:$PATH"
+fi
 ln -sfn "$WORK/data" data
 ln -sfn "$WORK/checkpoints" checkpoints
 LOGS=$WORK/logs
@@ -102,7 +114,8 @@ stage() {  # stage <name> <command...>: run once, log to $LOGS/<name>.log
 
 # ------------------------------------------------------------------ setup
 setup() {
-    # The PyTorch image keeps torch inside its Docker container; on the host, install the ROCm build
+    # The PyTorch image keeps torch inside its `rocm` container; run this script there. On a bare host,
+    # the ROCm build is installed instead
     if ! python -c "import torch" 2>/dev/null; then
         say "torch not found on the host: installing the ROCm build from ${TORCH_INDEX:=https://download.pytorch.org/whl/rocm7.1}"
         pip install -q --upgrade pip
