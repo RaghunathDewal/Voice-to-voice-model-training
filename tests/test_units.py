@@ -169,6 +169,32 @@ def test_hotel_v2_examples_are_valid_and_varied():
     assert any("reservation" in r["text"].lower() and not r["tool_calls"] for r in rows)
 
 
+def test_hotel_v3_tools_and_facts_come_from_the_prompt():
+    from s2s.data.hotel import score_example, validate_call
+    from s2s.data.hotel_v3 import GenericBackend, generate_examples_v3
+
+    rows = generate_examples_v3(2000, seed=3)
+    names = set()
+    for r in rows:
+        offered = {t["function"]["name"] for t in r["tools"] or []}
+        for c in r["tool_calls"]:
+            assert c["name"] in offered, (c, offered)              # only listed tools are ever called
+            assert validate_call(c, r["tools"]) is None, c
+            assert "error" not in GenericBackend(r["tools"]).execute(c)
+            names.add(c["name"])
+        if not r["tool_calls"]:
+            assert r["reply"] and r["answer_contains"]
+            assert score_example(r, [], r["reply"])               # the gold reply passes its own check
+    assert len(names) >= 12                                        # varied function names
+    assert sum(r["tools"] is None for r in rows) > 50              # some prompts offer no tools at all
+    # property facts are in the prompt and answered without a tool call
+    facts = [r for r in rows if not r["tool_calls"] and r["reply"] in r["system"]]
+    assert len(facts) > 300
+    # requests for a tool that is not offered: no call, hand over instead
+    assert any(not r["tool_calls"] and "can't do that myself" in r["reply"] for r in rows)
+    assert 0.2 < sum(1 for r in rows if r.get("history")) / len(rows) < 0.4
+
+
 def test_reply_filter_drops_generic_handovers():
     from s2s.prep.reply_texts import is_generic
 
@@ -194,3 +220,8 @@ def test_ws_live_prompt_and_tool_options(tmp_path):
     assert load_prompt(str(f)) == 'You are ARIA.\n{\n"guest_name": "A"\n}'
     assert [t["function"]["name"] for t in select_tools("order_product,create_issue")] == ["order_product", "create_issue"]
     assert select_tools("none") is None and len(select_tools("all")) == 4
+    assert [t["function"]["name"] for t in select_tools("report_issue,request_taxi")] == ["report_issue", "request_taxi"]
+    custom = tmp_path / "tools.json"
+    custom.write_text('[{"type": "function", "function": {"name": "open_gate", "parameters": {"type": "object", '
+                      '"properties": {}, "required": []}}}]')
+    assert select_tools("all", str(custom))[0]["function"]["name"] == "open_gate"

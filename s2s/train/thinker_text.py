@@ -28,8 +28,9 @@ import time
 import torch
 
 from s2s.cli_common import base_parser, config_from_args
-from s2s.data.hotel import score_example, tools_by_name
+from s2s.data.hotel import row_system, score_example, tools_by_name
 from s2s.data.hotel_v2 import generate_examples_v2
+from s2s.data.hotel_v3 import generate_examples_v3
 from s2s.eval.text_tools import extract_calls
 from s2s.models.thinker import Thinker
 from s2s.train.common import make_grad_scaler, optimizer_step
@@ -81,7 +82,7 @@ def hotel_accuracy(thinker: Thinker, system_prompt: str, rows: list[dict], show:
     per = collections.defaultdict(lambda: [0, 0])
     misses = []
     for r in rows:
-        system = Thinker.system_content(system_prompt, r.get("context"))
+        system = row_system(r, system_prompt)
         ids = thinker.prompts.text_prompt_ids(system, r["text"], tools_by_name(r.get("tools")), r.get("history"))
         with autocast_ctx(thinker.device, thinker.dtype):
             gen = thinker.model.generate(torch.tensor([ids], device=thinker.device), max_new_tokens=100, use_cache=True,
@@ -132,7 +133,9 @@ def main() -> None:
     p.add_argument("--max-len", type=int, default=1536)
     p.add_argument("--eval-every", type=int, default=250)
     p.add_argument("--save-every", type=int, default=250)
-    p.add_argument("--eval-rows", type=int, default=150, help="hotel_v2 seed-2 rows for the accuracy check")
+    p.add_argument("--eval-rows", type=int, default=150, help="hotel seed-2 rows for the accuracy check")
+    p.add_argument("--data-version", type=int, default=2, choices=[2, 3],
+                   help="hotel generator for the accuracy check: 3 = tools and property facts from the prompt")
     p.add_argument("--upload-repo", default=None, help="push each saved LoRA to this HF model repo")
     p.add_argument("--resume", action="store_true", help="continue from <out>/lora and <out>/state.json")
     args = p.parse_args()
@@ -161,7 +164,7 @@ def main() -> None:
 
     train = encode_rows(thinker.prompts, read_jsonl(train_path), args.max_len)
     valid = encode_rows(thinker.prompts, read_jsonl(valid_path)[:200], args.max_len)
-    eval_rows = generate_examples_v2(args.eval_rows, seed=2)
+    eval_rows = (generate_examples_v3 if args.data_version == 3 else generate_examples_v2)(args.eval_rows, seed=2)
     opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.0)
     scaler = make_grad_scaler(enabled=device.type == "cuda" and dtype == torch.float16)
     rng = random.Random(cfg.seed + start)

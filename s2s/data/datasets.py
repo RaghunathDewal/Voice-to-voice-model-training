@@ -28,7 +28,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, WeightedRandomSampler
 
-from s2s.data.hotel import tools_by_name
+from s2s.data.hotel import row_system, tools_by_name
 from s2s.models.thinker import PromptBuilder
 from s2s.text import ctc_encode, sentence_case
 from s2s.utils import read_jsonl
@@ -105,7 +105,7 @@ class SpeechLLMDataset(Dataset):
         lat = lat[:t]
 
         task = self.task_for(row, rng)
-        system = PromptBuilder.system_content(self.system_prompt, row.get("context"))
+        system = row_system(row, self.system_prompt)
         tools = tools_by_name(row.get("tools"))
         history = row.get("history") or None  # earlier turns as text (multi-turn rows)
         if task == "tool":

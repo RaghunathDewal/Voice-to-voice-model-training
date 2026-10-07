@@ -115,9 +115,9 @@ class HotelBackend:
         return {"success": True, "time": time}
 
 
-def validate_call(call: dict) -> str | None:
-    """Minimal JSON-schema check. Returns an error string or None."""
-    spec = next((t["function"] for t in HOTEL_TOOLS if t["function"]["name"] == call.get("name")), None)
+def validate_call(call: dict, tools: list | None = None) -> str | None:
+    """Minimal JSON-schema check against `tools` (default: HOTEL_TOOLS). Returns an error string or None."""
+    spec = next((t["function"] for t in (tools or HOTEL_TOOLS) if t["function"]["name"] == call.get("name")), None)
     if spec is None:
         return f"unknown tool {call.get('name')}"
     params = spec["parameters"]
@@ -253,13 +253,23 @@ def generate_examples(n: int, seed: int = 0) -> list[dict]:
     return rows
 
 
-def tools_by_name(name: str | None) -> list[dict] | None:
+def tools_by_name(name: str | list | None) -> list[dict] | None:
+    """A row's `tools`: a tool-set name ("hotel") or the schema list itself (hotel_v3 rows)."""
+    if isinstance(name, list):
+        return name or None
     if name == "hotel":
         return HOTEL_TOOLS
     return None
 
 
-FREE_TEXT_ARGS = {"description"}
+def row_system(row: dict, system_prompt: str) -> str:
+    """The system message for a row: its own `system` (hotel_v3) or the default prompt + its context."""
+    if row.get("system"):
+        return row["system"]
+    return f"{system_prompt}\n\n{row['context']}" if row.get("context") else system_prompt
+
+
+FREE_TEXT_ARGS = {"description", "destination", "reason"}
 
 
 def calls_match(pred: list[dict], gold: list[dict]) -> bool:

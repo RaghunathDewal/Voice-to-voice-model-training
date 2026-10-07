@@ -39,6 +39,7 @@ from fastapi.responses import HTMLResponse, Response
 from s2s.audio import resample
 from s2s.cli_common import base_parser, config_from_args
 from s2s.data.hotel import HOTEL_TOOLS, HotelBackend, make_reservation, reservation_context
+from s2s.data.hotel_v3 import _TOOL_NAMES, GenericBackend, tool_schema
 from s2s.runtime.agent import VoiceAgent
 from s2s.runtime.live import LiveListener
 
@@ -76,17 +77,32 @@ def load_prompt(path: str) -> str:
         return f.read().replace("{{", "{").replace("}}", "}").strip()
 
 
-def select_tools(names: str | None) -> list | None:
-    """--tools all | none | comma-separated names (order_product,create_issue,...)."""
+def known_tools() -> dict[str, dict]:
+    """Every built-in tool schema by function name: the v1 hotel tools and the hotel_v3 pool."""
+    pool = {t["function"]["name"]: t for t in HOTEL_TOOLS}
+    for kind, variants in _TOOL_NAMES.items():
+        for i in range(len(variants)):
+            t = tool_schema(kind, i)
+            pool.setdefault(t["function"]["name"], t)
+    return pool
+
+
+def select_tools(names: str | None, tools_file: str | None = None) -> list | None:
+    """--tools all | none | comma-separated names (order_product,create_issue,...); --tools-file: your own
+    OpenAI-style schema list (JSON), used as is."""
+    if tools_file:
+        with open(tools_file, encoding="utf-8") as f:
+            return json.load(f) or None
     if names is None or names == "all":
         return HOTEL_TOOLS
     if names == "none":
         return None
-    keep = {n.strip() for n in names.split(",")}
-    unknown = keep - {t["function"]["name"] for t in HOTEL_TOOLS}
+    pool = known_tools()
+    keep = [n.strip() for n in names.split(",") if n.strip()]
+    unknown = [n for n in keep if n not in pool]
     if unknown:
-        raise SystemExit(f"unknown tools {sorted(unknown)}")
-    return [t for t in HOTEL_TOOLS if t["function"]["name"] in keep]
+        raise SystemExit(f"unknown tools {unknown}; built-in: {sorted(pool)} (or pass --tools-file)")
+    return [pool[n] for n in keep]
 
 
 def build_app(agent: VoiceAgent | None, system_prompt: str | None = None, tools: list | None = HOTEL_TOOLS,
@@ -129,7 +145,7 @@ def build_app(agent: VoiceAgent | None, system_prompt: str | None = None, tools:
             def build():
                 with gpu_lock:  # taken in the worker thread, never on the event loop
                     if system_prompt:
-                        return agent.new_session(system_prompt=system_prompt, tools=tools, backend=HotelBackend({}))
+                        return agent.new_session(system_prompt=system_prompt, tools=tools, backend=GenericBackend(tools))
                     return agent.new_session(context=reservation_context(res), tools=tools, backend=HotelBackend(res))
 
             conv["session"] = await asyncio.to_thread(build)
@@ -239,8 +255,9 @@ def main() -> None:
     p.add_argument("--system-prompt-file", default=None,
                    help="your own system prompt (with the guest/reservation data inside); replaces the demo one")
     p.add_argument("--demo-dir", default=None, help="serve a pre-generated conversation at /?demo=demo")
-    p.add_argument("--tools", default="all", help="all | none | comma-separated: order_product,create_issue,"
-                                                  "get_property_information,schedule_wakeup_call")
+    p.add_argument("--tools", default="all", help="all | none | comma-separated built-in names, e.g. "
+                                                  "order_product,create_issue (the v1 hotel tools and the hotel_v3 pool)")
+    p.add_argument("--tools-file", default=None, help="JSON list of your own tool schemas (overrides --tools)")
     args = p.parse_args()
     sys.stdout.reconfigure(line_buffering=True)
     cfg = config_from_args(args)
@@ -248,7 +265,7 @@ def main() -> None:
     import uvicorn
 
     prompt = load_prompt(args.system_prompt_file) if args.system_prompt_file else None
-    app = build_app(VoiceAgent(cfg, args.speech_llm_dir, args.talker_dir), prompt, select_tools(args.tools), args.demo_dir)
+    app = build_app(VoiceAgent(cfg, args.speech_llm_dir, args.talker_dir), prompt, select_tools(args.tools, args.tools_file), args.demo_dir)
     if args.tunnel:
         start_tunnel(args.port)
     print(f"serving on http://localhost:{args.port}  (use --tunnel for a public https link)", flush=True)

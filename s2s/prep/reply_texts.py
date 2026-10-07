@@ -45,12 +45,15 @@ def strip(inp: str, out: str) -> None:
     print(f"{inp}: dropped {dropped} generic replies, {kept} replies kept, {len(rows)} rows -> {out}")
 
 
-def talker(hotel: int, replies: list[str], out: str, max_rows: int, max_per_text: int, seed: int) -> None:
+def talker(hotel: int, replies: list[str], out: str, max_rows: int, max_per_text: int, seed: int,
+           hotel_version: int = 2) -> None:
     from s2s.data.hotel_v2 import generate_examples_v2
+    from s2s.data.hotel_v3 import generate_examples_v3
 
     rng = random.Random(seed)
     texts: list[str] = []
-    for r in generate_examples_v2(hotel, seed=0):  # the hotel replies the agent speaks
+    gen = generate_examples_v3 if hotel_version == 3 else generate_examples_v2
+    for r in gen(hotel, seed=0):  # the hotel replies the agent speaks
         texts += [t for t in (r.get("reply"), r.get("reply_after_tool")) if t]
     hotel_n = len(texts)
     for path in replies:
@@ -83,11 +86,13 @@ def main() -> None:
     t.add_argument("--max", type=int, default=16000)
     t.add_argument("--max-per-text", type=int, default=3)
     t.add_argument("--seed", type=int, default=0)
+    t.add_argument("--hotel-version", type=int, default=2, choices=[2, 3], help="hotel reply generator")
     a = p.parse_args()
     if a.cmd == "strip":
         strip(a.inp, a.out)
     else:
-        talker(a.hotel, [f for pat in a.replies for f in sorted(glob.glob(pat))], a.out, a.max, a.max_per_text, a.seed)
+        talker(a.hotel, [f for pat in a.replies for f in sorted(glob.glob(pat))], a.out, a.max, a.max_per_text, a.seed,
+               a.hotel_version)
 
 
 if __name__ == "__main__":

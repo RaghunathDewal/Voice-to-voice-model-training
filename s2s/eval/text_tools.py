@@ -16,7 +16,7 @@ from tqdm import tqdm
 
 from s2s.cli_common import base_parser, config_from_args
 from s2s.data.datasets import load_manifest
-from s2s.data.hotel import score_example, tools_by_name
+from s2s.data.hotel import row_system, score_example, tools_by_name
 from s2s.models.speech_llm import greedy_generate
 from s2s.models.thinker import Thinker
 from s2s.utils import resolve_device, resolve_dtype, save_json
@@ -55,7 +55,7 @@ def main() -> None:
     per_tool = collections.defaultdict(lambda: [0, 0])
     results = []
     for r in tqdm(rows, desc="text tool eval"):
-        system = Thinker.system_content(cfg.thinker.system_prompt, r.get("context"))
+        system = row_system(r, cfg.thinker.system_prompt)
         ids = thinker.prompts.text_prompt_ids(system, r["text"], tools_by_name(r.get("tools")), r.get("history"))
         emb = thinker.embed(torch.tensor([ids], device=device))
         out = thinker.tokenizer.decode(greedy_generate(thinker, emb, 120), skip_special_tokens=False)

@@ -71,6 +71,25 @@ def test_text_sft_conversation_matches_runtime_layout(tiny_models):
     assert "<tool_response>" not in trained and "SYS" not in trained
 
 
+def test_text_sft_v3_uses_the_rows_own_prompt_and_tools(tiny_models):
+    from s2s.data.hotel_v3 import generate_examples_v3
+    from s2s.models.thinker import PromptBuilder
+    from s2s.prep.thinker_sft_data import hotel_conversation
+
+    pb = PromptBuilder.from_pretrained(tiny_models["qwen"])
+    rows = generate_examples_v3(200, seed=0)
+    row = next(r for r in rows if r.get("tool_calls"))
+    conv = hotel_conversation(row, "DEFAULT PROMPT")
+    assert conv["messages"][0]["content"] == row["system"] and conv["tools"] == row["tools"]
+    ids, labels = pb.conversation_ids(conv["messages"], conv["tools"])
+    trained = pb.tokenizer.decode([i for i, y in zip(ids, labels) if y != -100])
+    assert row["tool_calls"][0]["name"] in trained and trained.endswith(row["reply_after_tool"] + "<|im_end|>")
+    plain = next(r for r in rows if not r["tools"])  # no tools offered: plain reply, no tool section
+    conv = hotel_conversation(plain, "DEFAULT PROMPT")
+    ids, labels = pb.conversation_ids(conv["messages"], conv["tools"])
+    assert "<tools>" not in pb.tokenizer.decode(ids)
+
+
 def test_labels_align_with_targets(tiny_models, cpu):
     th = Thinker(tiny_models["qwen"], cpu, torch.float32)
     ad = SpeechAdapter(64, th.hidden_size, d_model=32, n_layers=1, n_heads=4)

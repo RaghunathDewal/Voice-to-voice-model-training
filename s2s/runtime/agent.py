@@ -263,7 +263,7 @@ class VoiceSession:
             return {"error": "no backend configured"}
         from s2s.data.hotel import validate_call
 
-        err = validate_call(call) if self.tools else None
+        err = validate_call(call, self.tools) if self.tools else None
         if err:
             return {"error": err}
         return self.backend.execute(call)

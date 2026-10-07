@@ -353,6 +353,33 @@ reply chunk the moment it is decoded, so playback starts with the first audio (n
 whole reply). Strict turn-taking: the mic is ignored while the agent thinks or speaks. The page logs
 `first audio heard by the browser … ms after the end of your turn`.
 
+## 3e. Your own property and tools (thinker v3) and the MI300X run
+
+The v3 thinker answers property questions from **your system prompt** and calls **only the tools you
+pass**. Put the unit names, opening hours, Wi-Fi, policies and the guest's booking in a prompt file, and
+list just the tools your backend supports:
+
+```bash
+python -m s2s.cli.ws_live $CFG --speech-llm-dir checkpoints/speech_llm_pk4 --talker-dir checkpoints/talker_v3 \
+    --set thinker.model=checkpoints/thinker_merged_v3 \
+    --system-prompt-file my_property.txt --tools order_product,create_issue --tunnel
+# or your own schemas: --tools-file my_tools.json  (OpenAI-style function list)
+```
+
+A request with no matching tool gets "I can't do that myself, but <your hand-over team> can help"; a
+fact missing from the prompt gets "I don't have that information". Training data:
+`s2s/data/hotel_v3.py` (random property profiles, prompt formats, personas and tool subsets).
+
+Retraining everything (thinker v3, new replies, adapter v4, full-size talker v3) on one AMD MI300X:
+
+```bash
+export HF_TOKEN=hf_...  DO_TOKEN=dop_v1_...   # DO_TOKEN: droplet read+delete, enables the kill switch
+bash scripts/mi300x_train.sh 2>&1 | tee -a ~/run.log
+```
+
+Each stage is skipped when already done, checkpoints are pushed to Hugging Face every 10 minutes, and with
+`DO_TOKEN` the droplet destroys itself when the script ends or after `MAX_HOURS` (default 14).
+
 ## 4. Configuration reference
 
 | Key | Meaning |

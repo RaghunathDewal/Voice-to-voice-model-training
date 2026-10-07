@@ -20,7 +20,7 @@ from tqdm import tqdm
 
 from s2s.cli_common import base_parser, config_from_args
 from s2s.data.datasets import load_manifest
-from s2s.data.hotel import score_example, tools_by_name
+from s2s.data.hotel import row_system, score_example, tools_by_name
 from s2s.eval.text_tools import extract_calls
 from s2s.models.adapter import SpeechAdapter
 from s2s.models.speech_llm import assemble_inputs, greedy_generate
@@ -60,7 +60,7 @@ def main() -> None:
         with torch.no_grad(), autocast_ctx(device, dtype):
             out = adapter(lat_t)
         ctc = ctc_greedy_decode(out["ctc_logits"][0].argmax(-1).tolist())
-        system = Thinker.system_content(cfg.thinker.system_prompt, r.get("context"))
+        system = row_system(r, cfg.thinker.system_prompt)
         tools = tools_by_name(r.get("tools"))
         lengths = torch.tensor([t])
 
@@ -69,7 +69,7 @@ def main() -> None:
                 emb, _, _ = assemble_inputs(thinker, adapter, out["embeds"], lengths, [prefix], [suffix], None)
                 return thinker.tokenizer.decode(greedy_generate(thinker, emb, max_new), skip_special_tokens=False)
 
-        if r.get("tools"):
+        if r.get("tools") or "tool_calls" in r:  # hotel rows (v3 rows may offer no tools)
             n_tool += 1
             history = r.get("history") or None
             pre, suf = thinker.prompts.prompt_parts(system, tools, None, history)
