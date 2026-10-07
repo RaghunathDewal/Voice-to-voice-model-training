@@ -102,6 +102,12 @@ stage() {  # stage <name> <command...>: run once, log to $LOGS/<name>.log
 
 # ------------------------------------------------------------------ setup
 setup() {
+    # The PyTorch image keeps torch inside its Docker container; on the host, install the ROCm build
+    if ! python -c "import torch" 2>/dev/null; then
+        say "torch not found on the host: installing the ROCm build from ${TORCH_INDEX:=https://download.pytorch.org/whl/rocm7.1}"
+        pip install -q --upgrade pip
+        pip install -q torch --index-url "$TORCH_INDEX"
+    fi
     python -c "import torch; assert torch.cuda.is_available(), 'no GPU'; print('torch', torch.__version__, \
 'hip', torch.version.hip, torch.cuda.get_device_name(0), round(torch.cuda.get_device_properties(0).total_memory/2**30), 'GB')"
     pip install -q -e ".[demo]" "kokoro>=0.9" "misaki[en]"   # the image's ROCm torch is kept as is
