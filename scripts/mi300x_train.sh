@@ -37,13 +37,21 @@ mkdir -p "$WORK"/{data,checkpoints,logs,done,tmp}
 cd "$REPO_DIR"
 # Python: where torch already exists (e.g. inside the image's `rocm` container) use that interpreter
 # directly; otherwise a venv on the host, where setup installs the ROCm build of torch.
-SYS_PY=$(command -v python3 || command -v python)
-if "$SYS_PY" -c "import torch" 2>/dev/null; then
+SYS_PY=""
+for c in ${PYTHON:-} $(command -v python3 python 2>/dev/null) /opt/venv/bin/python3 /opt/conda/bin/python3 \
+         /opt/conda/envs/*/bin/python3 /opt/*/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
+    if [ -x "$c" ] && "$c" -c "import torch" 2>/dev/null; then SYS_PY=$c; break; fi
+done
+if [ -n "$SYS_PY" ]; then
+    echo "using $SYS_PY ($("$SYS_PY" -c 'import torch; print("torch", torch.__version__)'))"
     mkdir -p "$WORK/bin"
-    ln -sfn "$SYS_PY" "$WORK/bin/python"
+    rm -f "$WORK/bin/python"   # a wrapper, not a symlink: a symlinked venv python loses its venv
+    printf '#!/bin/sh\nexec "%s" "$@"\n' "$SYS_PY" > "$WORK/bin/python" && chmod +x "$WORK/bin/python"
     printf '#!/bin/sh\nexec "%s" -m pip "$@"\n' "$SYS_PY" > "$WORK/bin/pip" && chmod +x "$WORK/bin/pip"
     export PATH="$WORK/bin:$PATH" PIP_BREAK_SYSTEM_PACKAGES=1   # Ubuntu 24.04 marks system Python as managed
 else
+    SYS_PY=$(command -v python3 || command -v python)
+    echo "no Python with torch found (inside the rocm container it should exist: try PYTHON=/path/to/python3)"
     if [ ! -x "$WORK/venv/bin/pip" ]; then   # also repairs a venv made before python3-venv was installed
         rm -rf "$WORK/venv"
         "$SYS_PY" -m venv --system-site-packages "$WORK/venv" || {
