@@ -4,6 +4,8 @@
         --system-prompt-file my_property.txt --tools order_product,create_issue
     # or a fixed list of guest lines, one per line (each starts a fresh conversation unless --multi-turn)
     python -m s2s.eval.thinker_chat ... --questions my_questions.txt
+    # your own tool schemas and a canned (fake) response per tool, so multi-step flows can be tried
+    python -m s2s.eval.thinker_chat ... --tools-file my_tools.json --mock-results my_mock_results.json
 
 Prints the reply, or the tool call, the mock tool result and the spoken confirmation, exactly as the
 voice agent would produce them (greedy decoding, same prompt layout). Tool results come from a mock
@@ -21,6 +23,20 @@ from s2s.data.hotel_v3 import GenericBackend, select_tools
 from s2s.eval.text_tools import extract_calls
 from s2s.models.thinker import Thinker
 from s2s.utils import resolve_device, resolve_dtype
+
+
+class MockBackend(GenericBackend):
+    """Canned responses per tool name from a JSON file ({"browse_products": {...}, ...}); other listed tools
+    fall back to GenericBackend's echo. Calls to tools that are not in the tool list still get an error."""
+
+    def __init__(self, tools: list | None, canned: dict):
+        super().__init__(tools)
+        self.canned = canned
+
+    def execute(self, call: dict) -> dict:
+        if call.get("name") in self.names and call["name"] in self.canned:
+            return self.canned[call["name"]]
+        return super().execute(call)
 
 
 def load_prompt(path: str) -> str:
@@ -65,6 +81,7 @@ def main() -> None:
     p.add_argument("--system-prompt-file", required=True)
     p.add_argument("--tools", default="none", help="none | comma-separated built-in names (see ws_live --tools)")
     p.add_argument("--tools-file", default=None, help="JSON list of your own tool schemas")
+    p.add_argument("--mock-results", default=None, help="JSON: tool name -> the (fake) response it returns")
     p.add_argument("--questions", default=None, help="file with one guest line per line; default: type them")
     p.add_argument("--multi-turn", action="store_true", help="with --questions: keep one conversation")
     args = p.parse_args()
@@ -76,6 +93,13 @@ def main() -> None:
     system = load_prompt(args.system_prompt_file)
     tools = select_tools(args.tools, args.tools_file)
     print(f"tools: {[t['function']['name'] for t in tools or []]}\n")
+    canned = {}
+    if args.mock_results:
+        with open(args.mock_results, encoding="utf-8") as f:
+            canned = json.load(f)
+
+    def new_backend() -> GenericBackend:
+        return MockBackend(tools, canned)
 
     def fresh() -> list[dict]:
         return [{"role": "system", "content": system}]
@@ -89,17 +113,17 @@ def main() -> None:
                 messages = fresh()
             messages.append({"role": "user", "content": q})
             print(f"GUEST: {q}")
-            print("\n".join(respond(thinker, messages, tools, GenericBackend(tools))) + "\n")
+            print("\n".join(respond(thinker, messages, tools, new_backend())) + "\n")
         return
     print("Type as the guest. Empty line = new conversation, Ctrl-D = quit.")
-    backend = GenericBackend(tools)
+    backend = new_backend()
     while True:
         try:
             q = input("GUEST: ").strip()
         except EOFError:
             break
         if not q:
-            messages, backend = fresh(), GenericBackend(tools)
+            messages, backend = fresh(), new_backend()
             print("  (new conversation)")
             continue
         messages.append({"role": "user", "content": q})

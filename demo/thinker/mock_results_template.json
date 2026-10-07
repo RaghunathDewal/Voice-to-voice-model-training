@@ -1,0 +1,15 @@
+{
+  "browse_products": {"products": [
+    {"productName": "Extra Towels", "description": "Set of 2 bath towels", "element_type": "Amenity"},
+    {"productName": "Extra Pillow", "description": "Soft hypoallergenic pillow", "element_type": "Amenity"},
+    {"productName": "Coffee Pods", "description": "Box of 10", "element_type": "Supplies"},
+    {"productName": "Late Night Snack Box", "description": "Chips, cookies and juice", "element_type": "Add-on"}]},
+  "place_product_order": {"success": true, "order_id": 9001, "status": "Pending"},
+  "get_orders_by_reservation": {"orders": [
+    {"order_id": 8001, "status": "Delivered", "items": ["Extra Pillow"]},
+    {"order_id": 8002, "status": "In progress", "items": ["Coffee Pods"]}]},
+  "get_order_by_id": {"order_id": 8002, "status": "In progress", "line_items": [{"productName": "Coffee Pods", "quantity": 1}]},
+  "report_unit_issue": {"success": true, "issue_id": 501, "status": "Open"},
+  "get_reported_issues_by_reservation": {"issues": [
+    {"issue_id": 500, "description": "The kitchen sink is leaking under the cabinet.", "status": "Technician assigned"}]}
+}

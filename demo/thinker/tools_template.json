@@ -1,0 +1,24 @@
+[
+  {"type": "function", "function": {"name": "browse_products",
+    "description": "List the products, add-ons and services the guest can order.",
+    "parameters": {"type": "object", "properties": {}, "required": []}}},
+  {"type": "function", "function": {"name": "place_product_order",
+    "description": "Order a product for the guest. Use the exact productName from browse_products.",
+    "parameters": {"type": "object", "properties": {
+      "productName": {"type": "string", "description": "Exact productName from browse_products"},
+      "quantity": {"type": "integer", "description": "How many, default 1"}}, "required": ["productName"]}}},
+  {"type": "function", "function": {"name": "get_orders_by_reservation",
+    "description": "List all orders placed for this reservation with their status.",
+    "parameters": {"type": "object", "properties": {}, "required": []}}},
+  {"type": "function", "function": {"name": "get_order_by_id",
+    "description": "Get one order and its line items.",
+    "parameters": {"type": "object", "properties": {"order_id": {"type": "integer"}}, "required": ["order_id"]}}},
+  {"type": "function", "function": {"name": "report_unit_issue",
+    "description": "Report a maintenance or housekeeping problem in the guest's unit.",
+    "parameters": {"type": "object", "properties": {
+      "issue_description": {"type": "string", "description": "Complete sentence: the item and the symptom"},
+      "priority": {"type": "string", "enum": ["High", "Medium", "Low"]}}, "required": ["issue_description"]}}},
+  {"type": "function", "function": {"name": "get_reported_issues_by_reservation",
+    "description": "List the issues already reported for this reservation with their status.",
+    "parameters": {"type": "object", "properties": {}, "required": []}}}
+]
