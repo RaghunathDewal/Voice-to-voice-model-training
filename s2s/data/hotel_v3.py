@@ -140,6 +140,38 @@ class GenericBackend:
         return generic_tool_result(kind, args, self.n)
 
 
+def known_tools() -> dict[str, dict]:
+    """Every built-in tool schema by function name: the v1 hotel tools and the hotel_v3 pool."""
+    from s2s.data.hotel import HOTEL_TOOLS
+
+    pool = {t["function"]["name"]: t for t in HOTEL_TOOLS}
+    for kind, variants in _TOOL_NAMES.items():
+        for i in range(len(variants)):
+            t = tool_schema(kind, i)
+            pool.setdefault(t["function"]["name"], t)
+    return pool
+
+
+def select_tools(names: str | None, tools_file: str | None = None) -> list | None:
+    """--tools all | none | comma-separated names (order_product,create_issue,...); --tools-file: your own
+    OpenAI-style schema list (JSON), used as is."""
+    from s2s.data.hotel import HOTEL_TOOLS
+
+    if tools_file:
+        with open(tools_file, encoding="utf-8") as f:
+            return json.load(f) or None
+    if names is None or names == "all":
+        return HOTEL_TOOLS
+    if names == "none":
+        return None
+    pool = known_tools()
+    keep = [n.strip() for n in names.split(",") if n.strip()]
+    unknown = [n for n in keep if n not in pool]
+    if unknown:
+        raise SystemExit(f"unknown tools {unknown}; built-in: {sorted(pool)} (or pass --tools-file)")
+    return [pool[n] for n in keep]
+
+
 # ---------------------------------------------------------- property profile
 _PROPERTY_NAMES = ["Aurora Grand", "Seaview Resort", "Maple Lodge", "Palm Villas", "City Suites", "Riverside Inn",
                    "Lakeshore Holiday Park", "The Harbour Hotel", "Pinewood Cabins", "Sunset Bay Resort",

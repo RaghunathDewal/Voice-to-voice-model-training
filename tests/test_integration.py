@@ -90,6 +90,18 @@ def test_text_sft_v3_uses_the_rows_own_prompt_and_tools(tiny_models):
     assert "<tools>" not in pb.tokenizer.decode(ids)
 
 
+def test_thinker_chat_runs_a_turn(tiny_models, cpu):
+    from s2s.data.hotel_v3 import GenericBackend, select_tools
+    from s2s.eval.thinker_chat import respond
+
+    th = Thinker(tiny_models["qwen"], cpu, torch.float32)
+    tools = select_tools("order_product,create_issue")
+    messages = [{"role": "system", "content": "You are the voice assistant for Test Inn."},
+                {"role": "user", "content": "Can I get two towels?"}]
+    lines = respond(th, messages, tools, GenericBackend(tools))
+    assert lines and messages[-1]["role"] == "assistant"       # random tiny model: any reply, no crash
+
+
 def test_labels_align_with_targets(tiny_models, cpu):
     th = Thinker(tiny_models["qwen"], cpu, torch.float32)
     ad = SpeechAdapter(64, th.hidden_size, d_model=32, n_layers=1, n_heads=4)

@@ -1,0 +1,21 @@
+# Out-of-template checks for thinker v3. Run with --tools order_product,create_issue
+# facts in the prompt: answer, no tool
+What's the wifi password?
+Hey, till when can we swim?
+Can I bring my dog, and is it extra?
+When do we have to leave on the last day?
+Which lodge are we in again?
+# facts NOT in the prompt: "I don't have that information" + reception
+Is there a gym?
+How far is the nearest supermarket?
+# actions with a tool: call it
+Could you send a couple more towels to the lodge?
+The barbecue won't light, can someone check it?
+There's no hot water in the shower.
+# actions WITHOUT a tool: no call, hand over to reception
+Can you book us a table for dinner tonight?
+Please wake me up at 6 tomorrow.
+Can we stay one more night?
+# other
+Who are you?
+What's the weather tomorrow?

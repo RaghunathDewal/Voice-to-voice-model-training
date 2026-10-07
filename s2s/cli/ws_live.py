@@ -39,7 +39,7 @@ from fastapi.responses import HTMLResponse, Response
 from s2s.audio import resample
 from s2s.cli_common import base_parser, config_from_args
 from s2s.data.hotel import HOTEL_TOOLS, HotelBackend, make_reservation, reservation_context
-from s2s.data.hotel_v3 import _TOOL_NAMES, GenericBackend, tool_schema
+from s2s.data.hotel_v3 import GenericBackend, known_tools, select_tools  # noqa: F401  (re-exported)
 from s2s.runtime.agent import VoiceAgent
 from s2s.runtime.live import LiveListener
 
@@ -75,34 +75,6 @@ def load_prompt(path: str) -> str:
     """A system prompt file. `{{` / `}}` (template escaping) become single braces."""
     with open(path, encoding="utf-8") as f:
         return f.read().replace("{{", "{").replace("}}", "}").strip()
-
-
-def known_tools() -> dict[str, dict]:
-    """Every built-in tool schema by function name: the v1 hotel tools and the hotel_v3 pool."""
-    pool = {t["function"]["name"]: t for t in HOTEL_TOOLS}
-    for kind, variants in _TOOL_NAMES.items():
-        for i in range(len(variants)):
-            t = tool_schema(kind, i)
-            pool.setdefault(t["function"]["name"], t)
-    return pool
-
-
-def select_tools(names: str | None, tools_file: str | None = None) -> list | None:
-    """--tools all | none | comma-separated names (order_product,create_issue,...); --tools-file: your own
-    OpenAI-style schema list (JSON), used as is."""
-    if tools_file:
-        with open(tools_file, encoding="utf-8") as f:
-            return json.load(f) or None
-    if names is None or names == "all":
-        return HOTEL_TOOLS
-    if names == "none":
-        return None
-    pool = known_tools()
-    keep = [n.strip() for n in names.split(",") if n.strip()]
-    unknown = [n for n in keep if n not in pool]
-    if unknown:
-        raise SystemExit(f"unknown tools {unknown}; built-in: {sorted(pool)} (or pass --tools-file)")
-    return [pool[n] for n in keep]
 
 
 def build_app(agent: VoiceAgent | None, system_prompt: str | None = None, tools: list | None = HOTEL_TOOLS,
