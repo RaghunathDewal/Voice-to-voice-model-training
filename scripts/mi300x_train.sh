@@ -211,11 +211,14 @@ stage hotel_speech hotel_speech
 
 # ------------------------------------------------------- 4. adapter v4
 echo speech_llm_pk4 >> "$SYNC_DIRS"
-TRAIN="[{path: $M/hotel4_train_pk.jsonl, weight: 0.38}, {path: $M/hotel3_train_pk.jsonl, weight: 0.04}, \
-{path: $M/cv_train_pk_d3f.jsonl, weight: 0.24}, {path: $M/svarah_train_pk_d3f.jsonl, weight: 0.12}, \
-{path: $M/voxpop_acc_pk_d3f.jsonl, weight: 0.12}, {path: $M/peoples_train_pk_d3f.jsonl, weight: 0.10}]"
+# ~72% real speakers (accents, real microphones) for robust hearing, ~28% synthetic hotel speech for the
+# domain words, numbers and the long tool prompt; 35% of samples are exact transcription
+TRAIN="[{path: $M/hotel4_train_pk.jsonl, weight: 0.25}, {path: $M/hotel3_train_pk.jsonl, weight: 0.03}, \
+{path: $M/cv_train_pk_d3f.jsonl, weight: 0.28}, {path: $M/svarah_train_pk_d3f.jsonl, weight: 0.16}, \
+{path: $M/voxpop_acc_pk_d3f.jsonl, weight: 0.13}, {path: $M/peoples_train_pk_d3f.jsonl, weight: 0.15}]"
 stage adapter_train python -m s2s.train.speech_llm $CFG --set adapter.encoder=$E $TH \
     train_speech_llm.train_lora=false train_speech_llm.init_from=checkpoints/speech_llm_pk3 \
+    train_speech_llm.transcribe_prob=0.35 \
     train_speech_llm.output_dir=checkpoints/speech_llm_pk4 train_speech_llm.max_steps="$ADAPTER_STEPS" \
     train_speech_llm.batch_size=64 train_speech_llm.grad_accum=1 train_speech_llm.warmup_steps=300 \
     train_speech_llm.num_workers=12 train_speech_llm.eval_every=500 train_speech_llm.save_every=500 \
