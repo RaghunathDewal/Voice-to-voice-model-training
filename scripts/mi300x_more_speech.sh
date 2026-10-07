@@ -36,6 +36,8 @@ ln -sfn "$WORK/checkpoints" checkpoints
 python -c "import torch, s2s; assert torch.cuda.is_available()" || {
     echo "run scripts/mi300x_train.sh first (it sets up Python), and run this inside the rocm container"; exit 1; }
 
+pip install -q pyarrow librosa   # parquet shards; mp3 decoding for Common Voice
+
 touch "$WORK/more_running"
 trap 'rm -f "$WORK/more_running"' EXIT
 say() { echo "[$(date +%H:%M:%S)] $*"; }
