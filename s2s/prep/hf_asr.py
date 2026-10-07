@@ -13,6 +13,11 @@ like LibriSpeech. Only the parquet shards needed for --max-hours are downloaded.
     python -m s2s.prep.hf_asr --preset spokenwoz --split train --max-utts 8000 --name spokenwoz_train
     # EdAcc: accented conversational English (evaluation)
     python -m s2s.prep.hf_asr --preset edacc --split validation --name edacc_valid
+    # AMI meetings (spontaneous speech; headset and distant room mic), MLS English (many speakers),
+    # People's Speech "dirty" (noisier), Indian-accented Common Voice
+    python -m s2s.prep.hf_asr --preset ami_sdm --split train --max-hours 15 --min-words 4 --name ami_sdm_train
+    python -m s2s.prep.hf_asr --preset mls --split train --max-hours 25 --max-per-accent 0.1 --name mls_train
+    python -m s2s.prep.hf_asr --preset commonvoice --split train --accent-match "India|South Asia" --name cv_india_train
 
 Writes <data_dir>/manifests/<name>_raw.jsonl with id, audio, text, duration,
 source and (when the dataset has it) accent.
@@ -38,6 +43,12 @@ PRESETS = {
     "commonvoice": {"repo": "fixie-ai/common_voice_17_0", "prefix": "en/{split}-", "text": "sentence",
                     "accent": "accent"},
     "peoples": {"repo": "MLCommons/peoples_speech", "prefix": "clean/{split}-", "text": "text"},
+    "peoples_dirty": {"repo": "MLCommons/peoples_speech", "prefix": "dirty/{split}-", "text": "text"},
+    # AMI meeting corpus (CC BY 4.0): ihm = close-talk headset, sdm = one distant microphone in the room
+    "ami_ihm": {"repo": "edinburghcstr/ami", "prefix": "ihm/{split}-", "text": "text", "accent": "speaker_id"},
+    "ami_sdm": {"repo": "edinburghcstr/ami", "prefix": "sdm/{split}-", "text": "text", "accent": "speaker_id"},
+    # Multilingual LibriSpeech, English (CC BY 4.0): read speech from thousands of speakers
+    "mls": {"repo": "parler-tts/mls_eng", "prefix": "data/{split}-", "text": "transcript", "accent": "speaker_id"},
     "edacc": {"repo": "edinburghcstr/edacc", "prefix": "data/{split}-", "text": "text", "accent": "accent"},
     "voxpopuli_accented": {"repo": "facebook/voxpopuli", "prefix": "en_accented/{split}-",
                            "text": "normalized_text", "accent": "accent"},
@@ -104,6 +115,8 @@ def main() -> None:
     p.add_argument("--max-per-accent", type=float, default=0.0,
                    help="cap hours per accent label (balances accents; unlabelled rows are capped too)")
     p.add_argument("--max-shards", type=int, default=0, help="download at most this many parquet shards (0 = no cap)")
+    p.add_argument("--accent-match", default=None,
+                   help="keep only rows whose accent label matches this regex (e.g. 'India|South Asia')")
     p.add_argument("--min-seconds", type=float, default=1.0)
     p.add_argument("--max-seconds", type=float, default=20.0)
     p.add_argument("--min-words", type=int, default=2)
@@ -143,6 +156,8 @@ def main() -> None:
             if total_s >= limit_s or (args.max_utts and len(rows) >= args.max_utts):
                 break
             text = clean_text(rec.get(preset["text"], ""))
+            if text.isupper():  # AMI: "YEAH I THINK SO" -> "Yeah i think so"
+                text = re.sub(r"\bi\b", "I", text.lower().capitalize())
             if not usable(text, args.min_words):
                 skipped += 1
                 continue
@@ -150,6 +165,9 @@ def main() -> None:
                 skipped += 1
                 continue
             accent = str(rec.get(preset.get("accent", ""), "") or "").strip() or "unlabelled"
+            if args.accent_match and not re.search(args.accent_match, accent, re.I):
+                skipped += 1
+                continue
             if per_accent.get(accent, 0.0) >= accent_cap:
                 skipped += 1
                 continue

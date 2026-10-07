@@ -27,8 +27,8 @@ M=data/manifests
 
 # sizes for one MI300X (192 GB): bigger batches than the 2xT4 runs, same learning rates
 THINKER_STEPS=${THINKER_STEPS:-1500}       # batch 32: ~48k conversations seen
-ADAPTER_STEPS=${ADAPTER_STEPS:-6000}       # batch 64
-TALKER_STEPS=${TALKER_STEPS:-30000}        # batch 32, full-size talker (1024-d, 12 layers)
+ADAPTER_STEPS=${ADAPTER_STEPS:-8000}       # batch 64
+TALKER_STEPS=${TALKER_STEPS:-30000}        # batch 32, small talker (47M) continued from talker_v2
 TALKER_TEXTS=${TALKER_TEXTS:-40000}        # sentences spoken in af_heart for the talker
 
 : "${HF_TOKEN:?export HF_TOKEN first}"
@@ -211,11 +211,26 @@ stage hotel_speech hotel_speech
 
 # ------------------------------------------------------- 4. adapter v4
 echo speech_llm_pk4 >> "$SYNC_DIRS"
-# ~72% real speakers (accents, real microphones) for robust hearing, ~28% synthetic hotel speech for the
-# domain words, numbers and the long tool prompt; 35% of samples are exact transcription
-TRAIN="[{path: $M/hotel4_train_pk.jsonl, weight: 0.25}, {path: $M/hotel3_train_pk.jsonl, weight: 0.03}, \
-{path: $M/cv_train_pk_d3f.jsonl, weight: 0.28}, {path: $M/svarah_train_pk_d3f.jsonl, weight: 0.16}, \
-{path: $M/voxpop_acc_pk_d3f.jsonl, weight: 0.13}, {path: $M/peoples_train_pk_d3f.jsonl, weight: 0.15}]"
+# ~74% real speakers (accents, real microphones, meetings) for robust hearing, ~26% synthetic hotel speech
+# for the domain words, numbers and the long tool prompt; 35% of samples are exact transcription.
+# The extra real sets come from scripts/mi300x_more_speech.sh: wait for it while it runs, then use
+# every set that finished.
+if [ -f "$WORK/more_running" ]; then
+    say "waiting for mi300x_more_speech.sh to finish (max 3 h) ..."
+    for _ in $(seq 180); do [ -f "$WORK/more_running" ] || break; sleep 60; done
+fi
+mix() {  # mix <manifest> <weight>: one entry of the adapter mix, only if the manifest exists
+    [ -f "$1" ] && printf '{path: %s, weight: %s}, ' "$1" "$2"
+    return 0
+}
+more() { [ -f "$WORK/done/more_$1" ] && mix "$M/${1}_pk_d3f.jsonl" "$2"; return 0; }
+TRAIN="[$(mix $M/hotel4_train_pk.jsonl 0.23)$(mix $M/hotel3_train_pk.jsonl 0.03)\
+$(mix $M/cv_train_pk_d3f.jsonl 0.20)$(mix $M/svarah_train_pk_d3f.jsonl 0.13)\
+$(mix $M/voxpop_acc_pk_d3f.jsonl 0.09)$(mix $M/peoples_train_pk_d3f.jsonl 0.08)\
+$(more cv_india_train 0.06)$(more ami_ihm_train 0.05)$(more ami_sdm_train 0.04)\
+$(more peoples_dirty_train 0.05)$(more mls_train 0.04)]"
+TRAIN=${TRAIN/%, ]/]}
+say "adapter mix: $TRAIN"
 stage adapter_train python -m s2s.train.speech_llm $CFG --set adapter.encoder=$E $TH \
     train_speech_llm.train_lora=false train_speech_llm.init_from=checkpoints/speech_llm_pk3 \
     train_speech_llm.transcribe_prob=0.35 \
@@ -253,10 +268,13 @@ talker_data() {
 stage talker_data talker_data
 
 echo talker_v3 >> "$SYNC_DIRS"
-# default.yaml's talker size (1024-d, 12 + 6 layers) instead of small.yaml's 512-d
-TALKER_BIG="talker.d_model=1024 talker.n_layers=12 talker.n_heads=16 talker.depth_d_model=512 \
-talker.depth_layers=6 talker.depth_heads=8"
-stage talker_train python -m s2s.train.talker $CFG --set $TALKER_BIG \
+# small.yaml's talker (47M, keeps the model small and fast), continued from talker_v2 on more data
+fetch_talker_v2() {
+    python -c "from huggingface_hub import snapshot_download as s; s('$CKPT_REPO', local_dir='.', \
+allow_patterns=['checkpoints/talker_v2/talker.pt', 'checkpoints/talker_v2/meta.json', 'checkpoints/talker_v2/config.yaml'])"
+}
+stage fetch_talker_v2 fetch_talker_v2
+stage talker_train python -m s2s.train.talker $CFG --set train_talker.init_from=checkpoints/talker_v2 \
     train_talker.thinker_dir=checkpoints/thinker_merged_v3 train_talker.output_dir=checkpoints/talker_v3 \
     train_talker.max_steps="$TALKER_STEPS" train_talker.batch_size=32 train_talker.grad_accum=1 \
     train_talker.lr=3e-4 train_talker.warmup_steps=1000 train_talker.num_workers=12 \
@@ -265,7 +283,7 @@ stage talker_train python -m s2s.train.talker $CFG --set $TALKER_BIG \
     train_talker.valid_manifest=$M/talker_v3_valid.jsonl
 
 talker_eval() {
-    python -m s2s.eval.talker $CFG --set $TALKER_BIG train_talker.thinker_dir=checkpoints/thinker_merged_v3 \
+    python -m s2s.eval.talker $CFG --set train_talker.thinker_dir=checkpoints/thinker_merged_v3 \
         --talker-dir checkpoints/talker_v3 --manifest $M/talker_v3_valid.jsonl --max 100 \
         --out-dir "$LOGS/talker_v3_eval" | grep -e WER -e runaway
     hf_push checkpoints/talker_v3 checkpoints/talker_v3 || true

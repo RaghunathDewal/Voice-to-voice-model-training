@@ -477,7 +477,8 @@ def _stay_turn(ctx: _Ctx, wrap: bool) -> dict:
 def _small_talk(ctx: _Ctx) -> dict:
     rng = ctx.rng
     first = ctx.stay["guest_name"].split()[0]
-    me = f"I'm {ctx.persona}, the voice concierge for {ctx.prop}" if ctx.persona else f"I'm the {ctx.prop} voice assistant"
+    prop = ctx.prop[4:] if ctx.prop.startswith("The ") else ctx.prop  # "the Harbour Hotel", not "the The ..."
+    me = f"I'm {ctx.persona}, the voice concierge for {ctx.prop}" if ctx.persona else f"I'm the {prop} voice assistant"
     options = [
         (["Hi.", "Hello.", "Good morning.", "Hey there.", "Good evening."],
          f"Hello {first}! How can I help you today?", ["help"]),
