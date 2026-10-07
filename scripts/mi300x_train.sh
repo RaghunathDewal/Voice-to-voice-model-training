@@ -28,10 +28,15 @@ M=data/manifests
 # sizes for one MI300X (192 GB): bigger batches than the 2xT4 runs, same learning rates
 THINKER_STEPS=${THINKER_STEPS:-1500}       # batch 32: ~48k conversations seen
 ADAPTER_STEPS=${ADAPTER_STEPS:-8000}       # batch 64
+# after an interruption: ADAPTER_INIT=checkpoints/speech_llm_pk4 ADAPTER_STEPS=<steps left> ADAPTER_WARMUP=100
+ADAPTER_INIT=${ADAPTER_INIT:-checkpoints/speech_llm_pk3}
+ADAPTER_WARMUP=${ADAPTER_WARMUP:-300}
 TALKER_STEPS=${TALKER_STEPS:-30000}        # batch 32, small talker (47M) continued from talker_v2
 TALKER_TEXTS=${TALKER_TEXTS:-40000}        # sentences spoken in af_heart for the talker
 
-: "${HF_TOKEN:?export HF_TOKEN first}"
+# the token from `export HF_TOKEN=...`, or from a saved `huggingface-cli login` (for background runs)
+HF_TOKEN=${HF_TOKEN:-$(cat "$HOME/.cache/huggingface/token" 2>/dev/null || true)}
+: "${HF_TOKEN:?export HF_TOKEN first (or log in once: huggingface-cli login)}"
 export HF_TOKEN PYTHONUNBUFFERED=1 TQDM_MININTERVAL=30 TOKENIZERS_PARALLELISM=false
 mkdir -p "$WORK"/{data,checkpoints,logs,done,tmp}
 cd "$REPO_DIR"
@@ -232,10 +237,10 @@ $(more peoples_dirty_train 0.05)$(more mls_train 0.04)]"
 TRAIN=${TRAIN/%, ]/]}
 say "adapter mix: $TRAIN"
 stage adapter_train python -m s2s.train.speech_llm $CFG --set adapter.encoder=$E $TH \
-    train_speech_llm.train_lora=false train_speech_llm.init_from=checkpoints/speech_llm_pk3 \
+    train_speech_llm.train_lora=false train_speech_llm.init_from="$ADAPTER_INIT" \
     train_speech_llm.transcribe_prob=0.35 \
     train_speech_llm.output_dir=checkpoints/speech_llm_pk4 train_speech_llm.max_steps="$ADAPTER_STEPS" \
-    train_speech_llm.batch_size=64 train_speech_llm.grad_accum=1 train_speech_llm.warmup_steps=300 \
+    train_speech_llm.batch_size=64 train_speech_llm.grad_accum=1 train_speech_llm.warmup_steps="$ADAPTER_WARMUP" \
     train_speech_llm.num_workers=12 train_speech_llm.eval_every=500 train_speech_llm.save_every=500 \
     "train_speech_llm.train_manifests=$TRAIN" train_speech_llm.valid_manifest=$M/hotel4_eval_noisy_pk.jsonl
 
