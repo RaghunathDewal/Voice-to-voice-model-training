@@ -173,6 +173,23 @@ class VoiceSession:
         timer.mark("input_encoded")
         yield from turn.finish()
 
+    def respond_text(self, text: str, timer: Timer | None = None) -> Iterator[dict]:
+        """A typed user turn (e.g. a "greet the guest" kickoff from the application) -> reply events."""
+        timer = timer or Timer()
+        prompts = self.a.thinker.prompts
+        # the first user turn's opening is already in the prefilled prefix
+        ids = ([] if self.first_turn else self.next_open_ids) + prompts.ids(text)
+        ids += self.first_close_ids if self.first_turn else self.next_close_ids
+        self.first_turn = False
+        self.history.append({"role": "user", "text": text})
+        with torch.no_grad():
+            logits, hidden = self._feed_ids(ids)
+        timer.mark("prefill_done")
+        yield from self._generate(logits, hidden, timer)
+        timer.mark("done")
+        yield {"type": "timings", "ms": dict(timer.marks)}
+        yield {"type": "done"}
+
     def _open_turn(self) -> None:
         start, _ = self.a.adapter.boundary_embeddings()
         ids = [] if self.first_turn else self.next_open_ids

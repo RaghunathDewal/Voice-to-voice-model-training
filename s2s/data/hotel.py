@@ -120,18 +120,20 @@ def validate_call(call: dict, tools: list | None = None) -> str | None:
     spec = next((t["function"] for t in (tools or HOTEL_TOOLS) if t["function"]["name"] == call.get("name")), None)
     if spec is None:
         return f"unknown tool {call.get('name')}"
-    params = spec["parameters"]
+    params = spec.get("parameters") or {}  # a tool may take no arguments at all
     args = call.get("arguments") or {}
     for req in params.get("required", []):
         if req not in args:
             return f"missing argument {req}"
     for k, v in args.items():
-        prop = params["properties"].get(k)
+        prop = (params.get("properties") or {}).get(k)
         if prop is None:
             return f"unexpected argument {k}"
-        if prop["type"] == "integer" and not isinstance(v, int):
+        if prop.get("type") == "integer" and not isinstance(v, int):
             return f"{k} must be an integer"
-        if prop["type"] == "string" and not isinstance(v, str):
+        if prop.get("type") == "number" and (isinstance(v, bool) or not isinstance(v, (int, float))):
+            return f"{k} must be a number"
+        if prop.get("type") == "string" and not isinstance(v, str):
             return f"{k} must be a string"
         if "enum" in prop and v not in prop["enum"]:
             return f"{k} must be one of {prop['enum']}"

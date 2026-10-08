@@ -30,6 +30,9 @@ the agent thinks and speaks (half duplex), so no echo cancellation is needed on 
 
 The page is s2s/cli/static/live.html; /?demo=<dir> serves the showcase page (showcase.html) that
 replays a pre-generated conversation for the demo video.
+
+/live is the application API (system prompt + tools from the application, tool calls executed by
+it, Gemini-Live-like events): see s2s/cli/live_api.py and integrations/nestjs/.
 """
 
 from __future__ import annotations
@@ -104,7 +107,7 @@ def save_turn(save_dir: str, wav: np.ndarray, sr: int, info: dict) -> str:
 
 
 def build_app(agent: VoiceAgent | None, system_prompt: str | None = None, tools: list | None = HOTEL_TOOLS,
-              demo_dir: str | None = None, save_turns: str | None = None) -> FastAPI:
+              demo_dir: str | None = None, save_turns: str | None = None, live_token: str | None = None) -> FastAPI:
     """system_prompt: replaces the default prompt AND the generated demo reservation (put the guest data in it)."""
     sr = agent.codec.sample_rate if agent is not None else 24000
     gpu_lock = threading.Lock()  # one model call at a time across connections
@@ -118,6 +121,10 @@ def build_app(agent: VoiceAgent | None, system_prompt: str | None = None, tools:
         from fastapi.staticfiles import StaticFiles
 
         app.mount("/demo", StaticFiles(directory=demo_dir), name="demo")
+
+    from s2s.cli.live_api import add_live_api
+
+    add_live_api(app, agent, gpu_lock, live_token)  # /live: the model as an upstream API for an application
 
     @app.get("/favicon.ico")
     def favicon():
@@ -335,6 +342,8 @@ def main() -> None:
     p.add_argument("--tools", default="all", help="all | none | comma-separated built-in names, e.g. "
                                                   "order_product,create_issue (the v1 hotel tools and the hotel_v3 pool)")
     p.add_argument("--tools-file", default=None, help="JSON list of your own tool schemas (overrides --tools)")
+    p.add_argument("--live-token", default=os.environ.get("S2S_LIVE_TOKEN"),
+                   help="require this token on /live (?token= or Authorization: Bearer); default $S2S_LIVE_TOKEN")
     p.add_argument("--voice", choices=["talker", "kokoro"], default=None,
                    help="reply voice (default: runtime.voice from the config); kokoro needs: pip install kokoro misaki[en]")
     p.add_argument("--save-turns", default=None,
@@ -349,7 +358,7 @@ def main() -> None:
 
     prompt = load_prompt(args.system_prompt_file) if args.system_prompt_file else None
     app = build_app(VoiceAgent(cfg, args.speech_llm_dir, args.talker_dir), prompt, select_tools(args.tools, args.tools_file), args.demo_dir,
-                    args.save_turns)
+                    args.save_turns, args.live_token)
     if args.tunnel:
         start_tunnel(args.port)
     print(f"serving on http://localhost:{args.port}  (use --tunnel for a public https link)", flush=True)

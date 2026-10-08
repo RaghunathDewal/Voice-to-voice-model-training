@@ -361,3 +361,64 @@ def test_device_endpoint_raw_pcm(agent, monkeypatch):
             assert audio > 0, f"turn {turn}: no audio"
             assert any(x.startswith("you: ") for x in lines) and "agent: Hello there." in lines
             assert not any(x.startswith("{") for x in lines)  # no JSON protocol messages on /device
+
+
+def test_live_api_for_an_application_backend(agent, monkeypatch):
+    """/live: setup with Gemini-style tool declarations, a text kickoff, then a spoken turn whose tool call is
+    executed by the CLIENT (like a NestJS backend calling its own booking API) and answered with tool_response."""
+    from fastapi.testclient import TestClient
+
+    import s2s.runtime.agent as agent_mod
+    from s2s.cli.ws_live import build_app
+
+    p = agent.thinker.prompts
+    call = '\n{"name": "place_product_order", "arguments": {"products": [{"productName": "Towel", "count": 2}]}}\n'
+    script = (p.ids("Hi, how can I help?") + [p.im_end_id]
+              + [p.tool_call_start_id] + p.ids(call) + [p.tool_call_end_id, p.im_end_id]
+              + p.ids("Your towels are on the way.") + [p.im_end_id])
+    monkeypatch.setattr(agent_mod, "sample_logits", lambda *a, **k: script.pop(0) if script else p.im_end_id)
+    gemini_tools = [{"functionDeclarations": [
+        {"name": "browse_products", "description": "List products."},  # no parameters at all
+        {"name": "place_product_order", "description": "Order products.", "parameters": {
+            "type": "OBJECT", "required": ["products"], "properties": {
+                "message": {"type": "STRING"},
+                "products": {"type": "ARRAY", "items": {"type": "OBJECT", "required": ["productName"], "properties": {
+                    "productName": {"type": "STRING"}, "count": {"type": "NUMBER"}}}}}}}]}]
+    client = TestClient(build_app(agent, live_token="secret"))
+
+    def until(ws, kind):
+        got, audio = [], 0
+        while True:
+            msg = ws.receive()
+            if msg.get("bytes"):
+                audio += len(msg["bytes"]) // 2
+                continue
+            m = json.loads(msg["text"])
+            got.append(m)
+            if m["type"] == kind:
+                return got, audio
+
+    with pytest.raises(Exception):  # wrong token: refused
+        with client.websocket_connect("/live?token=nope") as ws:
+            ws.receive()
+    with client.websocket_connect("/live", headers={"Authorization": "Bearer secret"}) as ws:
+        ws.send_text(json.dumps({"type": "setup", "system_prompt": "You are the concierge.", "tools": gemini_tools,
+                                 "input_sample_rate": 16000, "output_sample_rate": 16000}))
+        until(ws, "setup_complete")
+        ws.send_text(json.dumps({"type": "text", "text": "Greet the guest."}))  # kickoff, like Gemini's sendClientContent
+        got, audio = until(ws, "turn_complete")
+        assert audio > 0 and {"type": "output_transcription", "text": "Hi, how can I help?"} in got
+        assert not any(m["type"] == "input_transcription" for m in got)  # typed kickoffs are not transcribed
+
+        sr = 16000
+        t = np.arange(sr) / sr
+        pcm = (np.concatenate([0.1 * np.sin(2 * np.pi * 220 * t), np.zeros(2 * sr)]) * 32767).astype("<i2")
+        for i in range(0, len(pcm), 2048):
+            ws.send_bytes(pcm[i:i + 2048].tobytes())
+        got, _ = until(ws, "tool_call")
+        assert any(m["type"] == "input_transcription" for m in got)
+        tc = got[-1]
+        assert tc["name"] == "place_product_order" and tc["args"]["products"][0]["count"] == 2
+        ws.send_text(json.dumps({"type": "tool_response", "id": tc["id"], "response": {"order_id": 77}}))
+        got, audio = until(ws, "turn_complete")
+        assert audio > 0 and {"type": "output_transcription", "text": "Your towels are on the way."} in got
