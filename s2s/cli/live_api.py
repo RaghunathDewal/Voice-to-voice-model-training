@@ -119,10 +119,12 @@ def add_live_api(app: FastAPI, agent, gpu_lock: threading.Lock, token: str | Non
     async def live(ws: WebSocket):
         if token:
             given = ws.query_params.get("token") or ws.headers.get("authorization", "").removeprefix("Bearer ").strip()
-            if given != token:
+            if given != token:  # the client sees HTTP 403
+                print(f"[live] refused a connection: {'wrong' if given else 'missing'} token", flush=True)
                 await ws.close(code=1008, reason="invalid token")
                 return
         await ws.accept()
+        print("[live] application connected", flush=True)
         loop = asyncio.get_running_loop()
         send_lock = asyncio.Lock()
         conv: dict = {"state": "setup", "session": None}
