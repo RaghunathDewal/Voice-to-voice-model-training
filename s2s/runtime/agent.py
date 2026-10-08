@@ -290,7 +290,8 @@ class StreamingTurn:
         self.latents: torch.Tensor | None = None
         self.fed_frames = 0
         self.eot_probs: list[float] = []
-        self.endpointer = Endpointer.from_config(a.cfg.runtime.endpoint, 1000.0 / self.codec.frame_rate)
+        self.endpointer = Endpointer.from_config(a.cfg.runtime.endpoint, 1000.0 / self.codec.frame_rate,
+                                                 self.codec.sample_rate)
         self.ended = False
         with torch.no_grad():
             session._open_turn()

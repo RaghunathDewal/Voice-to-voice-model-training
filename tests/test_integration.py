@@ -153,7 +153,8 @@ def agent(tiny_models, tmp_path, cpu):
            depth_d_model=16, depth_layers=1, depth_heads=2, max_frames=30).save(str(talker_dir / "talker.pt"))
     save_json(str(talker_dir / "meta.json"), {"thinker": tiny_models["qwen"], "layer_idx": layers})
     cfg = load_config(os.path.join(ROOT, "configs", "default.yaml"), [
-        f"codec.model={tiny_models['mimi']}", f"thinker.model={tiny_models['qwen']}", "device=cpu"])
+        f"codec.model={tiny_models['mimi']}", f"thinker.model={tiny_models['qwen']}", "device=cpu",
+        "runtime.endpoint.vad=energy"])  # synthetic tones stand in for speech here; Silero rightly ignores them
     from s2s.runtime.agent import VoiceAgent
 
     return VoiceAgent(cfg, str(speech_dir), str(talker_dir))

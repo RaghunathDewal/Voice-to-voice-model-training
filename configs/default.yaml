@@ -128,8 +128,10 @@ runtime:
   emit_every_frames: 2      # decode + emit audio every N frames (160 ms)
   max_tool_rounds: 3
   endpoint:
-    energy_threshold_db: -45.0
+    vad: silero             # silero (robust to room noise, clicks, fans) | energy (loudness threshold)
+    vad_threshold: 0.5      # silero speech probability to start speech (stops 0.15 lower)
+    energy_threshold_db: -45.0   # energy VAD only
     min_speech_ms: 240
-    min_silence_ms: 240     # earliest end-of-turn decision (needs EOT head agreement)
-    max_silence_ms: 800     # end of turn regardless of EOT head
+    min_silence_ms: 320     # earliest end-of-turn decision (needs EOT head agreement)
+    max_silence_ms: 1000    # end of turn regardless of EOT head
     eot_threshold: 0.5

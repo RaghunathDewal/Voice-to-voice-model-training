@@ -63,3 +63,59 @@ def test_two_turns_in_one_stream():
     listener, _ = make(eot=0.9)
     utts = feed_all(listener, np.concatenate([tone(0.8), silence(0.6), tone(0.8), silence(0.6)]))
     assert len(utts) == 2
+
+
+# ------------------------------------------------------------- Silero VAD
+def _speech_clip():
+    import os
+
+    import pytest
+    import soundfile as sf
+
+    from s2s.audio import resample
+
+    path = os.path.join(os.path.dirname(__file__), "..", "demo", "video", "public", "audio", "guest_1.wav")
+    pytest.importorskip("silero_vad")
+    if not os.path.exists(path):
+        pytest.skip("demo speech clip not available")
+    wav, sr = sf.read(path, dtype="float32")
+    return resample(wav, sr, SR)
+
+
+def _room_noise(seconds, seed=0):
+    """Fan-like noise at about -38 dB with keyboard-like clicks: louder than the energy VAD's -45 dB."""
+    rng = np.random.default_rng(seed)
+    n = int(seconds * SR)
+    noise = np.convolve(rng.standard_normal(n), np.ones(8) / 8, mode="same").astype(np.float32) * 0.035
+    for at in rng.integers(0, n - 200, size=int(seconds * 3)):
+        noise[at:at + 120] += rng.standard_normal(120).astype(np.float32) * 0.5
+    return noise
+
+
+def _speech_frames(ep, wav):
+    return sum(ep.is_speech(wav[i:i + HOP]) for i in range(0, len(wav) - HOP + 1, HOP))
+
+
+def test_silero_ignores_room_noise_and_clicks_that_fool_the_energy_vad():
+    _speech_clip()  # skips when silero-vad is not installed
+    noise = _room_noise(6.0)
+    energy = Endpointer(frame_ms=80, energy_threshold_db=-45)
+    silero = Endpointer(frame_ms=80, vad="silero", sample_rate=SR)
+    n = len(noise) // HOP
+    assert _speech_frames(energy, noise) > 0.8 * n          # loudness alone: noise looks like speech
+    assert _speech_frames(silero, noise) < 0.1 * n          # Silero: not speech
+
+
+def test_silero_turn_in_a_noisy_room_ends_after_the_speech():
+    speech = _speech_clip()
+    lead, tail = _room_noise(1.0, seed=1), _room_noise(2.0, seed=2)
+    wav = np.concatenate([lead, speech + _room_noise(len(speech) / SR, seed=3)[: len(speech)], tail])
+    ep = Endpointer(frame_ms=80, min_speech_ms=240, min_silence_ms=320, max_silence_ms=1000,
+                    eot_threshold=0.5, vad="silero", sample_rate=SR)
+    listener = LiveListener(ep, HOP, lambda w: 0.9, sample_rate=SR)
+    turns = feed_all(listener, wav)
+    assert len(turns) == 1
+    sec = len(turns[0]) / SR
+    voiced = _speech_frames(Endpointer(frame_ms=80, vad="silero", sample_rate=SR), speech) * HOP / SR
+    # the whole spoken part plus pre-roll and the closing silence, not the 2 s of noise after it
+    assert voiced <= sec < voiced + 1.5, (sec, voiced)

@@ -19,6 +19,7 @@ dependencies = [
     "soundfile",
     "pyyaml",
     "jiwer",
+    "silero-vad>=5.1",      # voice activity detection for live turn-taking (MIT, model bundled, CPU)
     "tqdm",
 ]
 

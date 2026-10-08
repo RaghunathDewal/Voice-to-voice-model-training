@@ -2,7 +2,7 @@
 
 `LiveListener` receives microphone audio in chunks of any size and returns a
 complete user utterance once the end of the turn is detected, with the same
-rules as the streaming runtime (energy VAD + the adapter's end-of-turn head,
+rules as the streaming runtime (Silero or energy VAD + the adapter's end-of-turn head,
 see s2s/runtime/endpoint.py):
 
     listener = LiveListener(agent)
@@ -42,7 +42,7 @@ class LiveListener:
     @classmethod
     def for_agent(cls, agent, **kw) -> "LiveListener":
         codec = agent.codec
-        ep = Endpointer.from_config(agent.cfg.runtime.endpoint, 1000.0 / codec.frame_rate)
+        ep = Endpointer.from_config(agent.cfg.runtime.endpoint, 1000.0 / codec.frame_rate, codec.sample_rate)
 
         def eot_fn(wav: np.ndarray) -> float:
             return agent.eot_probability(wav)  # encodes with the adapter's input encoder (Mimi, Parakeet, ...)
@@ -58,6 +58,7 @@ class LiveListener:
         self.remainder = np.zeros(0, dtype=np.float32)
         self.frames = None
         self.ep.reset()
+        self.ep.reset_vad()  # listening resumes after the agent spoke: a new audio stream
 
     def feed(self, chunk: np.ndarray) -> np.ndarray | None:
         """Feed 24 kHz mono float32 audio. Returns the utterance when the turn ends, else None."""
