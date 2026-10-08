@@ -34,6 +34,36 @@ SR = 16000
 CHUNK = SR // 10  # 100 ms
 
 
+QUESTIONS = [
+    ("af_bella", "Hi, could you send two extra towels to my room?"),
+    ("am_michael", "What time is check out tomorrow?"),
+    ("bf_emma", "The air conditioning in my room is not working."),
+    ("am_adam", "What is the Wi-Fi password, please?"),
+    ("af_sarah", "Can you tell me my reservation details?"),
+    ("bm_george", "Is breakfast included, and what time does it start?"),
+]
+
+
+def synth_questions(cache_dir: str) -> list[str]:
+    """No clips given: speak a few guest questions with Kokoro (several voices), cached on disk."""
+    import soundfile as sf
+
+    os.makedirs(cache_dir, exist_ok=True)
+    paths = [os.path.join(cache_dir, f"q{i}.wav") for i in range(len(QUESTIONS))]
+    if all(os.path.exists(p) for p in paths):
+        return paths
+    from kokoro import KPipeline
+
+    pipes: dict[str, KPipeline] = {}
+    for path, (voice, text) in zip(paths, QUESTIONS):
+        lang = voice[0]  # a = American, b = British
+        pipe = pipes.setdefault(lang, KPipeline(lang_code=lang, repo_id="hexgrad/Kokoro-82M"))
+        audio = np.concatenate([r.audio.numpy() for r in pipe(text, voice=voice, split_pattern=None)])
+        sf.write(path, audio, 24000)
+    print(f"synthesised {len(paths)} guest questions with Kokoro -> {cache_dir}")
+    return paths
+
+
 def clips(paths: list[str]) -> list[bytes]:
     out = []
     for p in paths:
@@ -121,14 +151,15 @@ def main() -> None:
     p.add_argument("--token", default=os.environ.get("S2S_LIVE_TOKEN"))
     p.add_argument("--concurrency", type=int, nargs="+", default=[1, 2, 4, 8])
     p.add_argument("--turns", type=int, default=3, help="questions per guest")
-    p.add_argument("--clips", nargs="*", default=sorted(glob.glob("demo/video/public/audio/guest_*.wav")))
+    p.add_argument("--clips", nargs="*", default=sorted(glob.glob("demo/video/public/audio/guest_*.wav")),
+                   help="speech WAVs to play; default: demo clips, else questions synthesised with Kokoro")
     p.add_argument("--silence", type=float, default=1.5, help="seconds of silence after each question")
     p.add_argument("--ramp", type=float, default=3.0, help="guests start within this many seconds")
     p.add_argument("--timeout", type=float, default=60.0, help="seconds to wait for a reply")
     p.add_argument("--system-prompt", default="You are the voice concierge of a holiday park. Be brief.")
     p.add_argument("--out", default=None, help="write all measurements as JSON")
     args = p.parse_args()
-    speech = clips(args.clips)
+    speech = clips(args.clips or synth_questions(os.path.expanduser("~/.cache/s2s_load_test")))
     print(f"{len(speech)} speech clips, {args.turns} turns per guest, url {args.url}")
     levels = [asyncio.run(run_level(n, args, speech)) for n in args.concurrency]
     if args.out:
