@@ -22,6 +22,12 @@ server -> client: {"type": "state", "state": listening|thinking|speaking}, {"typ
 {"type": "assistant", "text"}, {"type": "tool", "call", "result"}, {"type": "error", "text"},
 binary int16 24 kHz reply audio, {"type": "reply_done"} (always sent, even when the turn fails).
 
+Raw PCM on /device (ESP32 boards, phone-call bridges, simple test consoles): binary int16 mono
+mic audio in (16 kHz, or ?input=<rate>), binary int16 reply audio out (24 kHz, or ?output=16000),
+the text "__TURN_COMPLETE__" once the reply has finished playing, and "you: ..." / "agent: ..."
+transcript lines (?text=0 turns them off). The mic may stream all the time: it is ignored while
+the agent thinks and speaks (half duplex), so no echo cancellation is needed on the device.
+
 The page is s2s/cli/static/live.html; /?demo=<dir> serves the showcase page (showcase.html) that
 replays a pre-generated conversation for the demo video.
 """
@@ -119,20 +125,48 @@ def build_app(agent: VoiceAgent | None, system_prompt: str | None = None, tools:
 
     @app.websocket("/ws")
     async def ws_endpoint(ws: WebSocket):
+        await converse(ws, device=False)
+
+    @app.websocket("/device")
+    async def device_endpoint(ws: WebSocket, input: int = 16000, output: int = 24000, text: int = 1):
+        """Raw PCM for devices and simple clients (ESP32, the Gemini-bridge test console): binary int16 mono
+        mic audio in at `input` Hz, binary int16 reply audio out at `output` Hz, the text "__TURN_COMPLETE__"
+        once the reply has finished PLAYING (the client may flush its buffer then), and, with text=1, the
+        transcripts as plain "you: ..." / "agent: ..." lines. No hello / played messages needed."""
+        await converse(ws, device=True, in_sr=int(input), out_sr=int(output), text_lines=bool(text))
+
+    async def converse(ws: WebSocket, device: bool, in_sr: int = 48000, out_sr: int = 24000,
+                       text_lines: bool = True) -> None:
         await ws.accept()
         loop = asyncio.get_running_loop()
-        conv: dict = {"mic_sr": 48000, "state": "listening", "turn": 0}
+        conv: dict = {"mic_sr": in_sr, "state": "listening", "turn": 0}
 
         async def say(text: str) -> None:
             print(text, flush=True)
-            await ws.send_text(json.dumps({"type": "log", "text": text}))
+            if not device:
+                await ws.send_text(json.dumps({"type": "log", "text": text}))
 
         async def send(kind: str, **data) -> None:
-            await ws.send_text(json.dumps({"type": kind, **data}, default=str))
+            if not device:
+                await ws.send_text(json.dumps({"type": kind, **data}, default=str))
+            elif text_lines and kind in ("user", "assistant") and data.get("text"):
+                await ws.send_text(f"{'you' if kind == 'user' else 'agent'}: {data['text']}")
 
         async def set_state(s: str) -> None:
             conv["state"] = s
-            await ws.send_text(json.dumps({"type": "state", "state": s}))
+            if not device:
+                await ws.send_text(json.dumps({"type": "state", "state": s}))
+
+        async def reply_finished(play_end: float) -> None:
+            """Browser: it answers "played" after playing. Device: wait until the reply has played out
+            (audio is generated faster than real time), then tell it and listen again."""
+            if not device:
+                await ws.send_text(json.dumps({"type": "reply_done"}))
+                return
+            await asyncio.sleep(max(0.0, play_end - loop.time()))
+            await ws.send_text("__TURN_COMPLETE__")
+            conv["listener"].reset()
+            await set_state("listening")
 
         async def new_session() -> None:
             res = make_reservation()
@@ -167,7 +201,7 @@ def build_app(agent: VoiceAgent | None, system_prompt: str | None = None, tools:
                 try:
                     await send("error", text=repr(e))
                     await set_state("speaking")  # the page answers "played" and listening resumes
-                    await ws.send_text(json.dumps({"type": "reply_done"}))
+                    await reply_finished(loop.time())
                 except (WebSocketDisconnect, RuntimeError):
                     return
             if save_turns:
@@ -191,6 +225,7 @@ def build_app(agent: VoiceAgent | None, system_prompt: str | None = None, tools:
 
             threading.Thread(target=worker, daemon=True).start()
             spoke, last_call = False, None
+            play_end = loop.time()  # when the client will have played everything sent so far
             info = {"seconds": round(len(wav) / sr, 2), "end": conv["listener"].reason,
                     "rms_db": round(float(20 * np.log10(np.sqrt(np.mean(wav ** 2)) + 1e-9)), 1)}
             while (ev := await q.get()) is not None:
@@ -199,8 +234,10 @@ def build_app(agent: VoiceAgent | None, system_prompt: str | None = None, tools:
                     if not spoke:
                         spoke = True
                         await set_state("speaking")
-                    wav_out = ev["audio"] if ev.get("sample_rate", sr) == 24000 else resample(ev["audio"], ev["sample_rate"], 24000)
+                    rate = ev.get("sample_rate", sr)
+                    wav_out = ev["audio"] if rate == out_sr else resample(ev["audio"], rate, out_sr)
                     await ws.send_bytes(pcm16(wav_out))
+                    play_end = max(play_end, loop.time() + 0.15) + len(wav_out) / out_sr  # + client jitter buffer
                 elif t == "user_transcript":
                     info["ctc"] = ev["text"]
                     await say(f"USER (ctc): {ev['text']}")
@@ -228,7 +265,7 @@ def build_app(agent: VoiceAgent | None, system_prompt: str | None = None, tools:
                     await send("error", text=ev["text"])
             if not spoke:  # the page answers "played" right away and listening resumes
                 await set_state("speaking")
-            await ws.send_text(json.dumps({"type": "reply_done"}))
+            await reply_finished(play_end + 0.2)
             return info
 
         try:
@@ -257,7 +294,12 @@ def build_app(agent: VoiceAgent | None, system_prompt: str | None = None, tools:
                         await say(f"--- turn {conv['turn']} ({len(utterance) / sr:.1f}s, end: {conv['listener'].reason})")
                         asyncio.create_task(run_turn(utterance))
                     continue
-                data = json.loads(msg.get("text") or "{}")
+                try:
+                    data = json.loads(msg.get("text") or "{}")
+                except ValueError:
+                    data = {}  # devices may send plain-text pings / notes: ignored
+                if not isinstance(data, dict):
+                    data = {}
                 if data.get("type") == "hello":
                     conv["mic_sr"] = int(data.get("sr", 48000))
                     await say(f"mic sample rate reported by the browser: {conv['mic_sr']} Hz")

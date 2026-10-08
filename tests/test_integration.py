@@ -154,7 +154,8 @@ def agent(tiny_models, tmp_path, cpu):
     save_json(str(talker_dir / "meta.json"), {"thinker": tiny_models["qwen"], "layer_idx": layers})
     cfg = load_config(os.path.join(ROOT, "configs", "default.yaml"), [
         f"codec.model={tiny_models['mimi']}", f"thinker.model={tiny_models['qwen']}", "device=cpu",
-        "runtime.endpoint.vad=energy"])  # synthetic tones stand in for speech here; Silero rightly ignores them
+        "runtime.endpoint.vad=energy",  # synthetic tones stand in for speech here; Silero rightly ignores them
+        "runtime.voice=talker"])  # the tiny talker; the Kokoro voice has its own (stubbed) test
     from s2s.runtime.agent import VoiceAgent
 
     return VoiceAgent(cfg, str(speech_dir), str(talker_dir))
@@ -326,3 +327,37 @@ def test_unclear_audio_gets_asked_again_without_tool_calls(agent, monkeypatch):
     monkeypatch.setattr(agent, "input_encoder", FakeParakeet(0.95))  # confident: normal behaviour
     events = list(session.respond(np.zeros(24000, np.float32)))
     assert backend.orders and any(e["type"] == "tool_call" for e in events)
+
+
+def test_device_endpoint_raw_pcm(agent, monkeypatch):
+    """/device: raw 16 kHz PCM in (no hello), raw PCM out at ?output=, transcript lines and __TURN_COMPLETE__
+    after the reply has played, then the next turn works (like an ESP32 or the Gemini-bridge console)."""
+    from fastapi.testclient import TestClient
+
+    import s2s.runtime.agent as agent_mod
+    from s2s.cli.ws_live import build_app
+
+    p = agent.thinker.prompts
+    script = (p.ids("Hello there.") + [p.im_end_id]) * 2
+    monkeypatch.setattr(agent_mod, "sample_logits", lambda *a, **k: script.pop(0) if script else p.im_end_id)
+    sr = 16000
+    t = np.arange(sr) / sr
+    mic = np.concatenate([0.1 * np.sin(2 * np.pi * 220 * t), np.zeros(2 * sr)]).astype(np.float32)
+    pcm = (mic * 32767).astype("<i2")
+    with TestClient(build_app(agent)).websocket_connect("/device?output=16000") as ws:
+        for turn in range(2):
+            for i in range(0, len(pcm), 2048):  # 128 ms chunks, like a ScriptProcessor(2048) at 16 kHz
+                ws.send_bytes(pcm[i:i + 2048].tobytes())
+            ws.send_text("ping")  # plain text from a device is ignored
+            lines, audio = [], 0
+            while True:
+                msg = ws.receive()
+                if msg.get("bytes"):
+                    audio += len(msg["bytes"]) // 2
+                    continue
+                if msg["text"] == "__TURN_COMPLETE__":
+                    break
+                lines.append(msg["text"])
+            assert audio > 0, f"turn {turn}: no audio"
+            assert any(x.startswith("you: ") for x in lines) and "agent: Hello there." in lines
+            assert not any(x.startswith("{") for x in lines)  # no JSON protocol messages on /device
