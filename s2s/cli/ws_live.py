@@ -205,8 +205,10 @@ def build_app(agent: VoiceAgent | None, system_prompt: str | None = None, tools:
                     info["ctc"] = ev["text"]
                     await say(f"USER (ctc): {ev['text']}")
                     if ev.get("asr") is not None:
-                        info["asr"] = ev["asr"]
-                        await say(f"USER (parakeet): {ev['asr']}")
+                        info["asr"], info["asr_confidence"] = ev["asr"], round(float(ev["asr_confidence"]), 3)
+                        info["unclear"] = bool(ev.get("unclear"))
+                        await say(f"USER (parakeet, confidence {ev['asr_confidence']:.2f}"
+                                  f"{', unclear: asking again' if ev.get('unclear') else ''}): {ev['asr']}")
                     # the page shows the best transcript we have: Parakeet's own ASR head, else the adapter's CTC
                     await send("user", text=ev.get("asr") or ev["text"], ctc=ev["text"])
                 elif t == "assistant_text":

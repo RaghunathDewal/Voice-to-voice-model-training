@@ -88,8 +88,12 @@ def main() -> None:
         q = quality(wav, sr)
         print(f"{os.path.basename(wav_path)}  {sec:4.1f}s  end={info.get('end')}  level={info.get('rms_db')} dB  "
               f"snr={q['snr']:.0f} dB  clip={100 * q['clip']:.1f}%  bw={q['bw'] / 1000:.1f} kHz")
-        pk = parakeet.transcribe(parakeet.encode([resample(wav, sr, 16000)]))[0] if parakeet else info.get("asr", "")
-        print(f"   whisper:  {ref}\n   parakeet: {pk}\n   adapter:  {info.get('ctc', '')}\n   reply:    {info.get('reply', '')}")
+        if parakeet:
+            pk, conf = parakeet.transcribe_with_confidence(parakeet.encode([resample(wav, sr, 16000)]))[0]
+        else:
+            pk, conf = info.get("asr", ""), info.get("asr_confidence", float("nan"))
+        print(f"   whisper:  {ref}\n   parakeet: {pk}   (confidence {conf:.2f})\n   adapter:  {info.get('ctc', '')}\n"
+              f"   reply:    {info.get('reply', '')}")
         for line in alt:
             print(line)
     if lengths:

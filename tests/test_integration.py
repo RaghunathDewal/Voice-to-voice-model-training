@@ -288,3 +288,41 @@ def test_runtime_kokoro_voice_speaks_each_phrase(tiny_models, tmp_path, cpu, mon
     assert spoken == ["Sure, one moment please.", "Two towels are on the way."]
     assert [e["text"] for e in audio] == spoken and all(e["sample_rate"] == 24000 for e in audio)
     assert [e["text"] for e in events if e["type"] == "assistant_text"] == ["Sure, one moment please. Two towels are on the way."]
+
+
+def test_unclear_audio_gets_asked_again_without_tool_calls(agent, monkeypatch):
+    """Parakeet's confidence below runtime.asr_min_confidence: a fixed 'didn't catch that' reply, no tool call,
+    even if the thinker would have called a tool (garbled audio must never trigger an action)."""
+    import s2s.runtime.agent as agent_mod
+
+    class FakeParakeet:
+        sample_rate = 24000
+
+        def __init__(self, conf):
+            self.conf = conf
+
+        def encode(self, wavs):
+            return agent.codec.encode_latents(wavs)
+
+        def transcribe_with_confidence(self, feats):
+            return [("order one ticket", self.conf)]
+
+    p = agent.thinker.prompts
+    call = '\n{"name": "order_product", "arguments": {"product": "towel", "quantity": 1}}\n'
+    monkeypatch.setattr(agent, "input_encoder", FakeParakeet(0.3))
+    agent.cfg.runtime.asr_min_confidence = 0.6
+    script = [p.tool_call_start_id] + p.ids(call) + [p.tool_call_end_id, p.im_end_id]
+    monkeypatch.setattr(agent_mod, "sample_logits", lambda *a, **k: script.pop(0) if script else p.im_end_id)
+    res = make_reservation()
+    backend = HotelBackend(res)
+    session = agent.new_session(context=reservation_context(res), tools=HOTEL_TOOLS, backend=backend)
+    events = list(session.respond(np.zeros(24000, np.float32)))
+    first = next(e for e in events if e["type"] == "user_transcript")
+    assert first["unclear"] and first["asr"] == "order one ticket"
+    assert [e["text"] for e in events if e["type"] == "assistant_text"] == ["Sorry, I didn't catch that. Could you say it again?"]
+    assert not backend.orders and not any(e["type"] == "tool_call" for e in events)
+    assert session.past.get_seq_length() == session.n_tokens
+
+    monkeypatch.setattr(agent, "input_encoder", FakeParakeet(0.95))  # confident: normal behaviour
+    events = list(session.respond(np.zeros(24000, np.float32)))
+    assert backend.orders and any(e["type"] == "tool_call" for e in events)

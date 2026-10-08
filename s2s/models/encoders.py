@@ -117,15 +117,24 @@ class ParakeetEncoder(SpeechEncoder):
     @torch.no_grad()
     def transcribe(self, feats: list[torch.Tensor]) -> list[str]:
         """Encoder outputs from `encode` -> Parakeet's own greedy CTC transcripts (no second encoder pass)."""
+        return [text for text, _ in self.transcribe_with_confidence(feats)]
+
+    @torch.no_grad()
+    def transcribe_with_confidence(self, feats: list[torch.Tensor]) -> list[tuple[str, float]]:
+        """(transcript, confidence): confidence = mean probability of the emitted (non-blank) frames,
+        0 when nothing was recognised. Low values mean garbled, muffled or non-speech audio."""
         if self.processor is None:
             from transformers import AutoProcessor
 
             self.processor = AutoProcessor.from_pretrained(self.name.split(":", 1)[1])
+        blank = int(self.processor.tokenizer.pad_token_id)
         out = []
         for x in feats:
-            logits = self.ctc_head(x[None].to(self.device, self.dtype))[0]
-            ids = logits.argmax(-1).tolist()
-            out.append(self.processor.decode(ids, skip_special_tokens=True).strip())
+            probs = self.ctc_head(x[None].to(self.device, self.dtype))[0].float().softmax(-1)
+            p, ids = probs.max(-1)
+            emitted = ids != blank
+            conf = float(p[emitted].mean()) if bool(emitted.any()) else 0.0
+            out.append((self.processor.decode(ids.tolist(), skip_special_tokens=True).strip(), conf))
         return out
 
 

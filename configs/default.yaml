@@ -122,6 +122,8 @@ runtime:
   talker_dir: checkpoints/talker
   max_new_tokens: 200
   temperature: 0.0          # thinker: 0 = greedy
+  asr_min_confidence: 0.6   # Parakeet transcript confidence below this: "Sorry, I didn't catch that" and no tool calls (0 = off)
+  unclear_reply: "Sorry, I didn't catch that. Could you say it again?"
   voice: kokoro             # reply voice: talker (our talker + Mimi) | kokoro (Kokoro-82M speaks the thinker's text)
   kokoro_voice: af_heart    # with voice=kokoro: any Kokoro English voice (af_heart, af_bella, am_michael, ...)
   kokoro_speed: 1.0

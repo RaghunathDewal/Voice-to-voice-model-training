@@ -190,7 +190,9 @@ class VoiceSession:
 
     # ----------------------------------------------------------- generation
     @torch.no_grad()
-    def _generate(self, logits: torch.Tensor, hidden: torch.Tensor, timer: Timer) -> Iterator[dict]:
+    def _generate(self, logits: torch.Tensor, hidden: torch.Tensor, timer: Timer,
+                  forced: list[int] | None = None) -> Iterator[dict]:
+        """`forced`: speak exactly these reply tokens instead of sampling (kept in the KV cache like any reply)."""
         a, rt = self.a, self.rt
         th, talker = a.thinker, a.talker
         dev = a.device
@@ -222,7 +224,10 @@ class VoiceSession:
                     yield self._emit(decoder, pending, timer)
 
             for _ in range(int(rt.max_new_tokens)):
-                tok = sample_logits(logits, float(rt.temperature), 0, self.generator)
+                if forced is not None:
+                    tok = forced.pop(0) if forced else th.prompts.im_end_id
+                else:
+                    tok = sample_logits(logits, float(rt.temperature), 0, self.generator)
                 timer.mark("first_token")
                 if tok in th.eos_ids:
                     finished_by_eos = True
@@ -391,22 +396,29 @@ class StreamingTurn:
         if self.latents is None and len(self.audio):  # whole-utterance encoder: encode the turn now
             self.add_latents(a.encode_input([self.audio])[0], wav_frames=None)
             self.timer.mark("input_encoded")
-        asr = None
+        asr, asr_conf = None, None
         if self.latents is not None:
             ctc = a.adapter(self.latents[None].to(a.device))["ctc_logits"][0].argmax(-1).tolist()
             transcript = ctc_greedy_decode(ctc)
-            if hasattr(a.input_encoder, "transcribe"):  # Parakeet's own ASR head, same encoder output
-                asr = a.input_encoder.transcribe([self.latents])[0]
+            if hasattr(a.input_encoder, "transcribe_with_confidence"):  # Parakeet's own ASR head, same encoder output
+                asr, asr_conf = a.input_encoder.transcribe_with_confidence([self.latents])[0]
         else:
             transcript = ""
         self.s.history.append({"role": "user", "text": asr or transcript})
-        yield {"type": "user_transcript", "text": transcript, "asr": asr,
+        # confidence gate: when the audio was not understood, ask again instead of guessing (no tool calls)
+        min_conf = float(a.cfg.runtime.get("asr_min_confidence", 0.0))
+        unclear = asr_conf is not None and (not asr or asr_conf < min_conf)
+        yield {"type": "user_transcript", "text": transcript, "asr": asr, "asr_confidence": asr_conf, "unclear": unclear,
                "eot_prob_last": self.eot_probs[-1] if self.eot_probs else None,
                "endpoint_reason": self.endpointer.reason}
         logits, hidden = self.s._close_turn()
         cuda_sync(a.device)
         self.timer.mark("prefill_done")
-        yield from self.s._generate(logits, hidden, self.timer)
+        forced = None
+        if unclear:
+            th = a.thinker
+            forced = th.prompts.ids(str(a.cfg.runtime.get("unclear_reply", "Sorry, I didn't catch that. Could you say it again?")))
+        yield from self.s._generate(logits, hidden, self.timer, forced=forced)
         cuda_sync(a.device)
         self.timer.mark("done")
         yield {"type": "timings", "ms": dict(self.timer.marks)}
