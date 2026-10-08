@@ -187,10 +187,10 @@ def main() -> None:
 
     lora_params = [p for p in thinker.model.parameters() if p.requires_grad]
     adapter_params = list(adapter.parameters())
-    groups = [{"params": adapter_params, "lr": tc.adapter_lr, "base_lr": tc.adapter_lr}]
+    groups = [{"params": adapter_params, "lr": float(tc.adapter_lr), "base_lr": float(tc.adapter_lr)}]
     if lora_params:
-        groups.append({"params": lora_params, "lr": tc.lora_lr, "base_lr": tc.lora_lr})
-    opt = torch.optim.AdamW(groups, weight_decay=tc.weight_decay)
+        groups.append({"params": lora_params, "lr": float(tc.lora_lr), "base_lr": float(tc.lora_lr)})
+    opt = torch.optim.AdamW(groups, weight_decay=float(tc.weight_decay))
     scaler = make_grad_scaler(enabled=device.type == "cuda" and dtype == torch.float16)
     log(f"adapter params {count_params(adapter) / 1e6:.1f}M, trainable thinker params {sum(p.numel() for p in lora_params) / 1e6:.1f}M")
     log(f"train rows {len(rows)}, valid rows {len(valid_rows)}")

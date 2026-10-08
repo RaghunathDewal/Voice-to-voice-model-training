@@ -164,7 +164,7 @@ def main() -> None:
         codec = MimiCodec(cfg.codec.model, device, K)
 
     params = list(talker.parameters())
-    opt = torch.optim.AdamW(params, lr=tc.lr, weight_decay=tc.weight_decay, betas=(0.9, 0.95))
+    opt = torch.optim.AdamW(params, lr=float(tc.lr), weight_decay=float(tc.weight_decay), betas=(0.9, 0.95))
     scaler = make_grad_scaler(enabled=device.type == "cuda" and dtype == torch.float16)
     meta = {"thinker": thinker_path, "layer_idx": layer_idx, "num_codebooks": K, "codec": cfg.codec.model}
 

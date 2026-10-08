@@ -282,7 +282,7 @@ stage fetch_talker_v2 fetch_talker_v2
 stage talker_train python -m s2s.train.talker $CFG --set train_talker.init_from=checkpoints/talker_v2 \
     train_talker.thinker_dir=checkpoints/thinker_merged_v3 train_talker.output_dir=checkpoints/talker_v3 \
     train_talker.max_steps="$TALKER_STEPS" train_talker.batch_size=32 train_talker.grad_accum=1 \
-    train_talker.lr=3e-4 train_talker.warmup_steps=1000 train_talker.num_workers=12 \
+    train_talker.lr=0.0003 train_talker.warmup_steps=1000 train_talker.num_workers=12 \
     train_talker.eval_every=2000 train_talker.save_every=2000 \
     "train_talker.train_manifests=[{path: $M/talker_v3_train.jsonl, weight: 1.0}]" \
     train_talker.valid_manifest=$M/talker_v3_valid.jsonl
