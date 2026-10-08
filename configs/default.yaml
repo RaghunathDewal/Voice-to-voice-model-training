@@ -122,6 +122,9 @@ runtime:
   talker_dir: checkpoints/talker
   max_new_tokens: 200
   temperature: 0.0          # thinker: 0 = greedy
+  voice: talker             # reply voice: talker (our talker + Mimi) | kokoro (Kokoro-82M speaks the thinker's text)
+  kokoro_voice: af_heart    # with voice=kokoro: any Kokoro English voice (af_heart, af_bella, am_michael, ...)
+  kokoro_speed: 1.0
   talker_temperature: 0.4   # 0.8/250 gave more hiss and 25% Whisper WER vs 16% at 0.4/20 (talker_v2, 8 sentences)
   talker_top_k: 20
   decode_context_frames: 4  # conv left context for the streaming Mimi decoder (exact; transformer uses a KV cache)
