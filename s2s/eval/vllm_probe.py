@@ -84,7 +84,7 @@ def prepare(argv: list[str]) -> None:
 
 
 # ----------------------------------------------------------------------------- step 2
-def make_engine(model: str, dtype: str, mem: float):
+def make_engine(model: str, dtype: str, mem: float, eager: bool = False):
     from vllm import AsyncEngineArgs
 
     try:
@@ -92,7 +92,7 @@ def make_engine(model: str, dtype: str, mem: float):
     except ImportError:  # older vLLM
         from vllm import AsyncLLMEngine as Engine
     args = AsyncEngineArgs(model=model, dtype=dtype, enable_prompt_embeds=True, enable_prefix_caching=True,
-                           gpu_memory_utilization=mem, max_model_len=4096)
+                           gpu_memory_utilization=mem, max_model_len=4096, enforce_eager=eager)
     return Engine.from_engine_args(args)
 
 
@@ -121,7 +121,7 @@ async def run_async(args) -> None:
     items = data["items"]
     dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16}[args.dtype]
     embs = [it["embeds"].to(dtype) for it in items]
-    engine = make_engine(args.model, args.dtype, args.gpu_memory_utilization)
+    engine = make_engine(args.model, args.dtype, args.gpu_memory_utilization, args.enforce_eager)
     params = SamplingParams(temperature=0.0, max_tokens=data["max_new_tokens"])
     n = 0
 
@@ -162,6 +162,8 @@ def run(argv: list[str]) -> None:
     p.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16"])
     p.add_argument("--gpu-memory-utilization", type=float, default=0.3)
     p.add_argument("--concurrency", type=int, nargs="+", default=[1, 8, 32, 64])
+    p.add_argument("--enforce-eager", action="store_true",
+                   help="skip graph compilation / CUDA graphs: starts in seconds, but runs slower than production")
     asyncio.run(run_async(p.parse_args(argv)))
 
 
