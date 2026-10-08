@@ -77,8 +77,20 @@ def load_prompt(path: str) -> str:
         return f.read().replace("{{", "{").replace("}}", "}").strip()
 
 
+def save_turn(save_dir: str, wav: np.ndarray, sr: int, info: dict) -> str:
+    """Write one received user turn (what the model actually heard) as WAV + JSON, for debugging."""
+    import soundfile as sf
+
+    os.makedirs(save_dir, exist_ok=True)
+    stem = os.path.join(save_dir, f"turn_{len([f for f in os.listdir(save_dir) if f.endswith('.wav')]):04d}")
+    sf.write(stem + ".wav", wav, sr)
+    with open(stem + ".json", "w", encoding="utf-8") as f:
+        json.dump(info, f, indent=1)
+    return stem
+
+
 def build_app(agent: VoiceAgent | None, system_prompt: str | None = None, tools: list | None = HOTEL_TOOLS,
-              demo_dir: str | None = None) -> FastAPI:
+              demo_dir: str | None = None, save_turns: str | None = None) -> FastAPI:
     """system_prompt: replaces the default prompt AND the generated demo reservation (put the guest data in it)."""
     sr = agent.codec.sample_rate if agent is not None else 24000
     gpu_lock = threading.Lock()  # one model call at a time across connections
@@ -131,7 +143,10 @@ def build_app(agent: VoiceAgent | None, system_prompt: str | None = None, tools:
 
         async def run_turn(wav: np.ndarray) -> None:
             try:
-                await stream_reply(wav)
+                info = await stream_reply(wav)
+                if save_turns:
+                    stem = save_turn(save_turns, wav, sr, info)
+                    print(f"saved {stem}.wav", flush=True)
             except (WebSocketDisconnect, RuntimeError):
                 pass  # the page was closed mid-reply
 
@@ -149,6 +164,8 @@ def build_app(agent: VoiceAgent | None, system_prompt: str | None = None, tools:
 
             threading.Thread(target=worker, daemon=True).start()
             spoke = False
+            info = {"seconds": round(len(wav) / sr, 2), "end": conv["listener"].reason,
+                    "rms_db": round(float(20 * np.log10(np.sqrt(np.mean(wav ** 2)) + 1e-9)), 1)}
             while (ev := await q.get()) is not None:
                 t = ev["type"]
                 if t == "audio":
@@ -158,8 +175,10 @@ def build_app(agent: VoiceAgent | None, system_prompt: str | None = None, tools:
                     wav_out = ev["audio"] if ev.get("sample_rate", sr) == 24000 else resample(ev["audio"], ev["sample_rate"], 24000)
                     await ws.send_bytes(pcm16(wav_out))
                 elif t == "user_transcript":
+                    info["ctc"] = ev["text"]
                     await say(f"USER (ctc): {ev['text']}")
                 elif t == "assistant_text":
+                    info["reply"] = ev["text"]
                     await say(f"ASSISTANT: {ev['text']}")
                 elif t == "tool_call":
                     await say(f"TOOL CALL: {ev['call']}")
@@ -172,6 +191,7 @@ def build_app(agent: VoiceAgent | None, system_prompt: str | None = None, tools:
             await ws.send_text(json.dumps({"type": "reply_done"}))
             if not spoke:
                 await set_state("speaking")  # the page answers "played" right away and listening resumes
+            return info
 
         try:
             await new_session()
@@ -230,6 +250,8 @@ def main() -> None:
     p.add_argument("--tools", default="all", help="all | none | comma-separated built-in names, e.g. "
                                                   "order_product,create_issue (the v1 hotel tools and the hotel_v3 pool)")
     p.add_argument("--tools-file", default=None, help="JSON list of your own tool schemas (overrides --tools)")
+    p.add_argument("--save-turns", default=None,
+                   help="debug: save every user turn as heard by the server (WAV + JSON: length, end reason, level)")
     args = p.parse_args()
     sys.stdout.reconfigure(line_buffering=True)
     cfg = config_from_args(args)
@@ -237,7 +259,8 @@ def main() -> None:
     import uvicorn
 
     prompt = load_prompt(args.system_prompt_file) if args.system_prompt_file else None
-    app = build_app(VoiceAgent(cfg, args.speech_llm_dir, args.talker_dir), prompt, select_tools(args.tools, args.tools_file), args.demo_dir)
+    app = build_app(VoiceAgent(cfg, args.speech_llm_dir, args.talker_dir), prompt, select_tools(args.tools, args.tools_file), args.demo_dir,
+                    args.save_turns)
     if args.tunnel:
         start_tunnel(args.port)
     print(f"serving on http://localhost:{args.port}  (use --tunnel for a public https link)", flush=True)
