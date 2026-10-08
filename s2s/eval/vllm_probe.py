@@ -24,6 +24,9 @@ Step 2, in an environment with vLLM; needs only torch + vllm. On AMD (MI300X), A
   2. prefix caching: is the system prompt's KV reused across requests when the prompt is embeddings?
      (vLLM reports cached prompt tokens per request; 0 means the prompt is recomputed every turn)
   3. batching: time to first token and total time with 1 .. 64 simultaneous requests.
+  4. dynamic prompts: the same, but every request has its OWN system prompt (nothing shared or cached),
+     like the first turn of a call whose prompt is built per reservation. --prompt-positions makes the
+     prompts longer (timing only) to match a real GHB prompt size.
 """
 
 from __future__ import annotations
@@ -91,7 +94,7 @@ def prepare(argv: list[str]) -> None:
 
 
 # ----------------------------------------------------------------------------- step 2
-def make_engine(model: str, dtype: str, mem: float, eager: bool = False):
+def make_engine(model: str, dtype: str, mem: float, eager: bool = False, max_len: int = 4096):
     from vllm import AsyncEngineArgs
 
     try:
@@ -99,7 +102,7 @@ def make_engine(model: str, dtype: str, mem: float, eager: bool = False):
     except ImportError:  # older vLLM
         from vllm import AsyncLLMEngine as Engine
     args = AsyncEngineArgs(model=model, dtype=dtype, enable_prompt_embeds=True, enable_prefix_caching=True,
-                           gpu_memory_utilization=mem, max_model_len=4096, enforce_eager=eager)
+                           gpu_memory_utilization=mem, max_model_len=max_len, enforce_eager=eager)
     return Engine.from_engine_args(args)
 
 
@@ -128,7 +131,8 @@ async def run_async(args) -> None:
     items = data["items"]
     dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16}[args.dtype]
     embs = [it["embeds"].to(dtype) for it in items]
-    engine = make_engine(args.model, args.dtype, args.gpu_memory_utilization, args.enforce_eager)
+    engine = make_engine(args.model, args.dtype, args.gpu_memory_utilization, args.enforce_eager,
+                         max(4096, args.prompt_positions + 1024))
     params = SamplingParams(temperature=0.0, max_tokens=data["max_new_tokens"])
     n = 0
 
@@ -161,6 +165,30 @@ async def run_async(args) -> None:
         print(f"   {conc:>3} at once | first token p50 {pct([r['ttft'] for r in rs], 50)} p95 {pct([r['ttft'] for r in rs], 95)}"
               f" | whole reply p50 {pct([r['total'] for r in rs], 50)} | all done in {wall:5.2f} s (~{toks / wall:5.0f} words/s)")
 
+    sys_n = data["system_tokens"]
+    print(f"\n4. dynamic prompts: every request has its own prompt (nothing cached), "
+          f"~{max(args.prompt_positions, embs[0].shape[0])} positions each")
+    gen = torch.Generator().manual_seed(0)
+
+    def unique(emb: torch.Tensor) -> torch.Tensor:
+        """A prompt no other request shares: the system part is lengthened to --prompt-positions (by repeating
+        it, timing only) and slightly perturbed from position 0, so the prefix cache cannot match it."""
+        system, rest = emb[:sys_n], emb[sys_n:]
+        if args.prompt_positions > emb.shape[0]:
+            reps = -(-(args.prompt_positions - rest.shape[0]) // sys_n)
+            system = system.repeat(reps, 1)[: args.prompt_positions - rest.shape[0]]
+        noise = torch.randn(system.shape, generator=gen).to(system.dtype) * 1e-3
+        return torch.cat([system + noise, rest], dim=0)
+
+    for conc in args.concurrency:
+        prompts = [unique(embs[i % len(embs)]) for i in range(conc)]
+        t0 = time.perf_counter()
+        rs = await asyncio.gather(*(one(engine, prompts[i], params, rid()) for i in range(conc)))
+        wall = time.perf_counter() - t0
+        cached = [r["cached"] or 0 for r in rs]
+        print(f"   {conc:>3} at once | first token p50 {pct([r['ttft'] for r in rs], 50)} p95 {pct([r['ttft'] for r in rs], 95)}"
+              f" | whole reply p50 {pct([r['total'] for r in rs], 50)} | cached tokens max {max(cached)} | {wall:5.2f} s")
+
 
 def run(argv: list[str]) -> None:
     p = argparse.ArgumentParser(description="vLLM probe, step 2")
@@ -169,6 +197,8 @@ def run(argv: list[str]) -> None:
     p.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16"])
     p.add_argument("--gpu-memory-utilization", type=float, default=0.3)
     p.add_argument("--concurrency", type=int, nargs="+", default=[1, 8, 32, 64])
+    p.add_argument("--prompt-positions", type=int, default=0,
+                   help="test 4: make every prompt this long (e.g. 2000 for a long GHB prompt); 0 = as prepared")
     p.add_argument("--enforce-eager", action="store_true",
                    help="skip graph compilation / CUDA graphs: starts in seconds, but runs slower than production")
     asyncio.run(run_async(p.parse_args(argv)))
