@@ -18,9 +18,15 @@ like LibriSpeech. Only the parquet shards needed for --max-hours are downloaded.
     python -m s2s.prep.hf_asr --preset ami_sdm --split train --max-hours 15 --min-words 4 --name ami_sdm_train
     python -m s2s.prep.hf_asr --preset mls --split train --max-hours 25 --max-per-accent 0.1 --name mls_train
     python -m s2s.prep.hf_asr --preset commonvoice --split train --accent-match "India|South Asia" --name cv_india_train
+    # TALKER data (studio speech, kept at 24 kHz for Mimi): LibriTTS-R, many voices; Hi-Fi TTS, one voice
+    python -m s2s.prep.hf_asr --preset libritts_r --split train.clean.360 --max-hours 200 --sample-rate 24000 \
+        --max-seconds 25 --name libritts_r_train
+    python -m s2s.prep.hf_asr --preset hifitts --split train.clean --accent-match "^92$" --sample-rate 24000 \
+        --max-seconds 25 --name hifi92_train
 
 Writes <data_dir>/manifests/<name>_raw.jsonl with id, audio, text, duration,
-source and (when the dataset has it) accent.
+source and (when the dataset has it) accent (for the TTS presets: the speaker id).
+With --accent-match, shards whose label column has no match are skipped without being downloaded.
 """
 
 from __future__ import annotations
@@ -60,6 +66,12 @@ PRESETS = {
     "slurp": {"repo": "marcel-gohsen/slurp", "prefix": "data/{split}-", "text": "transcript", "accent": "intent"},
     # real customer-service phone calls, one user turn per row, with the dialogue so far (see the dataset card)
     "spokenwoz": {"repo": "pirxus/spokenwoz-whisper", "prefix": "data/{split}-", "text": "text", "history": "context"},
+    # studio TTS corpora for the talker (CC BY 4.0). Original text (digits, punctuation, casing), because
+    # at runtime the talker reads the thinker's text as written. "tts": parentheses are spoken, keep them.
+    "libritts_r": {"repo": "mythicinfinity/libritts_r", "prefix": "data/{split}/", "text": "text_original",
+                   "accent": "speaker_id", "tts": True},
+    "hifitts": {"repo": "MikhailT/hifi-tts", "prefix": "data/{split}-", "text": "text_no_preprocessing",
+                "accent": "speaker", "tts": True},
 }
 
 
@@ -78,10 +90,11 @@ def spokenwoz_history(ctx, max_exchanges: int = 2) -> list[dict]:
 SR = 16000
 # EdAcc / People's Speech markup that is not speech
 _MARKUP = re.compile(r"<[^>]*>|\[[^\]]*\]|\([^)]*\)")
+_TAGS = re.compile(r"<[^>]*>|\[[^\]]*\]")
 
 
-def clean_text(text: str) -> str:
-    text = _MARKUP.sub(" ", str(text or ""))
+def clean_text(text: str, keep_parens: bool = False) -> str:
+    text = (_TAGS if keep_parens else _MARKUP).sub(" ", str(text or ""))
     text = text.replace("’", "'").replace("‘", "'").replace("“", '"').replace("”", '"')
     return re.sub(r"\s+", " ", text).strip()
 
@@ -105,6 +118,21 @@ def decode_audio(cell) -> tuple[np.ndarray, int]:
     return to_mono(np.asarray(wav, dtype=np.float32)), int(sr)
 
 
+def shard_matches(repo: str, fname: str, column: str, pattern: str) -> bool:
+    """Read only the label column of a remote parquet shard (a few KB) to see if any row matches."""
+    import pyarrow.parquet as pq
+    from huggingface_hub import HfFileSystem
+
+    try:
+        with HfFileSystem().open(f"datasets/{repo}/{fname}") as f:
+            labels = pq.ParquetFile(f).read(columns=[column]).column(column).to_pylist()
+    except Exception as e:  # noqa: BLE001 - when unsure, download the shard
+        print(f"could not pre-check {fname}: {e}")
+        return True
+    rx = re.compile(pattern, re.I)
+    return any(rx.search(str(v or "")) for v in set(labels))
+
+
 def main() -> None:
     p = base_parser(__doc__)
     p.add_argument("--preset", choices=sorted(PRESETS), required=True)
@@ -117,6 +145,7 @@ def main() -> None:
     p.add_argument("--max-shards", type=int, default=0, help="download at most this many parquet shards (0 = no cap)")
     p.add_argument("--accent-match", default=None,
                    help="keep only rows whose accent label matches this regex (e.g. 'India|South Asia')")
+    p.add_argument("--sample-rate", type=int, default=SR, help="stored rate (24000 for talker data: Mimi is 24 kHz)")
     p.add_argument("--min-seconds", type=float, default=1.0)
     p.add_argument("--max-seconds", type=float, default=20.0)
     p.add_argument("--min-words", type=int, default=2)
@@ -136,6 +165,12 @@ def main() -> None:
     random.Random(args.seed).shuffle(files)  # spread speakers/topics across the whole split
     if args.max_shards:
         files = files[: args.max_shards]
+    if args.accent_match and preset.get("accent"):
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(16) as ex:
+            ok = list(ex.map(lambda f: shard_matches(preset["repo"], f, preset["accent"], args.accent_match), files))
+        files = [f for f, keep in zip(files, ok) if keep]
     print(f"{preset['repo']} {args.split}: {len(files)} parquet shards")
 
     audio_dir = os.path.join(cfg.paths.data_dir, "hf_asr", args.name)
@@ -155,7 +190,7 @@ def main() -> None:
         for rec in (r for b in pq.ParquetFile(local).iter_batches(batch_size=64) for r in b.to_pylist()):
             if total_s >= limit_s or (args.max_utts and len(rows) >= args.max_utts):
                 break
-            text = clean_text(rec.get(preset["text"], ""))
+            text = clean_text(rec.get(preset["text"], ""), keep_parens=preset.get("tts", False))
             if text.isupper():  # AMI: "YEAH I THINK SO" -> "Yeah i think so"
                 text = re.sub(r"\bi\b", "I", text.lower().capitalize())
             if not usable(text, args.min_words):
@@ -183,7 +218,7 @@ def main() -> None:
             uid = f"{args.name}_{len(rows):07d}"
             path = os.path.join(audio_dir, uid + ".flac")
             if not os.path.exists(path):
-                sf.write(path, resample(wav, sr, SR), SR, format="FLAC")
+                sf.write(path, resample(wav, sr, args.sample_rate), args.sample_rate, format="FLAC")
             row = {"id": uid, "audio": os.path.relpath(path, manifests), "text": text,
                    "duration": round(dur, 3), "source": args.preset}
             if "accent" in preset:
