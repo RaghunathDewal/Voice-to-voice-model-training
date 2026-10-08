@@ -26,6 +26,9 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--dir", required=True)
     p.add_argument("--asr", default="openai/whisper-small")
+    p.add_argument("--try-rates", action="store_true",
+                   help="also transcribe each turn as if the browser had sent 44.1/48/16 kHz audio under a wrong "
+                        "label (a sample-rate mismatch makes speech too fast or slow for every recogniser)")
     args = p.parse_args()
     from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
@@ -41,11 +44,22 @@ def main() -> None:
         with torch.no_grad():
             ids = model.generate(feats.to(device), language="en", task="transcribe", max_new_tokens=120)
         ref = proc.batch_decode(ids, skip_special_tokens=True)[0].strip()
+        alt = []
+        if args.try_rates:  # reinterpret the samples at other true rates: speed changes by true/assumed
+            for ratio, label in [(44100 / 48000, "was 44.1k sent as 48k"), (48000 / 44100, "was 48k sent as 44.1k"),
+                                 (16000 / 48000, "was 16k sent as 48k"), (48000 / 16000, "was 48k sent as 16k")]:
+                w = resample(wav, int(round(sr * ratio)), 16000)
+                f2 = proc.feature_extractor(w, sampling_rate=16000, return_tensors="pt").input_features
+                with torch.no_grad():
+                    i2 = model.generate(f2.to(device), language="en", task="transcribe", max_new_tokens=120)
+                alt.append(f"   if {label}: {proc.batch_decode(i2, skip_special_tokens=True)[0].strip()}")
         sec = len(wav) / sr
         lengths.append(sec)
         short += sec < 1.0
         print(f"{os.path.basename(wav_path)}  {sec:4.1f}s  end={info.get('end')}  level={info.get('rms_db')} dB")
         print(f"   whisper: {ref}\n   adapter: {info.get('ctc', '')}\n   reply:   {info.get('reply', '')}")
+        for line in alt:
+            print(line)
     if lengths:
         print(f"\n{len(lengths)} turns, median length {np.median(lengths):.1f}s, {short} shorter than 1 s")
 

@@ -219,6 +219,7 @@ def build_app(agent: VoiceAgent | None, system_prompt: str | None = None, tools:
                 data = json.loads(msg.get("text") or "{}")
                 if data.get("type") == "hello":
                     conv["mic_sr"] = int(data.get("sr", 48000))
+                    await say(f"mic sample rate reported by the browser: {conv['mic_sr']} Hz")
                 elif data.get("type") == "played":
                     conv["listener"].reset()
                     await set_state("listening")
