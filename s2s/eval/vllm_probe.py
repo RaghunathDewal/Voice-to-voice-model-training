@@ -9,9 +9,16 @@ Step 1, in the training/runtime environment (our code, Parakeet, the adapter):
   (system prompt + tools as embeddings, the adapter's speech embeddings, the turn boundaries) and the
   reply our current runtime generates from it (greedy), and saves both.
 
-Step 2, in an environment with vLLM (e.g. the rocm/vllm docker image); needs only torch + vllm:
+Step 2, in an environment with vLLM; needs only torch + vllm. On AMD (MI300X), AMD's vLLM image needs
+`--security-opt seccomp=unconfined --ulimit memlock=-1:-1` or the engine hangs silently at start-up:
 
-    python s2s/eval/vllm_probe.py run --data /root/vllm_probe.pt --model checkpoints/thinker_merged_v3
+    docker run -d --name vllm_probe --security-opt seccomp=unconfined --ulimit memlock=-1:-1 \
+      --device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size 16g \
+      -e VLLM_WORKER_MULTIPROC_METHOD=spawn -v /root/probe:/probe rocm/vllm:latest \
+      bash -c "python /probe/vllm_probe.py run --data /probe/vllm_probe.pt --model /probe/thinker > /probe/result.txt 2>&1"
+
+  First result (MI300X, thinker_merged_v3, eager mode): 6/6 replies identical to our runtime, the system
+  prompt's KV reused across requests, first token 33 ms alone and 152 ms with 64 requests at once.
 
   1. correctness: does vLLM, given the same embeddings, produce the same replies?
   2. prefix caching: is the system prompt's KV reused across requests when the prompt is embeddings?
