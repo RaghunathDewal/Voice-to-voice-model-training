@@ -1,6 +1,8 @@
 """Concurrency test for the /live API: N simulated guests talking at the same time.
 
     python -m s2s.eval.load_test --url ws://127.0.0.1:7860/live --token $S2S_LIVE_TOKEN --concurrency 1 2 4 8 16
+    # several server processes on one GPU: guests are spread over the URLs round-robin
+    python -m s2s.eval.load_test --url ws://127.0.0.1:7860/live ws://127.0.0.1:7861/live ... --concurrency 8 16 32
 
 Each guest opens its own /live session (same setup as an application would send), then speaks
 `--turns` questions from real speech clips, streamed at real-time speed in 100 ms chunks followed by
@@ -77,7 +79,8 @@ def clips(paths: list[str]) -> list[bytes]:
 async def guest(idx: int, args, speech: list[bytes], results: list[dict]) -> None:
     import websockets
 
-    url = args.url + (("&" if "?" in args.url else "?") + f"token={args.token}" if args.token else "")
+    base = args.url[idx % len(args.url)]
+    url = base + (("&" if "?" in base else "?") + f"token={args.token}" if args.token else "")
     rng = random.Random(idx)
     await asyncio.sleep(rng.uniform(0, args.ramp))
     try:
@@ -147,7 +150,8 @@ async def run_level(n: int, args, speech: list[bytes]) -> dict:
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--url", default="ws://127.0.0.1:7860/live")
+    p.add_argument("--url", nargs="+", default=["ws://127.0.0.1:7860/live"],
+                   help="one or more /live URLs (several server processes: guests are spread round-robin)")
     p.add_argument("--token", default=os.environ.get("S2S_LIVE_TOKEN"))
     p.add_argument("--concurrency", type=int, nargs="+", default=[1, 2, 4, 8])
     p.add_argument("--turns", type=int, default=3, help="questions per guest")
@@ -160,7 +164,7 @@ def main() -> None:
     p.add_argument("--out", default=None, help="write all measurements as JSON")
     args = p.parse_args()
     speech = clips(args.clips or synth_questions(os.path.expanduser("~/.cache/s2s_load_test")))
-    print(f"{len(speech)} speech clips, {args.turns} turns per guest, url {args.url}")
+    print(f"{len(speech)} speech clips, {args.turns} turns per guest, {len(args.url)} server(s): {' '.join(args.url)}")
     levels = [asyncio.run(run_level(n, args, speech)) for n in args.concurrency]
     if args.out:
         with open(args.out, "w") as f:
