@@ -132,6 +132,7 @@ runtime:
   decode_context_frames: 4  # conv left context for the streaming Mimi decoder (exact; transformer uses a KV cache)
   emit_every_frames: 2      # decode + emit audio every N frames (160 ms)
   max_tool_rounds: 3
+  tool_result_max_items: 12  # long lists in tool results are cut to this many items (+ "... and N more"); 0 = off
   endpoint:
     vad: silero             # silero (robust to room noise, clicks, fans) | energy (loudness threshold)
     vad_threshold: 0.5      # silero speech probability to start speech (stops 0.15 lower)

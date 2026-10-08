@@ -246,3 +246,13 @@ def test_phrase_chunker_long_text_without_punctuation_and_empty():
     out = [p for w in "one two three four five six seven".split() for p in c.push(" " + w)] + c.flush()
     assert out == ["one two three four five", "six seven"]
     assert PhraseChunker().flush() == [] and PhraseChunker().push("...") == []
+
+
+def test_compact_tool_result():
+    from s2s.runtime.agent import compact_result
+
+    products = {"products": [{"name": f"item {i}", "max_quantity": 0} for i in range(40)], "note": "x" * 1000}
+    out = compact_result(products, max_items=3, max_chars=10)
+    assert out["products"][:3] == products["products"][:3] and out["products"][3] == "... and 37 more"
+    assert out["note"] == "x" * 10 + "..."
+    assert compact_result(products, max_items=0) is products and compact_result({"ok": True}) == {"ok": True}

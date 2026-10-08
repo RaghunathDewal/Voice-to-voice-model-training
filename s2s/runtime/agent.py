@@ -54,6 +54,22 @@ def speakable(piece: str) -> bool:
     return False
 
 
+def compact_result(value, max_items: int = 12, max_chars: int = 400):
+    """Shorten a tool result before the thinker reads it: long lists keep their first `max_items` entries
+    plus a count of the rest, long strings are cut. Keeps the prompt short (faster replies) and readable
+    for a small model. max_items <= 0 disables it."""
+    if max_items <= 0:
+        return value
+    if isinstance(value, dict):
+        return {k: compact_result(v, max_items, max_chars) for k, v in value.items()}
+    if isinstance(value, list):
+        head = [compact_result(v, max_items, max_chars) for v in value[:max_items]]
+        return head + [f"... and {len(value) - max_items} more"] if len(value) > max_items else head
+    if isinstance(value, str) and len(value) > max_chars:
+        return value[:max_chars] + "..."
+    return value
+
+
 class VoiceAgent:
     def __init__(self, cfg, speech_llm_dir: str | None = None, talker_dir: str | None = None,
                  device: str | None = None):
@@ -304,7 +320,8 @@ class VoiceSession:
             timer.mark("tool_result")
             if round_idx == int(rt.max_tool_rounds):
                 break
-            logits, hidden = self._feed_ids(th.prompts.tool_response_ids(results))
+            limit = int(rt.get("tool_result_max_items", 12))
+            logits, hidden = self._feed_ids(th.prompts.tool_response_ids([compact_result(r, limit) for r in results]))
 
     def _execute(self, call: dict) -> dict:
         if call.get("name") is None:
