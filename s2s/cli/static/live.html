@@ -257,7 +257,9 @@ async function runDemo() {
 /* ---------- live mode (WebSocket to s2s.cli.ws_live) ---------- */
 let ws, state = 'idle', sendBuf = [], playHead = 0, playing = 0, replyDone = false, agentEl = null, lastTurnLabel = '';
 async function runLive() {
-  const stream = await navigator.mediaDevices.getUserMedia({audio: {echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1}});
+  // ?raw=1 turns off the browser's noise suppression and auto gain (they can smear speech for the recogniser)
+  const clean = params.get('raw') !== '1';
+  const stream = await navigator.mediaDevices.getUserMedia({audio: {echoCancellation: true, noiseSuppression: clean, autoGainControl: clean, channelCount: 1}});
   const code = "class C extends AudioWorkletProcessor{process(i){const c=i[0][0];if(c)this.port.postMessage(c.slice(0));return true}};registerProcessor('cap',C);";
   await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([code], {type: 'application/javascript'})));
   const node = new AudioWorkletNode(ctx, 'cap'); const mic = ctx.createMediaStreamSource(stream);

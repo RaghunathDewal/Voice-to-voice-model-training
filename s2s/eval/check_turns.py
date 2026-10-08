@@ -6,6 +6,13 @@ For every saved turn it prints the length, why the turn ended, the input level, 
 transcript and a reference transcript from Whisper. If Whisper also gets only a fragment, the audio
 was cut short or is poor (turn detection, microphone, echo); if Whisper hears the full sentence and
 our adapter does not, the adapter is at fault.
+
+Audio quality per turn:
+  snr   speech level minus the noise floor between words (dB). Under ~15 dB recognition degrades
+        fast, and turning the volume up does not help: the noise is amplified with the speech.
+  clip  share of samples at full scale (distortion from speaking too loud / too close).
+  bw    frequency below which 99% of the energy lies. ~3.5 kHz = narrowband (Bluetooth headset in
+        call mode, phone line); a clean wideband mic is 6-8 kHz.
 """
 
 from __future__ import annotations
@@ -20,6 +27,20 @@ import soundfile as sf
 import torch
 
 from s2s.audio import resample
+
+
+def quality(wav: np.ndarray, sr: int) -> dict:
+    """SNR (90th minus 10th percentile of 20 ms frame levels), clipping share, 99% energy bandwidth."""
+    hop = int(0.02 * sr)
+    frames = wav[: len(wav) // hop * hop].reshape(-1, hop) if len(wav) >= hop else wav[None]
+    db = 10 * np.log10(np.mean(np.square(frames, dtype=np.float64), axis=1) + 1e-12)
+    n = 1024
+    segs = wav[: len(wav) // n * n].reshape(-1, n) if len(wav) >= n else np.pad(wav, (0, n - len(wav)))[None]
+    psd = np.mean(np.abs(np.fft.rfft(segs * np.hanning(n), axis=1)) ** 2, axis=0)
+    cum = np.cumsum(psd) / (psd.sum() + 1e-12)
+    bw = float(np.searchsorted(cum, 0.99)) * sr / n
+    return {"snr": float(np.percentile(db, 90) - np.percentile(db, 10)),
+            "clip": float(np.mean(np.abs(wav) >= 0.99)), "bw": bw}
 
 
 def main() -> None:
@@ -56,7 +77,9 @@ def main() -> None:
         sec = len(wav) / sr
         lengths.append(sec)
         short += sec < 1.0
-        print(f"{os.path.basename(wav_path)}  {sec:4.1f}s  end={info.get('end')}  level={info.get('rms_db')} dB")
+        q = quality(wav, sr)
+        print(f"{os.path.basename(wav_path)}  {sec:4.1f}s  end={info.get('end')}  level={info.get('rms_db')} dB  "
+              f"snr={q['snr']:.0f} dB  clip={100 * q['clip']:.1f}%  bw={q['bw'] / 1000:.1f} kHz")
         print(f"   whisper: {ref}\n   adapter: {info.get('ctc', '')}\n   reply:   {info.get('reply', '')}")
         for line in alt:
             print(line)
