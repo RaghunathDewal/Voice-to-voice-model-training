@@ -90,6 +90,9 @@ class ParakeetEncoder(SpeechEncoder):
         self.fe = AutoFeatureExtractor.from_pretrained(model)
         full = ParakeetForCTC.from_pretrained(model, dtype=dtype)
         self.enc = full.encoder.to(device).eval()
+        # Parakeet's own CTC head (1M params): a full ASR transcript from the same encoder output
+        self.ctc_head = full.ctc_head.to(device).eval()
+        self.processor = None
         del full
         self.device, self.dtype = device, dtype
         self.name = f"parakeet:{model}"
@@ -108,6 +111,21 @@ class ParakeetEncoder(SpeechEncoder):
             if x.shape[0] < t:
                 x = torch.cat([x, x[-1:].expand(t - x.shape[0], -1)], dim=0)
             out.append(x.cpu())
+        return out
+
+
+    @torch.no_grad()
+    def transcribe(self, feats: list[torch.Tensor]) -> list[str]:
+        """Encoder outputs from `encode` -> Parakeet's own greedy CTC transcripts (no second encoder pass)."""
+        if self.processor is None:
+            from transformers import AutoProcessor
+
+            self.processor = AutoProcessor.from_pretrained(self.name.split(":", 1)[1])
+        out = []
+        for x in feats:
+            logits = self.ctc_head(x[None].to(self.device, self.dtype))[0]
+            ids = logits.argmax(-1).tolist()
+            out.append(self.processor.decode(ids, skip_special_tokens=True).strip())
         return out
 
 

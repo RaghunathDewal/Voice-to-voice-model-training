@@ -391,13 +391,16 @@ class StreamingTurn:
         if self.latents is None and len(self.audio):  # whole-utterance encoder: encode the turn now
             self.add_latents(a.encode_input([self.audio])[0], wav_frames=None)
             self.timer.mark("input_encoded")
+        asr = None
         if self.latents is not None:
             ctc = a.adapter(self.latents[None].to(a.device))["ctc_logits"][0].argmax(-1).tolist()
             transcript = ctc_greedy_decode(ctc)
+            if hasattr(a.input_encoder, "transcribe"):  # Parakeet's own ASR head, same encoder output
+                asr = a.input_encoder.transcribe([self.latents])[0]
         else:
             transcript = ""
-        self.s.history.append({"role": "user", "text": transcript})
-        yield {"type": "user_transcript", "text": transcript,
+        self.s.history.append({"role": "user", "text": asr or transcript})
+        yield {"type": "user_transcript", "text": transcript, "asr": asr,
                "eot_prob_last": self.eot_probs[-1] if self.eot_probs else None,
                "endpoint_reason": self.endpointer.reason}
         logits, hidden = self.s._close_turn()

@@ -204,7 +204,11 @@ def build_app(agent: VoiceAgent | None, system_prompt: str | None = None, tools:
                 elif t == "user_transcript":
                     info["ctc"] = ev["text"]
                     await say(f"USER (ctc): {ev['text']}")
-                    await send("user", text=ev["text"])
+                    if ev.get("asr") is not None:
+                        info["asr"] = ev["asr"]
+                        await say(f"USER (parakeet): {ev['asr']}")
+                    # the page shows the best transcript we have: Parakeet's own ASR head, else the adapter's CTC
+                    await send("user", text=ev.get("asr") or ev["text"], ctc=ev["text"])
                 elif t == "assistant_text":
                     info["reply"] = ev["text"]
                     await say(f"ASSISTANT: {ev['text']}")
