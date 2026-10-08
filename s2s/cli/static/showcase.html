@@ -1,0 +1,320 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voice Concierge</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#0b1020; --bg2:#121a33; --card:rgba(255,255,255,.045); --line:rgba(255,255,255,.09);
+  --text:#e9ecf5; --muted:#8f98b3; --gold:#e8c27a; --gold2:#c99a4a; --teal:#5fd4c4; --violet:#8b7cf6;
+  --ok:#5ad08f; --guest:#1f2a4d; --agent:#2a2416;
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%}
+body{font-family:Inter,system-ui,sans-serif;color:var(--text);
+  background:radial-gradient(1200px 700px at 20% 10%,#1b2550 0%,transparent 60%),
+             radial-gradient(900px 600px at 90% 90%,#2a2140 0%,transparent 60%),var(--bg);
+  display:flex;flex-direction:column}
+header{display:flex;align-items:center;gap:16px;padding:22px 36px;border-bottom:1px solid var(--line)}
+.logo{width:42px;height:42px;border-radius:12px;display:grid;place-items:center;
+  background:linear-gradient(135deg,var(--gold),var(--gold2));color:#1b1405;font:600 20px Fraunces,serif}
+.brand h1{margin:0;font:600 22px Fraunces,serif;letter-spacing:.2px}
+.brand p{margin:2px 0 0;color:var(--muted);font-size:13px}
+.pill{margin-left:auto;display:flex;align-items:center;gap:8px;padding:8px 14px;border-radius:999px;
+  border:1px solid var(--line);background:var(--card);font-size:13px;color:var(--muted)}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--muted)}
+.dot.on{background:var(--ok);box-shadow:0 0 12px var(--ok)}
+main{flex:1;display:grid;grid-template-columns:1.05fr 1.25fr .9fr;gap:24px;padding:24px 36px 32px;min-height:0}
+.panel{background:var(--card);border:1px solid var(--line);border-radius:22px;backdrop-filter:blur(8px);min-height:0}
+/* voice stage */
+.stage{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:26px;padding:28px;position:relative}
+canvas#orb{width:380px;height:380px}
+#state{font:500 24px Fraunces,serif;letter-spacing:.3px;min-height:32px}
+#sub{color:var(--muted);font-size:14px;margin-top:-16px;min-height:20px;text-align:center}
+.controls{display:flex;gap:14px}
+button{font:600 16px Inter,sans-serif;border:0;border-radius:14px;padding:15px 26px;cursor:pointer;transition:transform .15s,box-shadow .2s}
+button:active{transform:scale(.97)}
+#start{background:linear-gradient(135deg,var(--gold),var(--gold2));color:#1b1405;box-shadow:0 10px 30px rgba(232,194,122,.25)}
+#start:disabled{opacity:.45;cursor:default;box-shadow:none}
+#end{background:transparent;color:var(--text);border:1px solid var(--line)}
+/* conversation */
+.convo{display:flex;flex-direction:column;padding:0}
+.convo .head{padding:18px 24px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between}
+.convo .head h2{margin:0;font:600 18px Fraunces,serif}
+.convo .head span{color:var(--muted);font-size:13px}
+#chat{flex:1;overflow:auto;padding:20px 22px;display:flex;flex-direction:column;gap:14px;scroll-behavior:smooth}
+.msg{max-width:84%;padding:13px 17px;border-radius:18px;line-height:1.45;font-size:16px;animation:pop .35s ease}
+.msg .who{font-size:11px;text-transform:uppercase;letter-spacing:1.2px;color:var(--muted);margin-bottom:5px}
+.msg.guest{align-self:flex-end;background:var(--guest);border:1px solid rgba(95,212,196,.25);border-bottom-right-radius:6px}
+.msg.agent{align-self:flex-start;background:var(--agent);border:1px solid rgba(232,194,122,.28);border-bottom-left-radius:6px}
+.msg .heard{font:12px "JetBrains Mono",monospace;color:var(--muted);margin-top:6px}
+.tool{align-self:flex-start;display:flex;flex-direction:column;gap:8px;max-width:88%;padding:12px 16px;border-radius:14px;
+  background:rgba(139,124,246,.10);border:1px solid rgba(139,124,246,.35);cursor:pointer;animation:pop .35s ease}
+.tool .row{display:flex;align-items:center;gap:10px;font-size:14px}
+.tool .ic{width:28px;height:28px;border-radius:8px;display:grid;place-items:center;background:rgba(139,124,246,.25)}
+.tool .name{font:13px "JetBrains Mono",monospace;color:#c9c1ff}
+.tool .ok{margin-left:auto;color:var(--ok);font-weight:600;font-size:13px}
+.tool pre{display:none;margin:0;padding:10px 12px;border-radius:10px;background:rgba(0,0,0,.35);font:12px/1.5 "JetBrains Mono",monospace;color:#cfd6ee;white-space:pre-wrap}
+.tool.open pre{display:block}
+.typing{display:inline-flex;gap:4px}
+.typing i{width:6px;height:6px;border-radius:50%;background:var(--gold);animation:blink 1s infinite}
+.typing i:nth-child(2){animation-delay:.15s}.typing i:nth-child(3){animation-delay:.3s}
+@keyframes blink{0%,80%,100%{opacity:.2}40%{opacity:1}}
+@keyframes pop{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+/* side */
+.side{display:flex;flex-direction:column;gap:18px;background:none;border:0;padding:0}
+.card{background:var(--card);border:1px solid var(--line);border-radius:22px;padding:20px 22px}
+.card h3{margin:0 0 14px;font:600 16px Fraunces,serif;display:flex;align-items:center;gap:8px}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:9px 14px;font-size:14px}
+.kv dt{color:var(--muted)} .kv dd{margin:0;text-align:right;font-weight:500}
+.tabs{display:flex;gap:6px;margin-bottom:14px}
+.tab{flex:1;text-align:center;padding:9px 0;border-radius:10px;font-size:13px;font-weight:600;color:var(--muted);cursor:pointer;border:1px solid transparent}
+.tab.active{color:var(--text);background:rgba(255,255,255,.06);border-color:var(--line)}
+.lat{display:flex;flex-direction:column;gap:9px}
+.lat .bar{display:grid;grid-template-columns:120px 1fr 62px;gap:10px;align-items:center;font-size:13px}
+.lat .track{height:8px;border-radius:6px;background:rgba(255,255,255,.07);overflow:hidden}
+.lat .fill{height:100%;border-radius:6px;background:linear-gradient(90deg,var(--teal),var(--gold));width:0;transition:width .8s ease}
+.lat .ms{text-align:right;color:var(--muted);font-variant-numeric:tabular-nums}
+.note{color:var(--muted);font-size:12px;margin-top:12px;line-height:1.5}
+.stack{display:flex;flex-direction:column;gap:8px;font-size:13px}
+.stack div{display:flex;justify-content:space-between;padding:9px 12px;border-radius:10px;background:rgba(255,255,255,.035)}
+.stack b{font-weight:600} .stack span{color:var(--muted)}
+.actions{display:flex;flex-direction:column;gap:8px}
+.actions .empty{color:var(--muted);font-size:13px}
+.actions .a{display:flex;align-items:center;gap:10px;padding:10px 12px;border-radius:12px;background:rgba(90,208,143,.08);border:1px solid rgba(90,208,143,.25);font-size:14px;animation:pop .35s ease}
+.actions .a small{margin-left:auto;color:var(--ok);font-weight:600}
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">A</div>
+  <div class="brand"><h1>Aurora Grand · Voice Concierge</h1><p>Speech-to-speech LLM · tool calling · English</p></div>
+  <div class="pill"><span id="conn" class="dot"></span><span id="connText">Ready</span></div>
+</header>
+<main>
+  <section class="panel stage">
+    <canvas id="orb" width="760" height="760"></canvas>
+    <div id="state">Tap to start</div>
+    <div id="sub">Just speak — the concierge answers when you pause</div>
+    <div class="controls"><button id="start">🎙️ Start talking</button><button id="end">End call</button></div>
+  </section>
+  <section class="panel convo">
+    <div class="head"><h2>Conversation</h2><span id="turns">0 turns</span></div>
+    <div id="chat"></div>
+  </section>
+  <aside class="side">
+    <div class="card">
+      <div class="tabs"><div class="tab active" id="tab-booking" data-pane="booking">Booking</div><div class="tab" id="tab-model" data-pane="model">Model</div></div>
+      <div id="pane-booking"><dl class="kv" id="booking"><dt>Guest</dt><dd>—</dd></dl></div>
+      <div id="pane-model" style="display:none"><div class="stack">
+        <div><b>Ear</b><span>Parakeet encoder</span></div><div><b>Bridge</b><span>speech adapter</span></div>
+        <div><b>Brain</b><span>Qwen3-0.6B + tools</span></div><div><b>Voice</b><span>talker → Mimi</span></div>
+        <div><b>Size</b><span>≈1.3B parameters</span></div></div></div>
+    </div>
+    <div class="card">
+      <h3>✅ Actions taken</h3>
+      <div class="actions" id="actions"><div class="empty">Orders, tickets and lookups appear here.</div></div>
+    </div>
+    <div class="card">
+      <h3>⚡ Time to first audio</h3>
+      <div class="lat" id="lat"></div>
+      <div class="note" id="latNote">From the end of your sentence to the first sound of the reply.</div>
+    </div>
+  </aside>
+</main>
+<script>
+const $ = s => document.querySelector(s);
+const chat = $('#chat');
+const params = new URLSearchParams(location.search);
+const DEMO = params.get('demo');            // ?demo=<folder with conversation.json + audio/>
+let ctx, analyser, level = 0, mode = 'idle', turns = 0;
+window.__events = [];                          // timeline for recordings: [{t, type, ...}]
+const mark = (type, extra = {}) => window.__events.push({t: performance.now(), type, ...extra});
+
+/* ---------- orb ---------- */
+const cv = $('#orb'), g = cv.getContext('2d');
+const COLORS = {done: ['#2f8a63', '#5ad08f'], idle: ['#3a4470', '#6b78b0'], listening: ['#2aa79a', '#5fd4c4'], thinking: ['#5a4bd1', '#8b7cf6'], speaking: ['#c99a4a', '#e8c27a']};
+let phase = 0, shown = 0;
+function drawOrb() {
+  phase += 0.012;
+  if (analyser) { const d = new Uint8Array(analyser.fftSize); analyser.getByteTimeDomainData(d);
+    let s = 0; for (const v of d) s += ((v - 128) / 128) ** 2; level = Math.min(1, Math.sqrt(s / d.length) * 5); }
+  const target = mode === 'thinking' ? 0.25 + 0.15 * Math.sin(phase * 6) : (mode === 'idle' || mode === 'done' ? 0.05 : level);
+  shown += (target - shown) * 0.18;
+  const W = cv.width, c = W / 2, [c1, c2] = COLORS[mode] || COLORS.idle;
+  g.clearRect(0, 0, W, W);
+  for (let k = 3; k >= 0; k--) {               // soft rings
+    const r = 150 + k * 34 + shown * 70 * (k + 1) / 2 + Math.sin(phase * 2 + k) * 4;
+    g.beginPath(); g.arc(c, c, r, 0, Math.PI * 2); g.strokeStyle = c2; g.globalAlpha = 0.08 + 0.05 * (3 - k); g.lineWidth = 2; g.stroke();
+  }
+  g.globalAlpha = 1;
+  const grad = g.createRadialGradient(c - 50, c - 60, 20, c, c, 190 + shown * 60);
+  grad.addColorStop(0, c2); grad.addColorStop(0.6, c1); grad.addColorStop(1, 'rgba(0,0,0,0)');
+  g.beginPath();                                  // wobbly blob
+  for (let a = 0; a <= Math.PI * 2 + 0.01; a += 0.05) {
+    const r = 150 + shown * 45 + 7 * Math.sin(a * 5 + phase * 4) * (0.3 + shown) + 5 * Math.sin(a * 3 - phase * 3);
+    const x = c + r * Math.cos(a), y = c + r * Math.sin(a); a === 0 ? g.moveTo(x, y) : g.lineTo(x, y);
+  }
+  g.fillStyle = grad; g.fill();
+  requestAnimationFrame(drawOrb);
+}
+drawOrb();
+
+/* ---------- UI helpers ---------- */
+const STATE = {listening: ['Listening…', 'Go ahead, I\'m all ears'], thinking: ['Thinking…', 'Understanding your request'],
+               speaking: ['Speaking', 'Replying out loud'], done: ['All set', 'Conversation complete'], idle: ['Tap to start', 'Just speak — the concierge answers when you pause']};
+function setMode(m, sub) { mode = m; $('#state').textContent = STATE[m][0]; $('#sub').textContent = sub || STATE[m][1]; mark('state', {state: m}); }
+function scrollChat() { chat.scrollTop = chat.scrollHeight; }
+function addGuest(text, heard) {
+  const el = document.createElement('div'); el.className = 'msg guest';
+  el.innerHTML = `<div class="who">Guest</div><div class="t"></div>` + (heard ? `<div class="heard">heard: ${heard}</div>` : '');
+  el.querySelector('.t').textContent = text; chat.appendChild(el); scrollChat();
+  turns++; $('#turns').textContent = `${turns} turn${turns > 1 ? 's' : ''}`; return el;
+}
+function addAgent() {
+  const el = document.createElement('div'); el.className = 'msg agent';
+  el.innerHTML = `<div class="who">Concierge</div><div class="t"><span class="typing"><i></i><i></i><i></i></span></div>`;
+  chat.appendChild(el); scrollChat(); return el.querySelector('.t');
+}
+const TOOL_ICON = {order_product: '🛎️', create_issue: '🛠️', get_property_information: 'ℹ️', schedule_wakeup_call: '⏰'};
+function describe(call, res) {
+  const a = call.arguments || {};
+  if (call.name === 'order_product') return [`${a.product} × ${a.quantity}`, res && res.order_id ? `Order #${res.order_id} · ${res.eta_minutes} min` : 'Ordered'];
+  if (call.name === 'create_issue') return [`${a.category}: ${a.description}`, res && res.ticket_id ? `Ticket #${res.ticket_id}` : 'Reported'];
+  if (call.name === 'get_property_information') return [`topic: ${a.topic}`, 'Fetched'];
+  if (call.name === 'schedule_wakeup_call') return [`at ${a.time}`, 'Scheduled'];
+  return [JSON.stringify(a), 'Done'];
+}
+let toolN = 0;
+function addTool(call, res) {
+  const [what, ok] = describe(call, res);
+  const el = document.createElement('div'); el.className = 'tool'; el.id = `tool-${toolN++}`;
+  el.innerHTML = `<div class="row"><div class="ic">${TOOL_ICON[call.name] || '⚙️'}</div><div><div class="name">${call.name}</div><div>${what}</div></div><div class="ok">✓ ${ok}</div></div>
+    <pre>${JSON.stringify({call, result: res}, null, 2)}</pre>`;
+  el.onclick = () => { el.classList.toggle('open'); scrollChat(); };
+  const list = $('#actions'); const empty = list.querySelector('.empty'); if (empty) empty.remove();
+  const row = document.createElement('div'); row.className = 'a';
+  row.innerHTML = `<span>${TOOL_ICON[call.name] || '⚙️'}</span><span>${what}</span><small>${ok}</small>`; list.appendChild(row);
+  chat.appendChild(el); scrollChat(); mark('tool', {id: el.id}); return el;
+}
+function setBooking(res) {
+  const rows = [['Guest', res.guest_name], ['Room', `${res.room} · ${res.room_type}`], ['Check-in', res.check_in],
+                ['Check-out', `${res.check_out} · ${res.checkout_time}`], ['Balance', res.balance_due]];
+  $('#booking').innerHTML = rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('');
+}
+function addLatency(label, ms) {
+  const el = document.createElement('div'); el.className = 'bar';
+  el.innerHTML = `<span>${label}</span><div class="track"><div class="fill"></div></div><span class="ms">${(ms / 1000).toFixed(2)} s</span>`;
+  $('#lat').appendChild(el); requestAnimationFrame(() => el.querySelector('.fill').style.width = `${Math.min(100, ms / 25)}%`);
+}
+document.querySelectorAll('.tab').forEach(t => t.onclick = () => {
+  document.querySelectorAll('.tab').forEach(x => x.classList.toggle('active', x === t));
+  $('#pane-booking').style.display = t.dataset.pane === 'booking' ? '' : 'none';
+  $('#pane-model').style.display = t.dataset.pane === 'model' ? '' : 'none'; mark('tab', {pane: t.dataset.pane});
+});
+function typeText(el, text, seconds) {           // reveal the reply in step with the audio
+  return new Promise(res => { const words = text.split(' '); let i = 0; el.textContent = '';
+    const step = Math.max(40, seconds * 1000 / words.length);
+    const iv = setInterval(() => { el.textContent = words.slice(0, ++i).join(' '); scrollChat(); if (i >= words.length) { clearInterval(iv); res(); } }, step); });
+}
+function connect(on, text) { $('#conn').classList.toggle('on', on); $('#connText').textContent = text; }
+
+/* ---------- audio ---------- */
+function ensureCtx() {
+  if (ctx) return; ctx = new AudioContext(); analyser = ctx.createAnalyser(); analyser.fftSize = 1024; analyser.connect(ctx.destination);
+}
+async function playUrl(url) {
+  const buf = await (await fetch(url)).arrayBuffer(); const audio = await ctx.decodeAudioData(buf);
+  return new Promise(res => { const s = ctx.createBufferSource(); s.buffer = audio; s.connect(analyser); s.onended = res; s.start(); });
+}
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+/* ---------- demo replay (pre-generated by the real model) ---------- */
+async function runDemo() {
+  const conv = await (await fetch(`${DEMO}/conversation.json`)).json();
+  const lat = conv.latency_ms || [];
+  if (conv.latency_note) $('#latNote').textContent = conv.latency_note;
+  mark('start'); connect(true, 'Connected · demo replay');
+  for (let i = 0; i < conv.turns.length; i++) {
+    const t = conv.turns[i];
+    setMode('listening'); mark('guest_start', {turn: i});
+    const g = addGuest('…'); await playUrl(`${DEMO}/audio/guest_${i}.wav`);
+    g.querySelector('.t').textContent = t.guest_text; mark('guest_end', {turn: i});
+    setMode('thinking'); const wait = lat[i] || 900; const t0 = performance.now();
+    if (t.tool_calls.length) { await sleep(wait * 0.55); t.tool_calls.forEach((c, k) => addTool(c, t.tool_results[k])); }
+    const reply = addAgent(); await sleep(Math.max(0, wait - (performance.now() - t0)));
+    addLatency(t.label || `Turn ${i + 1}`, wait);
+    setMode('speaking'); mark('bot_start', {turn: i});
+    await Promise.all([playUrl(`${DEMO}/audio/bot_${i}.wav`), typeText(reply, t.assistant.join(' '), t.bot_seconds * 0.9)]);
+    mark('bot_end', {turn: i}); await sleep(300);
+  }
+  setMode('done'); mark('done');
+}
+
+/* ---------- live mode (WebSocket to s2s.cli.ws_live) ---------- */
+let ws, state = 'idle', sendBuf = [], playHead = 0, playing = 0, replyDone = false, agentEl = null, lastTurnLabel = '';
+async function runLive() {
+  // ?raw=1 turns off the browser's noise suppression and auto gain (they can smear speech for the recogniser)
+  const clean = params.get('raw') !== '1';
+  const stream = await navigator.mediaDevices.getUserMedia({audio: {echoCancellation: true, noiseSuppression: clean, autoGainControl: clean, channelCount: 1}});
+  const code = "class C extends AudioWorkletProcessor{process(i){const c=i[0][0];if(c)this.port.postMessage(c.slice(0));return true}};registerProcessor('cap',C);";
+  await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([code], {type: 'application/javascript'})));
+  const node = new AudioWorkletNode(ctx, 'cap'); const mic = ctx.createMediaStreamSource(stream);
+  mic.connect(node); const mute = ctx.createGain(); mute.gain.value = 0; node.connect(mute); mute.connect(ctx.destination);
+  micAn = ctx.createAnalyser(); micAn.fftSize = 1024; mic.connect(micAn);
+  ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws'); ws.binaryType = 'arraybuffer';
+  ws.onopen = () => { ws.send(JSON.stringify({type: 'hello', sr: ctx.sampleRate})); connect(true, 'Connected'); };
+  ws.onclose = () => { connect(false, 'Disconnected'); setMode('idle', 'Reload the page to reconnect'); };
+  ws.onmessage = ev => {
+    if (typeof ev.data !== 'string') { playChunk(new Int16Array(ev.data)); return; }
+    const m = JSON.parse(ev.data);
+    if (m.type === 'state') { state = m.state; analyser = state === 'listening' ? micAn : outAn; setMode(state);
+      if (state === 'thinking') { agentEl = null; replyDone = false; } }
+    else if (m.type === 'reply_done') { replyDone = true; maybeDone(); }
+    else if (m.type === 'log') onLog(m.text);
+  };
+  node.port.onmessage = e => {
+    if (state !== 'listening' || ws.readyState !== 1) { sendBuf = []; return; }
+    sendBuf.push(e.data); const n = sendBuf.reduce((a, b) => a + b.length, 0); if (n < ctx.sampleRate * 0.08) return;
+    const pcm = new Int16Array(n); let o = 0; for (const b of sendBuf) for (let i = 0; i < b.length; i++) pcm[o++] = Math.max(-1, Math.min(1, b[i])) * 32767;
+    sendBuf = []; ws.send(pcm.buffer);
+  };
+  analyser = micAn;
+}
+let outAn, micAn;
+function onLog(text) {
+  let m;
+  if (text.startsWith('Reservation: ')) { try { setBooking(JSON.parse(text.slice(13).replace(/'/g, '"'))); } catch (e) {} }
+  else if ((m = text.match(/^USER \(ctc\): (.*)$/))) { addGuest(m[1]); lastTurnLabel = m[1].split(' ').slice(0, 3).join(' '); }
+  else if ((m = text.match(/^ASSISTANT: (.*)$/)) && m[1].trim()) { (agentEl || addAgent()).textContent = m[1]; agentEl = null; }
+  else if ((m = text.match(/^TOOL CALL: (.*)$/))) { window.__pendingCall = m[1]; }
+  else if ((m = text.match(/^TOOL RESULT: (.*)$/))) {
+    const j = s => { try { return JSON.parse(s.replace(/'/g, '"').replace(/\bTrue\b/g, 'true').replace(/\bFalse\b/g, 'false').replace(/\bNone\b/g, 'null')); } catch (e) { return {name: s}; } };
+    addTool(j(window.__pendingCall || '{}'), j(m[1]));
+  }
+  else if ((m = text.match(/first audio heard by the browser (\d+) ms/))) addLatency(lastTurnLabel || `Turn ${turns}`, +m[1]);
+}
+function playChunk(pcm) {
+  if (!outAn) { outAn = ctx.createAnalyser(); outAn.fftSize = 1024; outAn.connect(ctx.destination); analyser = outAn; }
+  if (!agentEl) agentEl = addAgent();
+  const f = new Float32Array(pcm.length); for (let i = 0; i < pcm.length; i++) f[i] = pcm[i] / 32768;
+  const buf = ctx.createBuffer(1, f.length, 24000); buf.copyToChannel(f, 0);
+  const s = ctx.createBufferSource(); s.buffer = buf; s.connect(outAn);
+  const now = ctx.currentTime; if (playHead < now + 0.02) playHead = now + 0.12;
+  s.start(playHead); playHead += buf.duration; playing++; s.onended = () => { playing--; maybeDone(); };
+}
+function maybeDone() { if (replyDone && playing === 0) { replyDone = false; ws.send(JSON.stringify({type: 'played'})); } }
+
+$('#start').onclick = async () => {
+  $('#start').disabled = true; mark('click', {id: 'start'}); ensureCtx();
+  if (DEMO) { const c = await (await fetch(`${DEMO}/conversation.json`)).json(); setBooking(c.reservation); runDemo(); }
+  else runLive();
+};
+$('#end').onclick = () => { mark('click', {id: 'end'}); if (ws) ws.close(); setMode('done', 'Call ended — thank you!'); connect(false, 'Call ended'); };
+if (DEMO) fetch(`${DEMO}/conversation.json`).then(r => r.json()).then(c => setBooking(c.reservation));
+</script>
+</body>
+</html>

@@ -17,7 +17,13 @@ https:// URL, which browsers require for microphone access (Kaggle / Colab / rem
 Protocol on /ws: client -> server: {"type": "hello", "sr": <mic rate>}, binary int16 mic PCM,
 {"type": "played"}, {"type": "reset"}, {"type": "latency", "first_audio_ms": ...};
 server -> client: {"type": "state", "state": listening|thinking|speaking}, {"type": "log", "text"},
-binary int16 24 kHz reply audio, {"type": "reply_done"}.
+{"type": "session", "tools": [...], "reservation": {...} | null}, {"type": "vad", "speech": bool}
+(the listener heard speech start / a noise burst was dropped), {"type": "user", "text"},
+{"type": "assistant", "text"}, {"type": "tool", "call", "result"}, {"type": "error", "text"},
+binary int16 24 kHz reply audio, {"type": "reply_done"} (always sent, even when the turn fails).
+
+The page is s2s/cli/static/live.html; /?demo=<dir> serves the showcase page (showcase.html) that
+replays a pre-generated conversation for the demo video.
 """
 
 from __future__ import annotations
@@ -43,7 +49,9 @@ from s2s.data.hotel_v3 import GenericBackend, known_tools, select_tools  # noqa:
 from s2s.runtime.agent import VoiceAgent
 from s2s.runtime.live import LiveListener
 
-PAGE = open(os.path.join(os.path.dirname(__file__), "static", "live.html"), encoding="utf-8").read()
+STATIC = os.path.join(os.path.dirname(__file__), "static")
+PAGE = open(os.path.join(STATIC, "live.html"), encoding="utf-8").read()
+SHOWCASE = open(os.path.join(STATIC, "showcase.html"), encoding="utf-8").read()
 
 
 def start_tunnel(port: int) -> subprocess.Popen:
@@ -97,8 +105,8 @@ def build_app(agent: VoiceAgent | None, system_prompt: str | None = None, tools:
     app = FastAPI()
 
     @app.get("/")
-    def index():
-        return HTMLResponse(PAGE)
+    def index(demo: str | None = None):
+        return HTMLResponse(SHOWCASE if demo else PAGE)
 
     if demo_dir:  # /?demo=demo replays a pre-generated conversation (conversation.json + audio/)
         from fastapi.staticfiles import StaticFiles
@@ -119,6 +127,9 @@ def build_app(agent: VoiceAgent | None, system_prompt: str | None = None, tools:
             print(text, flush=True)
             await ws.send_text(json.dumps({"type": "log", "text": text}))
 
+        async def send(kind: str, **data) -> None:
+            await ws.send_text(json.dumps({"type": kind, **data}, default=str))
+
         async def set_state(s: str) -> None:
             conv["state"] = s
             await ws.send_text(json.dumps({"type": "state", "state": s}))
@@ -134,6 +145,8 @@ def build_app(agent: VoiceAgent | None, system_prompt: str | None = None, tools:
 
             conv["session"] = await asyncio.to_thread(build)
             conv["listener"] = LiveListener.for_agent(agent)
+            await send("session", tools=[t["function"]["name"] for t in tools or []],
+                       reservation=None if system_prompt else res)
             if system_prompt:
                 await say(f"Custom system prompt ({len(system_prompt)} chars); tools: "
                           f"{[t['function']['name'] for t in tools or []]}")
@@ -142,13 +155,27 @@ def build_app(agent: VoiceAgent | None, system_prompt: str | None = None, tools:
             await set_state("listening")
 
         async def run_turn(wav: np.ndarray) -> None:
+            info = {}
             try:
                 info = await stream_reply(wav)
-                if save_turns:
+            except (WebSocketDisconnect, RuntimeError):
+                return  # the page was closed mid-reply
+            except Exception as e:  # noqa: BLE001 - never leave the page stuck in "thinking"
+                import traceback
+
+                traceback.print_exc()
+                try:
+                    await send("error", text=repr(e))
+                    await set_state("speaking")  # the page answers "played" and listening resumes
+                    await ws.send_text(json.dumps({"type": "reply_done"}))
+                except (WebSocketDisconnect, RuntimeError):
+                    return
+            if save_turns:
+                try:
                     stem = save_turn(save_turns, wav, sr, info)
                     print(f"saved {stem}.wav", flush=True)
-            except (WebSocketDisconnect, RuntimeError):
-                pass  # the page was closed mid-reply
+                except OSError as e:
+                    print(f"could not save the turn: {e}", flush=True)
 
         async def stream_reply(wav: np.ndarray) -> None:
             q: asyncio.Queue = asyncio.Queue()
@@ -163,7 +190,7 @@ def build_app(agent: VoiceAgent | None, system_prompt: str | None = None, tools:
                 loop.call_soon_threadsafe(q.put_nowait, None)
 
             threading.Thread(target=worker, daemon=True).start()
-            spoke = False
+            spoke, last_call = False, None
             info = {"seconds": round(len(wav) / sr, 2), "end": conv["listener"].reason,
                     "rms_db": round(float(20 * np.log10(np.sqrt(np.mean(wav ** 2)) + 1e-9)), 1)}
             while (ev := await q.get()) is not None:
@@ -177,20 +204,25 @@ def build_app(agent: VoiceAgent | None, system_prompt: str | None = None, tools:
                 elif t == "user_transcript":
                     info["ctc"] = ev["text"]
                     await say(f"USER (ctc): {ev['text']}")
+                    await send("user", text=ev["text"])
                 elif t == "assistant_text":
                     info["reply"] = ev["text"]
                     await say(f"ASSISTANT: {ev['text']}")
+                    await send("assistant", text=ev["text"])
                 elif t == "tool_call":
+                    last_call = ev["call"]
                     await say(f"TOOL CALL: {ev['call']}")
                 elif t == "tool_result":
                     await say(f"TOOL RESULT: {ev['result']}")
+                    await send("tool", call=last_call, result=ev["result"])
                 elif t == "timings":
                     await say("timings ms: " + ", ".join(f"{k}={v:.0f}" for k, v in ev["ms"].items()))
                 elif t == "error":
                     await say(f"ERROR: {ev['text']}")
+                    await send("error", text=ev["text"])
+            if not spoke:  # the page answers "played" right away and listening resumes
+                await set_state("speaking")
             await ws.send_text(json.dumps({"type": "reply_done"}))
-            if not spoke:
-                await set_state("speaking")  # the page answers "played" right away and listening resumes
             return info
 
         try:
@@ -209,7 +241,10 @@ def build_app(agent: VoiceAgent | None, system_prompt: str | None = None, tools:
                         with gpu_lock:
                             return conv["listener"].feed(c)
 
+                    was_in_turn = conv["listener"].in_turn
                     utterance = await asyncio.to_thread(feed)
+                    if utterance is None and conv["listener"].in_turn != was_in_turn:
+                        await send("vad", speech=conv["listener"].in_turn)  # "I hear you" / noise dropped
                     if utterance is not None:
                         conv["turn"] += 1
                         await set_state("thinking")
@@ -221,8 +256,9 @@ def build_app(agent: VoiceAgent | None, system_prompt: str | None = None, tools:
                     conv["mic_sr"] = int(data.get("sr", 48000))
                     await say(f"mic sample rate reported by the browser: {conv['mic_sr']} Hz")
                 elif data.get("type") == "played":
-                    conv["listener"].reset()
-                    await set_state("listening")
+                    if conv["state"] == "speaking":  # late or duplicate "played" messages are ignored
+                        conv["listener"].reset()
+                        await set_state("listening")
                 elif data.get("type") == "latency":
                     await say(f"first audio heard by the browser {data.get('first_audio_ms')} ms after the end of your turn")
                 elif data.get("type") == "reset":
