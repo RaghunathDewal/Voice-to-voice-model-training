@@ -15,9 +15,6 @@ tool_call, tool_result, audio (24 kHz float32 numpy), timings, done.
 
 Per session state: thinker KV cache (system prompt, context and tools are
 prefilled once and reused for every turn), talker cache, Mimi decoder window.
-
-Reply voice (`runtime.voice`): "talker" (our talker + Mimi, default) or "kokoro" (the thinker's
-text, cut into phrases while it streams, spoken by Kokoro-82M; see s2s/runtime/tts.py).
 """
 
 from __future__ import annotations
@@ -97,20 +94,9 @@ class VoiceAgent:
                 print(f"WARNING: talker was trained on thinker '{merged}' which is not available; using {thinker_desc}")
         self.thinker.model.eval()
         self.adapter = SpeechAdapter.load(os.path.join(speech_llm_dir, "adapter.pt")).to(self.device).eval()
-        self.voice = str(rt.get("voice", "talker"))
-        talker_pt = os.path.join(talker_dir, "talker.pt")
-        self.talker = None
-        if self.voice != "kokoro" or os.path.exists(talker_pt):
-            self.talker = Talker.load(talker_pt).to(self.device).eval()
+        self.talker = Talker.load(os.path.join(talker_dir, "talker.pt")).to(self.device).eval()
         self.layer_idx = self.talker_meta.get("layer_idx") or self.thinker.hidden_layer_indices(list(cfg.talker.hidden_layers))
-        self.codec = MimiCodec(cfg.codec.model, self.device, self.talker.K if self.talker else int(cfg.codec.num_codebooks))
-        self.tts = None
-        if self.voice == "kokoro":
-            from s2s.runtime.tts import KokoroVoice
-
-            self.tts = KokoroVoice(str(rt.get("kokoro_voice", "af_heart")), float(rt.get("kokoro_speed", 1.0)),
-                                   device=str(self.device))
-            print(f"[agent] reply voice: Kokoro-82M ({self.tts.voice})")
+        self.codec = MimiCodec(cfg.codec.model, self.device, self.talker.K)
         # speech INPUT encoder: whatever the adapter was trained on (Mimi output codec is separate)
         self.encoder_spec = self.adapter.hparams.get("encoder", "mimi")
         if self.encoder_spec == "mimi":
@@ -231,11 +217,6 @@ class VoiceSession:
         dev = a.device
         for round_idx in range(int(rt.max_tool_rounds) + 1):
             stream: TalkerStream | None = None
-            chunker = None
-            if a.tts is not None:
-                from s2s.runtime.tts import PhraseChunker
-
-                chunker = PhraseChunker()
             decoder = StreamingDecoder(a.codec, int(rt.decode_context_frames))
             pending: list[torch.Tensor] = []
             spoken: list[int] = []
@@ -281,12 +262,6 @@ class VoiceSession:
                     elif not speakable(piece):
                         spoken.append(tok)  # emoji / markdown: kept in the text, not spoken
                         yield {"type": "token", "text": piece}
-                    elif chunker is not None:  # TTS voice: speak each phrase once it is complete
-                        spoken.append(tok)
-                        timer.mark("first_spoken_token")
-                        yield {"type": "token", "text": piece}
-                        for phrase in chunker.push(piece):
-                            yield self._speak(phrase, timer)
                     else:
                         if stream is None:
                             stream = TalkerStream(talker, float(rt.talker_temperature), int(rt.talker_top_k),
@@ -303,9 +278,6 @@ class VoiceSession:
             if stream is not None:
                 stream.end_text()
                 yield from drain(final=True)
-            if chunker is not None:
-                for phrase in chunker.flush():
-                    yield self._speak(phrase, timer)
             text = th.tokenizer.decode(spoken, skip_special_tokens=True).strip()
             self.history.append({"role": "assistant", "text": text, "tool_calls": calls})
             yield {"type": "assistant_text", "text": text}
@@ -334,11 +306,6 @@ class VoiceSession:
         if err:
             return {"error": err}
         return self.backend.execute(call)
-
-    def _speak(self, text: str, timer: Timer) -> dict:
-        wav = self.a.tts.speak(text)
-        timer.mark("first_audio_out")
-        return {"type": "audio", "audio": wav, "sample_rate": self.a.tts.sample_rate, "text": text}
 
     def _emit(self, decoder: StreamingDecoder, pending: list[torch.Tensor], timer: Timer) -> dict:
         wav = decoder.push(list(pending))

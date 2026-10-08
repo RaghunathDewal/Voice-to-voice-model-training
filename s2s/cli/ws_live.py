@@ -344,15 +344,11 @@ def main() -> None:
     p.add_argument("--tools-file", default=None, help="JSON list of your own tool schemas (overrides --tools)")
     p.add_argument("--live-token", default=os.environ.get("S2S_LIVE_TOKEN"),
                    help="require this token on /live (?token= or Authorization: Bearer); default $S2S_LIVE_TOKEN")
-    p.add_argument("--voice", choices=["talker", "kokoro"], default=None,
-                   help="reply voice (default: runtime.voice from the config); kokoro needs: pip install kokoro misaki[en]")
     p.add_argument("--save-turns", default=None,
                    help="debug: save every user turn as heard by the server (WAV + JSON: length, end reason, level)")
     args = p.parse_args()
     sys.stdout.reconfigure(line_buffering=True)
     cfg = config_from_args(args)
-    if args.voice:
-        cfg.runtime.voice = args.voice
 
     import uvicorn
 

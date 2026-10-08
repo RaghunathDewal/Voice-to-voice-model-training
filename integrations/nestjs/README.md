@@ -22,7 +22,7 @@ grep -m1 trycloudflare ~/live.log      # -> https://<name>.trycloudflare.com
 
 The application's endpoint is `wss://<name>.trycloudflare.com/live`. The system prompt and the tools come
 from the application at connect time, so `--system-prompt-file` / `--tools` are not needed for `/live`.
-The reply voice is Kokoro (the default); `--talker-dir` still selects the thinker it was trained with.
+`--talker-dir` selects the reply voice (our talker) and the thinker it was trained with.
 Keep the token secret: anyone with the URL and token can use the GPU.
 
 ## 2. Swap the connect call
@@ -73,7 +73,7 @@ accepted as they are; `behavior` and `scheduling` are ignored.
 | Tool calls | non-blocking, can talk meanwhile | the model waits for the tool result (20 s timeout), then speaks it |
 | Reconnect | session resumption handle | a reconnect starts a fresh conversation (your greeting runs again) |
 | Languages | many | English only |
-| Voice | `speechConfig` | fixed on the server (Kokoro `af_heart`; `runtime.kokoro_voice` to change) |
+| Voice | `speechConfig` | fixed on the server: our own talker (`--talker-dir`) |
 | Usage | `usageMetadata` tokens | none (self-hosted: cost is the GPU) |
 
 Tool-calling quality with your exact six tools improves once the thinker is trained on them (thinker v4).

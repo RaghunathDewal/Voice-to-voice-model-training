@@ -154,8 +154,7 @@ def agent(tiny_models, tmp_path, cpu):
     save_json(str(talker_dir / "meta.json"), {"thinker": tiny_models["qwen"], "layer_idx": layers})
     cfg = load_config(os.path.join(ROOT, "configs", "default.yaml"), [
         f"codec.model={tiny_models['mimi']}", f"thinker.model={tiny_models['qwen']}", "device=cpu",
-        "runtime.endpoint.vad=energy",  # synthetic tones stand in for speech here; Silero rightly ignores them
-        "runtime.voice=talker"])  # the tiny talker; the Kokoro voice has its own (stubbed) test
+        "runtime.endpoint.vad=energy"])  # synthetic tones stand in for speech here; Silero rightly ignores them
     from s2s.runtime.agent import VoiceAgent
 
     return VoiceAgent(cfg, str(speech_dir), str(talker_dir))
@@ -248,47 +247,6 @@ def test_ws_live_streams_a_turn(agent, monkeypatch):
         while (m := _json.loads(ws.receive_text()))["type"] != "state":
             pass
         assert m["state"] == "listening"
-
-
-def test_runtime_kokoro_voice_speaks_each_phrase(tiny_models, tmp_path, cpu, monkeypatch):
-    """runtime.voice=kokoro: the thinker's streamed text is cut into phrases and each is spoken (TTS stubbed)."""
-    import s2s.runtime.agent as agent_mod
-    import s2s.runtime.tts as tts_mod
-    from s2s.runtime.agent import VoiceAgent
-
-    spoken = []
-
-    class FakeKokoro:
-        sample_rate = 24000
-
-        def __init__(self, voice, speed, device):
-            self.voice = voice
-
-        def speak(self, text):
-            spoken.append(text)
-            return np.full(2400 * len(text.split()), 0.1, np.float32)
-
-    monkeypatch.setattr(tts_mod, "KokoroVoice", FakeKokoro)
-    th = Thinker(tiny_models["qwen"], cpu, torch.float32)
-    speech_dir = tmp_path / "speech"
-    os.makedirs(speech_dir)
-    ad = SpeechAdapter(64, th.hidden_size, d_model=32, n_layers=1, n_heads=4)
-    ad.init_scale(th.text_embedding_rms())
-    ad.save(str(speech_dir / "adapter.pt"))
-    cfg = load_config(os.path.join(ROOT, "configs", "default.yaml"), [
-        f"codec.model={tiny_models['mimi']}", f"thinker.model={tiny_models['qwen']}", "device=cpu",
-        "runtime.endpoint.vad=energy", "runtime.voice=kokoro"])
-    agent = VoiceAgent(cfg, str(speech_dir), str(tmp_path / "no_talker"))  # no talker needed
-    assert agent.talker is None
-    p = agent.thinker.prompts
-    script = p.ids("Sure, one moment please. Two towels are on the way.") + [p.im_end_id]
-    monkeypatch.setattr(agent_mod, "sample_logits", lambda *a, **k: script.pop(0) if script else p.im_end_id)
-    session = agent.new_session(context="test", tools=None)
-    events = list(session.respond(np.zeros(24000, np.float32)))
-    audio = [e for e in events if e["type"] == "audio"]
-    assert spoken == ["Sure, one moment please.", "Two towels are on the way."]
-    assert [e["text"] for e in audio] == spoken and all(e["sample_rate"] == 24000 for e in audio)
-    assert [e["text"] for e in events if e["type"] == "assistant_text"] == ["Sure, one moment please. Two towels are on the way."]
 
 
 def test_unclear_audio_gets_asked_again_without_tool_calls(agent, monkeypatch):

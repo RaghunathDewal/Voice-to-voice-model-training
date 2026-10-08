@@ -366,11 +366,6 @@ python -m s2s.cli.ws_live $CFG --speech-llm-dir checkpoints/speech_llm_pk4 --tal
 # or your own schemas: --tools-file my_tools.json  (OpenAI-style function list)
 ```
 
-Reply voice: add `--voice kokoro` (needs `pip install -e ".[tts]"`) to have Kokoro-82M speak the
-thinker's text instead of our talker. The reply is cut into phrases while the thinker streams, and each
-phrase is spoken as soon as it is complete (`s2s/runtime/tts.py`). It sounds like the voice the talker
-was trained to imitate, at a similar size.
-
 A request with no matching tool gets "I can't do that myself, but <your hand-over team> can help"; a
 fact missing from the prompt gets "I don't have that information". Training data:
 `s2s/data/hotel_v3.py` (random property profiles, prompt formats, personas and tool subsets).

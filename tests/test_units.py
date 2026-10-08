@@ -227,27 +227,6 @@ def test_ws_live_prompt_and_tool_options(tmp_path):
     assert select_tools("all", str(custom))[0]["function"]["name"] == "open_gate"
 
 
-def test_phrase_chunker_cuts_streamed_text_into_phrases():
-    from s2s.runtime.tts import PhraseChunker
-
-    pieces = ["Sure", ",", " I", "'ve", " ordered", " two", " towels", ";", " they", " arrive", " at", " 1", "1", ":",
-              "3", "0", " AM", ".", " Your", " Wi", "-Fi", " password", " is", " otter", "2", "0", "2", "6", "."]
-    c = PhraseChunker()
-    phrases = [p for piece in pieces for p in c.push(piece)] + c.flush()
-    # first phrase as soon as a clause has 2 words; times are never split; the rest by sentence
-    assert phrases == ["Sure, I've ordered two towels;", "they arrive at 11:30 AM.", "Your Wi-Fi password is otter2026."]
-    assert "".join(pieces).replace(" ", "") == "".join(phrases).replace(" ", "")
-
-
-def test_phrase_chunker_long_text_without_punctuation_and_empty():
-    from s2s.runtime.tts import PhraseChunker
-
-    c = PhraseChunker(max_words=5)
-    out = [p for w in "one two three four five six seven".split() for p in c.push(" " + w)] + c.flush()
-    assert out == ["one two three four five", "six seven"]
-    assert PhraseChunker().flush() == [] and PhraseChunker().push("...") == []
-
-
 def test_compact_tool_result():
     from s2s.runtime.agent import compact_result
 

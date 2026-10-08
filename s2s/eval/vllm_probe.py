@@ -59,7 +59,6 @@ def prepare(argv: list[str]) -> None:
     p.add_argument("--max-new-tokens", type=int, default=60)
     args = p.parse_args(argv)
     cfg = config_from_args(args)
-    cfg.runtime.voice = "talker"
     agent = VoiceAgent(cfg, args.speech_llm_dir, args.talker_dir)
     th, ad = agent.thinker, agent.adapter
     tools = select_tools(args.tools, None)
