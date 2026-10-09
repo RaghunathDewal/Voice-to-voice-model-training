@@ -44,7 +44,7 @@ uv pip install torch torchaudio --index-url "$TORCH_INDEX"
 uv pip install -q --no-deps liquid-audio
 uv pip install -q "accelerate>=1.10.1" "datasets>=4.8.4" "einops>=0.8.1" "librosa>=0.11.0" \
   "sentencepiece>=0.2.1" "transformers>=4.55.4" safetensors soundfile jiwer numpy \
-  fastapi uvicorn silero-vad scipy pyyaml tqdm   # the live UI server (ws_live --backend lfm)
+  fastapi uvicorn websockets silero-vad scipy pyyaml tqdm   # the live UI server (ws_live --backend lfm)
 
 python - <<'EOF'
 import torch, liquid_audio, transformers
