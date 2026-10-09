@@ -329,6 +329,10 @@ def stage_train(args) -> None:
     dev = device()
     model = LFM2AudioModel.from_pretrained(HF_REPO, device=dev, dtype=torch.float32)
     model.conf.text_loss_multiplier = args.text_loss_weight
+    # fp32 weights + bf16 autocast: liquid-audio's _prefill writes the audio adapter's output (bf16 under
+    # autocast) into a buffer typed like the text embeddings (fp32) -> keep the adapter output in fp32
+    _adapter_forward = model.audio_adapter.forward
+    model.audio_adapter.forward = lambda *a, **k: _adapter_forward(*a, **k).float()
     if args.freeze_encoder:  # keep the (already good) hearing; train the adapter, LM, audio head
         for p in model.conformer.parameters():
             p.requires_grad_(False)
