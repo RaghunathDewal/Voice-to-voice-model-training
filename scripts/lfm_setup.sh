@@ -30,7 +30,10 @@ if ! command -v uv >/dev/null 2>&1; then
   curl -LsSf https://astral.sh/uv/install.sh | sh
 fi
 export PATH="$HOME/.local/bin:$PATH"
-uv venv -q -p 3.12 --seed --allow-existing ~/lfm-venv
+# uv's own (managed) Python ships the C headers that torch.compile / Triton need to build GPU kernels;
+# the OS Python on many images does not (error: "Python.h: No such file or directory")
+uv python install 3.12
+uv venv -q -p 3.12 --managed-python --seed --clear ~/lfm-venv
 # shellcheck disable=SC1090
 source ~/lfm-venv/bin/activate
 

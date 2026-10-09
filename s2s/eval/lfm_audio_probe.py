@@ -306,7 +306,13 @@ class LFM:
                     first_audio = now() - t0
                 if use_mimi and not bool((t == EOS_AUDIO).any()):
                     s = now()
-                    self.mimi.decode(t[None, :, None])
+                    try:
+                        self.mimi.decode(t[None, :, None])
+                    except Exception as e:  # noqa: BLE001 - e.g. kernel compilation unavailable
+                        print(f"[lfm] Mimi streaming decode failed ({type(e).__name__}); first-audible time "
+                              "not measured from here on")
+                        self.mimi, use_mimi = None, False
+                        continue
                     sync()
                     decode_s.append(now() - s)
                     if first_audible is None:
