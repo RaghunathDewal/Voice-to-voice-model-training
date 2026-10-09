@@ -42,6 +42,15 @@ def is_distributed() -> bool:
     return dist.is_available() and dist.is_initialized()
 
 
+def broadcast_int(value: int, device: torch.device) -> int:
+    """Rank 0's value on every rank (so all ranks take the same decision); the value itself without DDP."""
+    if not is_distributed():
+        return int(value)
+    t = torch.tensor([int(value)], dtype=torch.long, device=device)
+    dist.broadcast(t, 0)
+    return int(t.item())
+
+
 def barrier() -> None:
     if is_distributed():
         dist.barrier()

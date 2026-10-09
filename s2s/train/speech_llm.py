@@ -47,7 +47,7 @@ from s2s.models.adapter import SpeechAdapter
 from s2s.models.speech_llm import assemble_inputs, greedy_generate, speech_llm_losses
 from s2s.models.thinker import Thinker
 from s2s.text import ctc_greedy_decode, wer
-from s2s.train.common import fmt, make_grad_scaler, optimizer_step
+from s2s.train.common import apply_time_budget, fmt, make_grad_scaler, optimizer_step
 from s2s.utils import autocast_ctx, cosine_lr, count_params, resolve_dtype, save_json, set_seed
 
 
@@ -73,8 +73,12 @@ def build_models(cfg, device, dtype, init_from: str | None, train_lora: bool, la
                       new_lora=dict(cfg.thinker.lora) if train_lora else None,
                       attn_implementation=cfg.thinker.attn_implementation)
     if init_from and os.path.exists(os.path.join(init_from, "adapter.pt")):
-        adapter = SpeechAdapter.load(os.path.join(init_from, "adapter.pt"))
-        print(f"loaded adapter from {init_from}")
+        adapter = SpeechAdapter.load(os.path.join(init_from, "adapter.pt"), llm_dim=thinker.hidden_size)
+        if adapter.fresh_params:  # trained for another thinker: keep the speech encoder, new output layer
+            adapter.init_scale(thinker.text_embedding_rms())
+            print(f"warm start from {init_from} (other thinker): fresh {adapter.fresh_params}")
+        else:
+            print(f"loaded adapter from {init_from}")
     else:
         adapter = SpeechAdapter.from_config(cfg.adapter, latent_dim, thinker.hidden_size)
         adapter.init_scale(thinker.text_embedding_rms())
@@ -219,6 +223,7 @@ def main() -> None:
         gnorm = optimizer_step(opt, scaler, adapter_params + lora_params, tc.max_grad_norm)
         step += 1
         arm_watchdog()
+        apply_time_budget(tc, step, t0, device, log)
         if step % tc.log_every == 0:
             avg = {k: v / tc.log_every for k, v in running.items()}
             log(f"step {step} {fmt(avg)} gnorm {gnorm:.2f} lr_scale {scale:.3f} {(time.time() - t0) / step:.2f}s/step")

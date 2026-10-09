@@ -1,0 +1,14 @@
+# Qwen3-4B-Instruct-2507 as the thinker, used as is (no fine-tuning), with the small adapter and talker.
+# The adapter and talker are trained for this exact thinker: scripts/kaggle_4b_train.sh.
+base: small.yaml
+
+thinker:
+  model: Qwen/Qwen3-4B-Instruct-2507
+
+adapter:
+  encoder: parakeet:nvidia/parakeet-ctc-0.6b
+  max_frames: 400             # 32 s: keeps the longest batches inside a 16 GB T4
+
+runtime:
+  speech_llm_dir: checkpoints/speech_llm_4b
+  talker_dir: checkpoints/talker_4b

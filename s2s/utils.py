@@ -118,3 +118,12 @@ def save_json(path: str, obj: Any) -> None:
 def load_json(path: str) -> Any:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def load_matching(model: "torch.nn.Module", state_dict: dict) -> list[str]:
+    """Load every tensor whose name and shape match; return the names left at their fresh init.
+    Used to warm-start a component when only its connection to the thinker changed size."""
+    own = model.state_dict()
+    keep = {k: v for k, v in state_dict.items() if k in own and own[k].shape == v.shape}
+    model.load_state_dict(keep, strict=False)
+    return sorted(k for k in own if k not in keep)

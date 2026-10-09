@@ -192,10 +192,22 @@ class Talker(nn.Module):
         torch.save({"hparams": self.hparams, "state_dict": self.state_dict()}, path)
 
     @classmethod
-    def load(cls, path: str, map_location="cpu") -> "Talker":
+    def load(cls, path: str, map_location="cpu", llm_dim: int | None = None) -> "Talker":
+        """llm_dim: the thinker width to build for. When it differs from the checkpoint's (another thinker),
+        every weight that still fits is loaded and the thinker-facing layers start fresh; their names
+        are in `model.fresh_params` (empty for a normal load)."""
+        from s2s.utils import load_matching
+
         ckpt = torch.load(path, map_location=map_location, weights_only=False)
-        model = cls(**ckpt["hparams"])
+        hp = dict(ckpt["hparams"])
+        if llm_dim is not None and llm_dim != hp["llm_dim"]:
+            hp["llm_dim"] = llm_dim
+            model = cls(**hp)
+            model.fresh_params = load_matching(model, ckpt["state_dict"])
+            return model
+        model = cls(**hp)
         model.load_state_dict(ckpt["state_dict"])
+        model.fresh_params = []
         return model
 
 

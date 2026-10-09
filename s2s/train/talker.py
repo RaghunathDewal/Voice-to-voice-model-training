@@ -32,14 +32,16 @@ from s2s.data.datasets import TalkerDataset, collate_talker, load_manifest, load
 from s2s.models.speech_llm import talker_features
 from s2s.models.talker import Talker, TalkerStream, apply_delay
 from s2s.models.thinker import Thinker
-from s2s.train.common import fmt, make_grad_scaler, optimizer_step
+from s2s.train.common import apply_time_budget, fmt, make_grad_scaler, optimizer_step
 from s2s.utils import (autocast_ctx, cosine_lr, count_params, load_json, resolve_dtype,
                        save_json, set_seed)
 
 
 def resolve_thinker_path(cfg) -> str:
     path = cfg.train_talker.thinker_dir
-    if path and os.path.isdir(path):
+    if not path:  # null: the base thinker as is (e.g. Qwen3-4B-Instruct, not fine-tuned)
+        return cfg.thinker.model
+    if os.path.isdir(path):
         return path
     print(f"WARNING: merged thinker '{path}' not found; using base {cfg.thinker.model}. "
           "If you later change the thinker (LoRA), retrain the talker.")
@@ -129,9 +131,14 @@ def main() -> None:
     K = int(cfg.codec.num_codebooks)
 
     if tc.init_from and os.path.exists(os.path.join(tc.init_from, "talker.pt")):
-        talker = Talker.load(os.path.join(tc.init_from, "talker.pt"))
+        talker = Talker.load(os.path.join(tc.init_from, "talker.pt"), llm_dim=thinker.hidden_size)
         meta = load_json(os.path.join(tc.init_from, "meta.json"))
-        if meta.get("layer_idx") != layer_idx:
+        if talker.fresh_params:  # trained for another thinker: keep the voice, new input layers
+            if talker.hparams["n_hidden_layers"] != len(layer_idx):
+                raise ValueError(f"init_from talker fuses {talker.hparams['n_hidden_layers']} thinker layers, "
+                                 f"config gives {len(layer_idx)}")
+            log(f"warm start from {tc.init_from} (other thinker): fresh {talker.fresh_params}")
+        elif meta.get("layer_idx") != layer_idx:
             raise ValueError(f"init_from talker used layers {meta.get('layer_idx')}, config gives {layer_idx}")
     else:
         talker = Talker.from_config(cfg.talker, thinker.hidden_size, len(layer_idx), K, codec_card(cfg))
@@ -204,6 +211,7 @@ def main() -> None:
         gnorm = optimizer_step(opt, scaler, params, tc.max_grad_norm)
         step += 1
         arm_watchdog()
+        apply_time_budget(tc, step, t0, device, log)
         if step % tc.log_every == 0:
             avg = {k: v / tc.log_every for k, v in running.items()}
             log(f"step {step} {fmt(avg)} gnorm {gnorm:.2f} lr_scale {scale:.3f} {(time.time() - t0) / step:.2f}s/step")

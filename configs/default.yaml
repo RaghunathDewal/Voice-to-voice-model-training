@@ -84,6 +84,7 @@ train_speech_llm:
   weight_decay: 0.01
   warmup_steps: 500
   max_steps: 20000
+  max_minutes: 0            # >0: fit the run into this many minutes (shrinks max_steps during warm-up)
   max_grad_norm: 1.0
   transcribe_prob: 0.3      # fraction of samples trained on the transcription task
   ctc_weight: 0.3
@@ -109,6 +110,7 @@ train_talker:
   weight_decay: 0.01
   warmup_steps: 1000
   max_steps: 60000
+  max_minutes: 0
   max_grad_norm: 1.0
   max_frames: 375           # clips longer than 30 s are skipped
   eval_every: 2000
