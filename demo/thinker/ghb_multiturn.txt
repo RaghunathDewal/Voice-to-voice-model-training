@@ -1,0 +1,9 @@
+# One conversation (run with --multi-turn): confirmations, no second greeting, context kept.
+Hi!
+There are no towels in the bathroom.
+Yes please, two of them.
+Also, the AC isn't cooling.
+Yes, please report it.
+Hello again, what time is checkout?
+Did the towels get ordered?
+Thanks, that's all.

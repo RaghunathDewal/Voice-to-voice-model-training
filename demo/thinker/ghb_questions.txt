@@ -1,0 +1,44 @@
+# Single-turn checks for a deployment prompt like ARIA's (each line = a new conversation).
+# Expected behaviour is in the comment above each line.
+# greeting by name
+Hi there!
+# empty wifi fields -> "I apologize, but I don't have that information at the moment..."
+What's the wifi password?
+# reservation data: checkout date
+When is my checkout?
+# reservation data: unit address
+What's the address of the apartment?
+# reservation data: house rules
+Are there any house rules I should know about?
+# reservation data: guest count
+How many guests are on my booking?
+# rule 8: late checkout -> front desk, no promise
+Can I get a late checkout tomorrow?
+# not in the data -> say so, offer support; no invented places
+Can you recommend a good restaurant nearby?
+# scenario 2: browse_products
+What can I order to the apartment?
+# scenario 1, explicit: browse_products then place_product_order (exact productName)
+Please send two extra towels.
+# scenario 1, implicit: browse_products, then ASK before ordering (no place_product_order yet)
+There are no towels in the bathroom.
+# scenario 1, not available: browse, say it isn't available, list what is
+Can I order a bottle of champagne?
+# scenario 3: get_orders_by_reservation, no new order
+Did my towel order arrive yet?
+# scenario 4, not explicit: ask "shall I report it?" before report_unit_issue
+The AC isn't cooling at all.
+# scenario 4, explicit: report_unit_issue with a full sentence, priority High
+Please report that there's no hot water in the shower.
+# scenario 4, three problems -> three separate report_unit_issue calls
+Please report these: the TV won't turn on, the sink is clogged and the bedroom lamp is broken.
+# scenario 5: get_reported_issues_by_reservation, no duplicate filing
+Is there any update on the problem I reported earlier?
+# vague issue -> one clarifying question, no filing
+Something's wrong in the bathroom.
+# rule 4: escalation
+This is the third time I'm asking, I want to talk to a real person.
+# language rule: answer in Spanish
+Hola, ¿a qué hora es el check-out?
+# language rule: answer in Dutch
+Hallo, wat is het adres van het appartement?
