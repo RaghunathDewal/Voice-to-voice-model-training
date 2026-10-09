@@ -9,6 +9,7 @@
 # Every stage is resumable: re-running skips finished audio clips. Extra args go to every stage, e.g.
 #   bash scripts/lfm_finetune.sh --n-ghb 4000 --epochs 4
 set -euo pipefail
+export PYTHONUNBUFFERED=1   # show progress in the log immediately (nohup writes to a file)
 cd "$(dirname "$0")/.."
 WORK=${WORK:-$HOME/lfm_ft}
 STAGES=${STAGES:-"data voice build train eval"}
