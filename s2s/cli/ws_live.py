@@ -55,7 +55,10 @@ from s2s.audio import resample
 from s2s.cli_common import base_parser, config_from_args
 from s2s.data.hotel import HOTEL_TOOLS, HotelBackend, make_reservation, reservation_context
 from s2s.data.hotel_v3 import GenericBackend, known_tools, select_tools  # noqa: F401  (re-exported)
-from s2s.runtime.agent import VoiceAgent
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # imported lazily: the LFM backend runs in an environment without our model stack
+    from s2s.runtime.agent import VoiceAgent
 from s2s.runtime.live import LiveListener
 
 STATIC = os.path.join(os.path.dirname(__file__), "static")
@@ -107,7 +110,8 @@ def save_turn(save_dir: str, wav: np.ndarray, sr: int, info: dict) -> str:
 
 
 def build_app(agent: VoiceAgent | None, system_prompt: str | None = None, tools: list | None = HOTEL_TOOLS,
-              demo_dir: str | None = None, save_turns: str | None = None, live_token: str | None = None) -> FastAPI:
+              demo_dir: str | None = None, save_turns: str | None = None, live_token: str | None = None,
+              make_backend=None) -> FastAPI:
     """system_prompt: replaces the default prompt AND the generated demo reservation (put the guest data in it)."""
     sr = agent.codec.sample_rate if agent is not None else 24000
     gpu_lock = threading.Lock()  # one model call at a time across connections
@@ -181,7 +185,8 @@ def build_app(agent: VoiceAgent | None, system_prompt: str | None = None, tools:
             def build():
                 with gpu_lock:  # taken in the worker thread, never on the event loop
                     if system_prompt:
-                        return agent.new_session(system_prompt=system_prompt, tools=tools, backend=GenericBackend(tools))
+                        backend = make_backend() if make_backend else GenericBackend(tools)
+                        return agent.new_session(system_prompt=system_prompt, tools=tools, backend=backend)
                     return agent.new_session(context=reservation_context(res), tools=tools, backend=HotelBackend(res))
 
             conv["session"] = await asyncio.to_thread(build)
@@ -344,6 +349,13 @@ def main() -> None:
     p.add_argument("--tools-file", default=None, help="JSON list of your own tool schemas (overrides --tools)")
     p.add_argument("--live-token", default=os.environ.get("S2S_LIVE_TOKEN"),
                    help="require this token on /live (?token= or Authorization: Bearer); default $S2S_LIVE_TOKEN")
+    p.add_argument("--backend", default="s2s", choices=["s2s", "lfm"],
+                   help="s2s: our Parakeet + adapter + thinker + talker; lfm: LFM2.5-Audio (base or fine-tuned)")
+    p.add_argument("--lfm-model-dir", default=None, help="fine-tuned LFM folder (lfm_finetune.py); default: base model")
+    p.add_argument("--lfm-end-silence-ms", type=float, default=500,
+                   help="lfm: silence that ends the guest's turn (LFM has no end-of-turn head)")
+    p.add_argument("--mock-results", default=None,
+                   help="JSON {tool_name: result} returned for tool calls, e.g. demo/thinker/mock_results_template.json")
     p.add_argument("--save-turns", default=None,
                    help="debug: save every user turn as heard by the server (WAV + JSON: length, end reason, level)")
     args = p.parse_args()
@@ -353,8 +365,21 @@ def main() -> None:
     import uvicorn
 
     prompt = load_prompt(args.system_prompt_file) if args.system_prompt_file else None
-    app = build_app(VoiceAgent(cfg, args.speech_llm_dir, args.talker_dir), prompt, select_tools(args.tools, args.tools_file), args.demo_dir,
-                    args.save_turns, args.live_token)
+    if args.backend == "lfm":
+        from s2s.runtime.lfm_agent import LFMAgent
+
+        agent = LFMAgent(cfg, args.lfm_model_dir, end_silence_ms=args.lfm_end_silence_ms)
+    else:
+        from s2s.runtime.agent import VoiceAgent
+
+        agent = VoiceAgent(cfg, args.speech_llm_dir, args.talker_dir)
+    make_backend = None
+    if args.mock_results:
+        from s2s.runtime.lfm_agent import CannedBackend
+
+        make_backend = lambda: CannedBackend(args.mock_results)  # noqa: E731
+    app = build_app(agent, prompt, select_tools(args.tools, args.tools_file), args.demo_dir,
+                    args.save_turns, args.live_token, make_backend)
     if args.tunnel:
         start_tunnel(args.port)
     print(f"serving on http://localhost:{args.port}  (use --tunnel for a public https link)", flush=True)
