@@ -87,27 +87,30 @@ def skip_peft_tp_sharding_without_tp() -> None:
     save_and_load._maybe_shard_state_dict_for_tp = maybe_shard
 
 
-def load_causal_lm(name_or_path: str, dtype: torch.dtype, device: torch.device, attn_implementation: str = "sdpa"):
+def load_causal_lm(name_or_path: str, dtype: torch.dtype, device: torch.device, attn_implementation: str = "sdpa",
+                   device_map: str | None = None):
+    """device_map="auto" spreads the layers over all visible GPUs (e.g. Kaggle's 2x T4) instead of one."""
     from transformers import AutoModelForCausalLM
 
     model = AutoModelForCausalLM.from_pretrained(
-        name_or_path, attn_implementation=attn_implementation, **_dtype_kwargs(dtype)
+        name_or_path, attn_implementation=attn_implementation, **_dtype_kwargs(dtype),
+        **({"device_map": device_map} if device_map else {}),
     )
-    return model.to(device)
+    return model if device_map else model.to(device)
 
 
 class Thinker:
     def __init__(self, model_name: str, device: torch.device, dtype: torch.dtype,
                  lora_dir: str | None = None, new_lora: dict | None = None,
                  merge_lora: bool = False, attn_implementation: str = "sdpa",
-                 tokenizer_name: str | None = None):
+                 tokenizer_name: str | None = None, device_map: str | None = None):
         from transformers import AutoTokenizer
 
         self.device = device
         self.dtype = dtype
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name or model_name)
         self.prompts = PromptBuilder(self.tokenizer)
-        model = load_causal_lm(model_name, dtype, device, attn_implementation)
+        model = load_causal_lm(model_name, dtype, device, attn_implementation, device_map)
         for p in model.parameters():
             p.requires_grad_(False)
         if lora_dir or new_lora:

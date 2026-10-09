@@ -54,9 +54,13 @@ MAX_NEW = 150
 def generate(thinker: Thinker, messages: list[dict], tools: list | None, max_new: int | None = None) -> str:
     text = thinker.prompts._render(messages, tools, add_generation_prompt=True)
     ids = torch.tensor([thinker.prompts.ids(text)], device=thinker.device)
-    out = thinker.model.generate(ids, max_new_tokens=max_new or MAX_NEW, do_sample=False, use_cache=True,
-                                 eos_token_id=sorted(thinker.eos_ids), pad_token_id=thinker.pad_id)
-    return thinker.tokenizer.decode(out[0, ids.shape[1]:], skip_special_tokens=False).replace("<|im_end|>", "").strip()
+    try:
+        out = thinker.model.generate(ids, max_new_tokens=max_new or MAX_NEW, do_sample=False, use_cache=True,
+                                     eos_token_id=sorted(thinker.eos_ids), pad_token_id=thinker.pad_id)
+        return thinker.tokenizer.decode(out[0, ids.shape[1]:], skip_special_tokens=False).replace("<|im_end|>", "").strip()
+    finally:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 def _succeeded(result) -> bool:
@@ -136,12 +140,13 @@ def main() -> None:
     p.add_argument("--multi-turn", action="store_true", help="with --questions: keep one conversation")
     p.add_argument("--voice-rules", action="store_true", help="append guards.VOICE_RULES to the system prompt")
     p.add_argument("--guards", action="store_true", help="check replies (claimed actions, invented details)")
+    p.add_argument("--device-map", default=None, help="auto = split the model over all GPUs (Kaggle 2x T4)")
     p.add_argument("--max-new", type=int, default=150, help="max new tokens per generation")
     args = p.parse_args()
     cfg = config_from_args(args)
     device = resolve_device(cfg.device)
     thinker = Thinker(args.model or cfg.thinker.model, device, resolve_dtype(cfg.thinker.dtype, device),
-                      attn_implementation=cfg.thinker.attn_implementation)
+                      attn_implementation=cfg.thinker.attn_implementation, device_map=args.device_map)
     thinker.model.eval()
     system = load_prompt(args.system_prompt_file)
     if args.voice_rules:
