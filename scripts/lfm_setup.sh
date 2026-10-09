@@ -18,8 +18,11 @@ fi
 echo "== GPU: $GPU, PyTorch wheels from $TORCH_INDEX"
 
 export DEBIAN_FRONTEND=noninteractive
+# OS packages are optional (soundfile ships libsndfile); broken third-party apt sources on some images must
+# not stop the setup, so failures here only print a note
 if command -v apt-get >/dev/null 2>&1; then
-  apt-get update -qq && apt-get install -y -qq git curl ffmpeg libsndfile1 >/dev/null
+  apt-get update -qq >/dev/null 2>&1 || echo "(apt update reported errors from other repositories; continuing)"
+  apt-get install -y -qq git curl libsndfile1 >/dev/null 2>&1 || echo "(apt install skipped; continuing)"
 fi
 
 # liquid-audio needs Python >= 3.12; uv brings its own Python, independent of the OS one
@@ -27,13 +30,14 @@ if ! command -v uv >/dev/null 2>&1; then
   curl -LsSf https://astral.sh/uv/install.sh | sh
 fi
 export PATH="$HOME/.local/bin:$PATH"
-uv venv -q -p 3.12 --seed ~/lfm-venv
+uv venv -q -p 3.12 --seed --allow-existing ~/lfm-venv
 # shellcheck disable=SC1090
 source ~/lfm-venv/bin/activate
 
 # torch + torchaudio for this GPU first, then liquid-audio WITHOUT its deps (so pip never swaps in a
 # CPU / wrong-GPU torch), then the remaining deps explicitly
-uv pip install -q torch torchaudio --index-url "$TORCH_INDEX"
+echo "== installing PyTorch for $GPU (3-4 GB download, a few minutes)"
+uv pip install torch torchaudio --index-url "$TORCH_INDEX"
 uv pip install -q --no-deps liquid-audio
 uv pip install -q "accelerate>=1.10.1" "datasets>=4.8.4" "einops>=0.8.1" "librosa>=0.11.0" \
   "sentencepiece>=0.2.1" "transformers>=4.55.4" safetensors soundfile jiwer numpy
