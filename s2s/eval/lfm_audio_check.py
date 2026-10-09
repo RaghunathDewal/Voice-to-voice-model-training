@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import time
 from pathlib import Path
 
 import numpy as np
@@ -40,6 +41,7 @@ def main() -> None:
     p.add_argument("--tools-file", default="demo/thinker/tools_template.json")
     p.add_argument("--out", default=os.path.expanduser("~/lfm_check"))
     p.add_argument("--max-new-tokens", type=int, default=600)
+    p.add_argument("--only", nargs="*", default=None, help="run only these variants, e.g. --only p_user p_2pass")
     p.add_argument("--whisper", default="openai/whisper-large-v3-turbo")
     args = p.parse_args()
 
@@ -57,9 +59,11 @@ def main() -> None:
         proc, model = base_proc, base
     mimi = proc.mimi.eval()
 
-    def chat(system: str, text: str | None = None, wav: np.ndarray | None = None):
+    def chat(system: str, text: str | None = None, wav: np.ndarray | None = None, prefix: str | None = None):
         c = ChatState(proc)
         c.new_turn("system"), c.add_text(system), c.end_turn(), c.new_turn("user")
+        if prefix:
+            c.add_text(prefix)
         if wav is not None:
             c.add_audio(torch.from_numpy(wav)[None], OUT_SR)
         else:
@@ -95,19 +99,45 @@ def main() -> None:
         with mimi.streaming(1):
             return np.concatenate([mimi.decode(f[None, :, None])[0, 0].float().cpu().numpy() for f in frames])
 
-    variants = [("stock", lambda **k: model.generate_interleaved(**k), INTERLEAVED),
-                ("hybrid", lambda **k: generate_hybrid(model, **k), INTERLEAVED)]
+    hybrid = lambda **k: generate_hybrid(model, **k)  # noqa: E731
+    # (name, generator, system message, text before the guest's audio in the user turn, two-pass TTS)
+    variants = [("stock", lambda **k: model.generate_interleaved(**k), INTERLEAVED, None, False),
+                ("hybrid", hybrid, INTERLEAVED, None, False)]
     if args.prompt_file:
-        sys_prompt, _ = setup_for(load_prompt(Path(os.path.expanduser(args.prompt_file))),
-                                  load_tools(Path(args.tools_file)), "system")
-        variants.append(("prompt", lambda **k: generate_hybrid(model, **k), sys_prompt))
+        prompt, tools = load_prompt(Path(os.path.expanduser(args.prompt_file))), load_tools(Path(args.tools_file))
+        sys_prompt, _ = setup_for(prompt, tools, "system")
+        user_sys, user_prefix = setup_for(prompt, tools, "user")
+        variants += [("prompt", hybrid, sys_prompt, None, False),          # prompt in the system message
+                     ("p_user", hybrid, user_sys, user_prefix, False),     # prompt in the guest's turn
+                     ("p_2pass", hybrid, sys_prompt, None, True),          # text with the prompt, then LFM TTS
+                     ("pu_2pass", hybrid, user_sys, user_prefix, True)]
 
+    @torch.no_grad()
+    def speak(text: str) -> tuple[list, float]:
+        """Two-pass: LFM's own TTS mode (short system line) speaks the reply text; returns frames, first-frame s."""
+        c = ChatState(proc)
+        c.new_turn("system"), c.add_text("Perform TTS. Use the US female voice."), c.end_turn()
+        c.new_turn("user"), c.add_text(text), c.end_turn(), c.new_turn("assistant")
+        t0, first, fr = time.perf_counter(), None, []
+        for t in model.generate_sequential(**c, max_new_tokens=1024, audio_temperature=0.8, audio_top_k=64):
+            if t.numel() > 1 and not bool((t == EOS_AUDIO).any()):
+                first = first or time.perf_counter() - t0
+                fr.append(t)
+        return fr, first or 0.0
+
+    if args.only:
+        variants = [v for v in variants if v[0] in args.only]
     rows = []
     for qi, q in enumerate(QUESTIONS):
         qwav = tts(q)
         sf.write(out / f"q{qi}.wav", qwav, OUT_SR)
-        for name, gen, system in variants:
-            text, frames = run(gen, chat(system, wav=qwav))
+        for name, gen, system, prefix, two_pass in variants:
+            t0 = time.perf_counter()
+            text, frames = run(gen, chat(system, wav=qwav, prefix=prefix))
+            gen_s = time.perf_counter() - t0
+            if two_pass:  # keep the text (said with the prompt), re-speak it with the short TTS context
+                frames, first = speak(spoken(text))
+                print(f"q{qi} {name:8s} text in {gen_s:.1f} s, TTS first frame {1000 * first:.0f} ms", flush=True)
             for dec, fn in (("detok", decode_detok), ("mimi", decode_mimi)):
                 w = fn(frames)
                 path = out / f"q{qi}_{name}_{dec}.wav"
@@ -115,7 +145,7 @@ def main() -> None:
                 rows.append({"q": q, "gen": name, "decoder": dec, "text": spoken(text), "frames": len(frames),
                              "seconds": round(len(w) / OUT_SR, 2), "rms": round(float(np.sqrt(np.mean(w ** 2))), 4),
                              "peak": round(float(np.abs(w).max()), 3), "wav": str(path)})
-                print(f"q{qi} {name:6s} {dec:5s} | {len(frames):3d} frames {rows[-1]['seconds']:5.1f} s rms "
+                print(f"q{qi} {name:8s} {dec:5s} | {len(frames):3d} frames {rows[-1]['seconds']:5.1f} s rms "
                       f"{rows[-1]['rms']:.3f} | {spoken(text)[:90]}", flush=True)
 
     del model, base
@@ -135,7 +165,7 @@ def main() -> None:
             r["heard"] = asr({"raw": w16, "sampling_rate": 16_000},
                              generate_kwargs={"language": "en", "task": "transcribe"})["text"]
             r["wer"] = round(100 * jiwer.wer(norm(r["text"]) or "-", norm(r["heard"]) or "-"))
-        print(f"  {r['gen']:6s} {r['decoder']:5s} WER {r['wer'] if r['wer'] is not None else '-':>4} | heard: {r['heard'][:90]}")
+        print(f"  {r['gen']:8s} {r['decoder']:5s} WER {r['wer'] if r['wer'] is not None else '-':>4} | heard: {r['heard'][:90]}")
     summary = {}
     for r in rows:
         if r["wer"] is not None:
