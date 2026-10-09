@@ -92,10 +92,194 @@ def _join(names: list[str]) -> str:
     return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
 
 
+# --------------------------------------------------------------- note-style property prompts
+# Real deployment prompts are short notes ("Pool: indoor pool open 9 AM to 7 PM; children under 12 with an adult.")
+# and guests ask in their own words ("till when can we swim?"). topic -> rng -> (note line, spoken answer);
+# answers rephrase the note instead of copying it.
+def _t(rng, lo, hi, half=True):
+    h = rng.randint(lo, hi)
+    return v3._clock(h, 30 if half and rng.random() < 0.3 else 0), h
+
+
+def _note_reception(rng, c):
+    (o, _), (e, _) = _t(rng, 7, 9, False), _t(rng, 17, 22, False)
+    x = rng.randint(0, 9)
+    place = rng.choice(["main building", "lobby", "entrance", "welcome centre"])
+    note = rng.choice([f"staffed {o} to {e} in the {place}, dial {x}", f"{o}-{e}, {place}, extension {x}",
+                       f"in the {place}, {o} until {e} (call {x})"])
+    return note, f"Reception is open from {o} to {e}, and you can reach them on extension {x}."
+
+
+def _note_breakfast(rng, c):
+    (o, _), (e, _) = _t(rng, 6, 8), _t(rng, 10, 11)
+    place = rng.choice(["main restaurant", "Garden Room", "Terrace", "clubhouse", "Orangery"])
+    inc = rng.random() < 0.5
+    price = rng.choice([12, 15, 18])
+    note = rng.choice([f"{o}-{e}, {place}", f"served {o} until {e} in the {place}", f"{place}, from {o} till {e}"])
+    note += ", included in the rate" if inc else f" ({price} dollars pp)"
+    return note, f"Breakfast is served from {o} to {e} in the {place}" + (", and it's included." if inc else
+                                                                         f", for {price} dollars per person.")
+
+
+def _note_wifi(rng, c):
+    net = rng.choice(["Guest", "Lodge", "Park", "Resort", "Stay"]) + rng.choice(["WiFi", "-Guest", "Net", ""]) + \
+        rng.choice(["", "5G"])
+    pw = rng.choice(["heron", "maple", "sunny", "harbor", "pine", "birch", "falcon"]) + str(rng.randint(10, 2099))
+    note = rng.choice([f"SSID {net} / password {pw}", f"{net} (password {pw})", f"network {net}, key {pw}"])
+    return note, f"The Wi-Fi network is {net} and the password is {pw}."
+
+
+def _note_pool(rng, c):
+    (o, _), (e, _) = _t(rng, 7, 10, False), _t(rng, 18, 22, False)
+    kind = rng.choice(["indoor", "outdoor", "heated outdoor"])
+    note = rng.choice([f"{kind}, {o}-{e}; under-12s must be accompanied", f"{kind} pool {o} until {e} (kids need an adult)",
+                       f"{o} to {e}, {kind}, lifeguard on duty"])
+    return note, f"The {kind} pool is open from {o} to {e}." + \
+        (" Children under 12 need to be with an adult." if "lifeguard" not in note else "")
+
+
+def _note_pets(rng, c):
+    if rng.random() < 0.35:
+        return rng.choice(["no pets", "pets not permitted", "no animals except assistance dogs"]), \
+            "I'm sorry, pets aren't allowed here."
+    fee = rng.choice([10, 15, 20, 25])
+    u = c["unit_word"]
+    note = rng.choice([f"dogs welcome in pet-friendly {u}s, {fee} dollars a night", f"dogs OK in selected {u}s ({fee} dollars/night)",
+                       f"max one dog, {fee} dollars per night, pet {u}s only"])
+    return note, f"Yes, dogs are welcome in pet-friendly {u}s, for {fee} dollars per night."
+
+
+def _note_checkout(rng, c):
+    t, _ = _t(rng, 10, 12, False)
+    return rng.choice([f"by {t}", f"{t} latest", t]), f"Checkout is at {t} on your last day."
+
+
+def _note_checkin(rng, c):
+    t, _ = _t(rng, 14, 16, False)
+    return rng.choice([f"after {t}", f"{t} onwards", f"keys from {t}"]), f"Check-in starts at {t}."
+
+
+def _note_barbecue(rng, c):
+    u = c["unit_word"]
+    note = rng.choice([f"gas barbecue at every {u}, spare gas from the shop", f"every {u} has a gas grill; extra cylinders at the shop",
+                       f"charcoal grills at the picnic area, charcoal sold at the shop"])
+    say = (f"Every {u} has a gas barbecue, and you can buy extra gas at the shop." if "gas" in note else
+           "There are charcoal grills at the picnic area, and charcoal is sold at the shop.")
+    return note, say
+
+
+def _note_parking(rng, c):
+    if rng.random() < 0.5:
+        return rng.choice([f"free, one car per {c['unit_word']}", f"one free space per {c['unit_word']}"]), \
+            f"Parking is free, for one car per {c['unit_word']}."
+    p = rng.choice([5, 8, 10, 12])
+    return rng.choice([f"{p} dollars a night, main car park", f"main car park, {p} dollars/night"]), \
+        f"Parking is {p} dollars per night at the main car park."
+
+
+def _note_restaurant(rng, c):
+    name = rng.choice(["Lakeside Grill", "the Pines", "Olive Tree", "the Anchor", "Fern and Fire"])
+    (o, _), (e, _) = _t(rng, 17, 18), _t(rng, 21, 22, False)
+    note = rng.choice([f"{name}, dinner {o}-{e}, please reserve", f"{name} serves dinner {o} until {e} (booking advised)"])
+    return note, f"{name[0].upper() + name[1:]} serves dinner from {o} to {e}; booking is recommended."
+
+
+def _note_shop(rng, c):
+    (o, _), (e, _) = _t(rng, 7, 9, False), _t(rng, 18, 21, False)
+    return rng.choice([f"mini-market {o}-{e}", f"open {o} till {e}, groceries and basics"]), \
+        f"The shop is open from {o} to {e}."
+
+
+def _note_quiet(rng, c):
+    (o, _), (e, _) = _t(rng, 22, 23, False), _t(rng, 7, 8, False)
+    return rng.choice([f"{o}-{e}", f"between {o} and {e}"]), f"Quiet hours are from {o} to {e}."
+
+
+def _note_bikes(rng, c):
+    p = rng.choice([8, 10, 12, 15])
+    return rng.choice([f"{p} dollars per day, ask at the shop", f"bike hire {p} dollars/day"]), \
+        f"You can rent bikes for {p} dollars a day."
+
+
+def _note_sauna(rng, c):
+    (o, _), (e, _) = _t(rng, 10, 15, False), _t(rng, 20, 22, False)
+    return rng.choice([f"{o}-{e}, 18+ only", f"adults only, {o} until {e}"]), \
+        f"The sauna is open from {o} to {e}, for adults only."
+
+
+_NOTES = {"reception": ("Reception", _note_reception), "breakfast": ("Breakfast", _note_breakfast),
+          "wifi": ("Wi-Fi", _note_wifi), "pool": ("Pool", _note_pool), "pets": ("Pets", _note_pets),
+          "checkout": ("Checkout", _note_checkout), "checkin": ("Check-in", _note_checkin),
+          "barbecue": ("Barbecue", _note_barbecue), "parking": ("Parking", _note_parking),
+          "restaurant": ("Restaurant", _note_restaurant), "shop": ("Shop", _note_shop),
+          "quiet": ("Quiet hours", _note_quiet), "bikes": ("Bikes", _note_bikes), "sauna": ("Sauna", _note_sauna)}
+# many ways to ask; deliberately not the words used in the note
+_NOTE_Q = {
+    "reception": ["When is reception open?", "How do I call the front desk?", "Is reception open now?",
+                  "What's the number for reception?", "Until when can I reach reception?", "Where's the reception?"],
+    "breakfast": ["What time is breakfast?", "When can we eat in the morning?", "Where do we have breakfast?",
+                  "Is breakfast included?", "Till when is breakfast served?", "When does breakfast start?",
+                  "Can we still get breakfast at ten?"],
+    "wifi": ["What's the wifi password?", "How do I get on the internet?", "What's the network name?",
+             "Can you give me the wifi details?", "The internet password, please?", "How do I connect my phone?"],
+    "pool": ["Till when can we swim?", "Is there a pool?", "When does the pool close?", "Can the kids go swimming now?",
+             "What time does the pool open?", "Can we go for a swim this evening?", "Where can we swim?",
+             "Is the swimming pool open in the morning?"],
+    "pets": ["Can I bring my dog?", "Is it extra for the dog?", "Are pets allowed?", "Can our dog stay with us?",
+             "Do you allow dogs, and what does it cost?"],
+    "checkout": ["When do we have to leave on the last day?", "What time is checkout?", "By when do we need to be out?",
+                 "What time do we have to check out?", "How late can we stay on the last morning?"],
+    "checkin": ["When can we check in?", "What time can we get the keys?", "From when can we arrive?",
+                "Can we check in early?"],
+    "barbecue": ["Is there a barbecue?", "Can we grill tonight?", "Where do I get gas for the barbecue?",
+                 "The barbecue is out of gas, where can I get more?", "Do we have a grill?"],
+    "parking": ["Where can I park?", "Is parking free?", "How much is parking?", "Can I park next to the lodge?"],
+    "restaurant": ["Is there a restaurant?", "Where can we have dinner?", "When is dinner served?",
+                   "Do we need to book for dinner?", "Can we eat on site tonight?"],
+    "shop": ["Is there a shop?", "Where can I buy milk?", "When does the shop close?", "Can I buy groceries here?"],
+    "quiet": ["Are there quiet hours?", "Until when can we make noise?", "From what time do we need to be quiet?",
+              "Is there a curfew for noise?"],
+    "bikes": ["Can we rent bikes?", "How much is a bike?", "Where can I get a bicycle?"],
+    "sauna": ["Is there a sauna?", "When is the sauna open?", "Can kids use the sauna?"],
+}
+
+
+def _note_system(rng, ctx, facts: dict) -> str:
+    """A deployment-style prompt: short rules, then the property as notes, then the guest as JSON or lines."""
+    who = f"You are {ctx.persona}, the voice concierge for {ctx.prop}, speaking with a guest out loud." if ctx.persona \
+        else f"You are the voice concierge for {ctx.prop}, speaking with a guest out loud."
+    rules = (f"Answer questions only from the information below. If something is not listed, say you don't have that "
+             f"information and that {ctx.handover} can help. Use a tool only when the guest asks for something one of "
+             f"your tools can do; otherwise say you can't do it yourself and that {ctx.handover} can help.\n"
+             "Keep replies to one or two short spoken sentences, with no markdown, lists or emojis.")
+    lines = [(_NOTES[t][0], facts[t][0]) for t in facts]
+    style = rng.random()
+    if style < 0.5:
+        prop = "\n".join(f"- {k}: {v}." for k, v in lines)
+    elif style < 0.75:
+        prop = "\n".join(f"{k}: {v}." for k, v in lines)
+    else:
+        prop = " ".join(f"{k}: {v}." for k, v in lines)
+    st = ctx.stay
+    guest = {"guest_name": st["guest_name"], ctx.unit_word: st["unit"], "arrival": st["check_in"],
+             "departure": st["check_out"], "guests": st["guests"], "balance_due": f"{st['balance_due']} USD"}
+    if rng.random() < 0.6:
+        g = json.dumps(guest, indent=1)
+    else:
+        g = "\n".join(f"{k.replace('_', ' ')}: {v}" for k, v in guest.items())
+    return f"{who}\n{rules}\n\nProperty information ({ctx.prop}):\n{prop}\n\nCurrent guest:\n{g}"
+
+
 class _Ghb:
-    def __init__(self, rng: random.Random):
+    def __init__(self, rng: random.Random, note_frac: float = 0.0):
         self.rng = rng
         self.ctx = v3._Ctx(rng)  # property, stay, persona, hand-over, system prompt
+        self.notes = None
+        self.system = self.ctx.system
+        if rng.random() < note_frac:  # deployment-style note prompt instead of the hotel_v3 prompt
+            topics = rng.sample(list(_NOTES), rng.randint(6, len(_NOTES) - 2))
+            self.notes = {t: _NOTES[t][1](rng, {"unit_word": self.ctx.unit_word}) for t in topics}
+            self.system = _note_system(rng, self.ctx, self.notes)
         pool = ghb_tools()
         names = [n for n, w in _TOOL_WEIGHT.items() if rng.random() < w] if rng.random() > 0.05 else []
         self.tools = {n: pool[n] for n in names}
@@ -253,6 +437,16 @@ class _Ghb:
         """Property facts, the guest's stay, small talk, staff-only / emergency / out-of-scope (hotel_v3)."""
         rng, ctx = self.rng, self.ctx
         r = rng.random()
+        if r < 0.62 and self.notes is not None:
+            if rng.random() < 0.8:
+                topic = rng.choice(list(self.notes))
+                q = rng.choice(_NOTE_Q[topic])
+                return {"user": _wrap(rng, q) if rng.random() < 0.4 else q,
+                        "assistant": [{"say": self.notes[topic][1]}], "kind": "fact"}
+            topic = rng.choice([t for t in _NOTE_Q if t not in self.notes] or list(_NOTE_Q))
+            say = rng.choice([f"I'm sorry, I don't have that information, but {self.h} can help.",
+                              f"I don't have details on that. {self.h[0].upper() + self.h[1:]} will know."])
+            return {"user": rng.choice(_NOTE_Q[topic]), "assistant": [{"say": say}], "kind": "unknown"}
         if r < 0.62:
             if rng.random() < 0.78 and ctx.profile:
                 topic = rng.choice(list(ctx.profile))
@@ -293,13 +487,13 @@ class _Ghb:
         return self.info()
 
 
-def generate_ghb(n: int, seed: int = 0, max_turns: int = 3) -> list[dict]:
+def generate_ghb(n: int, seed: int = 0, max_turns: int = 3, note_frac: float = 0.0, prefix: str = "ghb") -> list[dict]:
     rng = random.Random(seed)
     out = []
     for i in range(n):
-        g = _Ghb(rng)
+        g = _Ghb(rng, note_frac)
         k = 1 if rng.random() < 0.5 else rng.randint(2, max_turns)
-        out.append({"id": f"ghb_{seed}_{i:06d}", "system": g.ctx.system, "tools": list(g.tools.values()),
+        out.append({"id": f"{prefix}_{seed}_{i:06d}", "system": g.system, "tools": list(g.tools.values()),
                     "turns": [g.turn() for _ in range(k)]})
     return out
 
@@ -320,8 +514,9 @@ def from_v3(row: dict) -> dict:
     return {"id": row["id"], "system": row["system"], "tools": tools, "turns": turns}
 
 
-def generate_mixed(n_ghb: int, n_v3: int, seed: int = 0) -> list[dict]:
-    rows = generate_ghb(n_ghb, seed) + [from_v3(r) for r in v3.generate_examples_v3(n_v3, seed=seed + 1)]
+def generate_mixed(n_ghb: int, n_v3: int, seed: int = 0, note_frac: float = 0.0) -> list[dict]:
+    rows = generate_ghb(n_ghb, seed, note_frac=note_frac) + \
+        [from_v3(r) for r in v3.generate_examples_v3(n_v3, seed=seed + 1)]
     random.Random(seed).shuffle(rows)
     return rows
 

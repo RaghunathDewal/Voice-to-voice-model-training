@@ -80,10 +80,25 @@ def clip_jobs(convs: list[dict], assistant_voice: str) -> list[dict]:
 
 # ----------------------------------------------------------------------------- 1. data
 def stage_data(args) -> None:
-    from s2s.data.hotel_ghb import generate_mixed
+    from s2s.data.hotel_ghb import generate_ghb, generate_mixed
 
     w = work_dir(args)
-    rows = generate_mixed(args.n_ghb, args.n_v3, seed=args.seed)
+    if args.add:  # append deployment-style (note prompt) conversations to an existing set
+        rows = generate_ghb(args.add, seed=args.seed + 100, note_frac=args.note_frac, prefix="ghbn")
+        rng = random.Random(args.seed + 100)
+        for r in rows:
+            for t in r["turns"]:
+                t["typed"] = rng.random() < args.typed_frac
+        n_val = max(10, int(len(rows) * args.val_frac))
+        for name, part in (("val", rows[:n_val]), ("train", rows[n_val:])):
+            with (w / f"convs_{name}.jsonl").open("a", encoding="utf-8") as f:
+                for r in part:
+                    f.write(json.dumps(r) + "\n")
+        total = sum(1 for _ in (w / "convs_train.jsonl").open()) + sum(1 for _ in (w / "convs_val.jsonl").open())
+        print(f"added {len(rows)} note-style conversations ({len(rows) - n_val} train / {n_val} val), "
+              f"{len(clip_jobs(rows, args.assistant_voice))} new clips to voice; {total} conversations in total")
+        return
+    rows = generate_mixed(args.n_ghb, args.n_v3, seed=args.seed, note_frac=args.note_frac)
     rng = random.Random(args.seed)
     for r in rows:
         for t in r["turns"]:
@@ -273,25 +288,43 @@ class ConvIterator:
                 yield m
 
 
-def stage_build(args) -> None:
+def _build_worker(rank: int, shards: list, wavs: str, seed: int, augment: bool, out: str, context: int) -> None:
     from liquid_audio import LFM2AudioProcessor
     from liquid_audio.data.mapper import LFM2AudioChatMapper
     from liquid_audio.data.preprocess import preprocess_dataset
 
-    w = work_dir(args)
     proc = LFM2AudioProcessor.from_pretrained(HF_REPO, device=device()).eval()
-    mapper = LFM2AudioChatMapper(proc)
+    data = ConvIterator(shards[rank], wavs, seed + rank, augment)
+    preprocess_dataset(data=data, output_path=f"{out}/shard_{rank}", mapper=LFM2AudioChatMapper(proc),
+                       max_context_length=context)
+
+
+def stage_build(args) -> None:
+    """Conversations -> liquid-audio training format, in --build-workers parallel processes (one shard each)."""
+    import torch.multiprocessing as mp
+    from datasets import concatenate_datasets, load_from_disk
+
+    w = work_dir(args)
     for split in ("train", "val"):
         out = w / "data" / split
-        if out.exists():
-            shutil.rmtree(out)
+        tmp = w / "data" / f"{split}_shards"
+        for d in (out, tmp):
+            if d.exists():
+                shutil.rmtree(d)
+        tmp.mkdir(parents=True)
         convs = read_jsonl(w / f"convs_{split}.jsonl")
-        data = ConvIterator(convs, str(w / "wavs"), args.seed + (split == "val"), augment=(split == "train"))
-        missing = sum(1 for c in convs if not data.complete(c))
+        missing = sum(1 for c in convs if not ConvIterator(convs, str(w / "wavs"), 0, False).complete(c))
+        n = max(1, min(args.build_workers, len(convs) // 20 or 1))
+        shards = [convs[i::n] for i in range(n)]
         t0 = time.time()
-        preprocess_dataset(data=data, output_path=out, mapper=mapper, max_context_length=args.context)
-        print(f"[build] {split}: {len(convs) - missing} conversations -> {out} "
-              f"({missing} skipped for missing audio, {time.time() - t0:.0f} s)")
+        mp.start_processes(_build_worker, args=(shards, str(w / "wavs"), args.seed + (split == "val") * 1000,
+                                                split == "train", str(tmp), args.context),
+                           nprocs=n, join=True, start_method="spawn")
+        ds = concatenate_datasets([load_from_disk(str(tmp / f"shard_{i}")) for i in range(n)])
+        ds.save_to_disk(str(out))
+        shutil.rmtree(tmp)
+        print(f"[build] {split}: {len(ds)} conversations -> {out} ({missing} skipped for missing audio, "
+              f"{n} workers, {time.time() - t0:.0f} s)", flush=True)
 
 
 # ----------------------------------------------------------------------------- 4. train
@@ -437,6 +470,10 @@ def main() -> None:
     # data
     p.add_argument("--n-ghb", type=int, default=2600, help="conversations with our six tools")
     p.add_argument("--n-v3", type=int, default=1000, help="conversations with other tool names (generalisation)")
+    p.add_argument("--note-frac", type=float, default=0.5,
+                   help="share of hotel_ghb conversations with a deployment-style note prompt (short 'Key: value' notes)")
+    p.add_argument("--add", type=int, default=0,
+                   help="data stage: APPEND this many new note-style conversations to the existing set")
     p.add_argument("--typed-frac", type=float, default=0.15, help="guest turns given as text instead of audio")
     p.add_argument("--val-frac", type=float, default=0.03)
     p.add_argument("--assistant-voice", default="US female", choices=GUEST_VOICES)
@@ -446,9 +483,10 @@ def main() -> None:
     p.add_argument("--retries", type=int, default=2)
     # build / train
     p.add_argument("--context", type=int, default=2048, help="max positions per conversation (longer are skipped)")
+    p.add_argument("--build-workers", type=int, default=8, help="parallel processes for the build stage")
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--grad-accum", type=int, default=1)
-    p.add_argument("--epochs", type=float, default=3)
+    p.add_argument("--epochs", type=float, default=2)
     p.add_argument("--max-steps", type=int, default=0, help="overrides --epochs")
     p.add_argument("--lr", type=float, default=2e-5)
     p.add_argument("--weight-decay", type=float, default=0.05)
