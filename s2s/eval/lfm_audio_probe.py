@@ -178,7 +178,8 @@ def parse_tool_calls(text: str) -> list[dict]:
 
 
 def spoken(text: str) -> str:
-    """What the guest hears: the text without tool-call sections and special tokens."""
+    """What the guest hears: the text up to <|text_end|>, without tool-call sections and special tokens."""
+    text = text.split("<|text_end|>")[0]
     text = re.sub(r"<\|tool_call_start\|>.*?(<\|tool_call_end\|>|$)", " ", text, flags=re.S)
     return re.sub(r"\s+", " ", re.sub(r"<\|[^|]*\|>", " ", text)).strip()
 
@@ -253,6 +254,9 @@ def generate_hybrid(m, *, text, audio_in, audio_in_lens, audio_out, modality_fla
             if frame[0] == EOS_AUDIO:
                 frame[:] = EOS_AUDIO
                 mode = LFMModality.TEXT
+                if text_done:  # the reply's text and audio are both finished: end the turn here
+                    yield frame
+                    break
             yield frame
             in_emb = m.audio_embedding(frame + m.codebook_offsets).sum(0)[None, None, :]
 
@@ -724,9 +728,27 @@ def main() -> None:
     if tts_lines and any(t in args.tests for t in ("tts", "asr", "s2s", "noisy", "multiturn", "concurrent", "batched")):
         print("== guest questions spoken with LFM's TTS voices" + (" (multi-turn only)" if args.audio_dir else ""))
         t0 = now()
+        # always the BASE model's TTS: a fine-tuned model may have lost its TTS mode, and base and fine-tuned
+        # runs must hear the same kind of questions
+        speaker = lfm
+        if args.model_dir:
+            import copy
+
+            base_args = copy.copy(args)
+            base_args.model_dir = None
+            speaker = LFM(base_args)
         for k, line in enumerate(tts_lines):
-            w = lfm.tts(line, VOICES[k % len(VOICES)])
+            w = np.zeros(0, dtype=np.float32)
+            for _ in range(3):  # sampling can occasionally give an empty clip
+                w = speaker.tts(line, VOICES[k % len(VOICES)])
+                if len(w) > OUT_SR // 4:
+                    break
+            if len(w) <= OUT_SR // 4:
+                raise SystemExit(f"TTS produced no audio for: {line!r}")
             (wavs if (not args.audio_dir and k < len(items)) else mt_wavs).append(w)
+        if speaker is not lfm:
+            del speaker
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
         for k, w in enumerate(wavs):
             sf.write(out / "wavs" / f"q{k:02d}.wav", w, OUT_SR)
         print(f"  {len(tts_lines)} clips in {now() - t0:.0f} s")
