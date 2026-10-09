@@ -23,7 +23,7 @@ from s2s.cli_common import base_parser, config_from_args
 from s2s.data.hotel_v3 import GenericBackend, select_tools
 from s2s.eval.text_tools import extract_calls
 from s2s.models.thinker import Thinker
-from s2s.runtime.guards import VOICE_RULES, claims_action, retry_note, speakable, unsupported
+from s2s.runtime.guards import VOICE_RULES, claims_action, promises_action, retry_note, speakable, unsupported
 from s2s.utils import resolve_device, resolve_dtype
 
 
@@ -80,7 +80,7 @@ def respond(thinker: Thinker, messages: list[dict], tools: list | None, backend:
     details found in none of system prompt / guest words / tool results). Each check gets one retry with a
     note that is shown to the model for that generation only; if it fails again a safe line is spoken.
     The reply is always cleaned for speech (no markdown / emojis)."""
-    lines, succeeded, note, retried = [], [], None, set()
+    lines, succeeded, called, note, retried = [], [], [], None, set()
     for _ in range(max_rounds + 2):
         try:
             out = generate(thinker, messages + ([{"role": "user", "content": note}] if note else []), tools)
@@ -94,6 +94,8 @@ def respond(thinker: Thinker, messages: list[dict], tools: list | None, backend:
                 problem = None
                 if claims_action(spoken, succeeded):
                     problem = ("claim", None)
+                elif promises_action(spoken, succeeded, called):
+                    problem = ("promise", None)
                 else:
                     sources = [m["content"] for m in messages if m["role"] in ("system", "user", "tool")]
                     sources += [json.dumps(tc["function"]["arguments"]) for m in messages
@@ -108,7 +110,7 @@ def respond(thinker: Thinker, messages: list[dict], tools: list | None, backend:
                         retried.add(kind)
                         note = retry_note(kind, detail)
                         continue
-                    spoken = FALLBACK_CLAIM if kind == "claim" else FALLBACK_UNKNOWN
+                    spoken = FALLBACK_UNKNOWN if kind == "unsupported" else FALLBACK_CLAIM
                     lines.append("  GUARD: still failing after the retry, speaking the safe line")
             messages.append({"role": "assistant", "content": spoken})
             lines.append(f"  AGENT: {spoken}")
@@ -121,6 +123,7 @@ def respond(thinker: Thinker, messages: list[dict], tools: list | None, backend:
                 result = backend.execute(c)
             except Exception as e:  # noqa: BLE001
                 result = {"success": False, "error": f"{type(e).__name__}: {e}"}
+            called.append(c["name"])
             if _succeeded(result):
                 succeeded.append(c["name"])
             lines.append(f"  TOOL CALL: {c['name']}({json.dumps(c.get('arguments') or {})}) -> {json.dumps(result)}")

@@ -1,5 +1,6 @@
 """Safety checks on the thinker's reply before it is spoken (model-independent, no training needed).
 
+  promises_action   "I'll request that now" / "Let me check" and the turn ends without the tool call -> retry once
   claims_action     the reply says an order was placed / an issue was reported, but no such tool call
                     succeeded in this turn -> retry once, telling the model to call the tool or not claim it
   unsupported       the reply states a value (password, code, time, price, number) or a proper name
@@ -36,6 +37,12 @@ _CLAIM = re.compile(
     r"\b(done!?|i(?:'| ha)ve (?:placed|requested|ordered|reported|logged|filed|submitted|arranged|sent)|"
     r"(?:has|have) been (?:placed|requested|ordered|reported|logged|filed|submitted|arranged)|"
     r"i(?:'| a)m placing|is on (?:its|the) way|are on (?:their|the) way)\b", re.I)
+# "I'll request two for you right away" / "Let me check what we offer" with no tool call behind it
+_PROMISE_ACT = re.compile(
+    r"\b(?:i(?:'| wi)ll|let me|i(?:'| a)m going to)\s+(?:now\s+|go ahead and\s+|just\s+)?"
+    r"(?:request|order|place|report|log|file|submit|send|arrange)\b", re.I)
+_PROMISE_LOOK = re.compile(
+    r"\b(?:i(?:'| wi)ll|let me|i(?:'| a)m going to)\s+(?:now\s+|quickly\s+|just\s+)?(?:check|look|browse|see)\b", re.I)
 ACTION_TOOLS = {"place_product_order", "report_unit_issue", "order_product", "create_issue", "report_issue"}
 
 _EMOJI = re.compile("[\U0001F000-\U0001FAFF\U00002600-\U000027BF\U0001F900-\U0001F9FF‍️]+")
@@ -57,6 +64,14 @@ def speakable(text: str) -> str:
 def claims_action(reply: str, succeeded: list[str]) -> bool:
     """The reply claims an order / report although no action tool succeeded in this turn."""
     return bool(_CLAIM.search(reply)) and not any(n in ACTION_TOOLS for n in succeeded)
+
+
+def promises_action(reply: str, succeeded: list[str], called: list[str]) -> bool:
+    """The reply says it is about to act ("I'll request...", "Let me check...") but ends the turn without
+    the tool call: an action promise with no successful action tool, or a look-up promise with no tool at all."""
+    if _PROMISE_ACT.search(reply) and not any(n in ACTION_TOOLS for n in succeeded):
+        return True
+    return bool(_PROMISE_LOOK.search(reply)) and not called
 
 
 def _values(text: str) -> set[str]:
@@ -96,6 +111,9 @@ def unsupported(reply: str, sources: list[str]) -> list[str]:
 
 
 def retry_note(kind: str, detail: list[str] | None = None) -> str:
+    if kind == "promise":
+        return ("(Check before answering: you said you would do it, but you ended without calling the tool. "
+                "Call the tool now in this reply; say it is done only after it succeeds.)")
     if kind == "claim":
         return ("(Check before answering: you said the request was done, but you did not call the tool in this "
                 "turn. If the guest asked you to do it, call the tool now. Otherwise do not say it was done.)")
