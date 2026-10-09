@@ -53,6 +53,7 @@ DEFAULT_PROMPT = REPO / "demo/thinker/example_prompt.txt"
 DEFAULT_TOOLS = REPO / "demo/thinker/tools_template.json"
 DEFAULT_MOCK = REPO / "demo/thinker/mock_results_template.json"
 HF_REPO = "LiquidAI/LFM2.5-Audio-1.5B"
+TOOL_CALL_START, IM_END, TEXT_END = 10, 7, 130
 INTERLEAVED = "Respond with interleaved text and audio."
 VOICES = ["US female", "UK male", "US male", "UK female"]
 EOS_AUDIO = 2048
@@ -215,6 +216,47 @@ def score(item: dict, rounds: list[dict]) -> dict:
 
 
 # ----------------------------------------------------------------------------- the model
+@torch.no_grad()
+def generate_hybrid(m, *, text, audio_in, audio_in_lens, audio_out, modality_flag, max_new_tokens: int = 512,
+                    text_temperature=None, text_top_k=None, audio_temperature=None, audio_top_k=None):
+    """liquid-audio's generate_interleaved, except that a turn whose first token is <|tool_call_start|> stays in
+    text mode until <|im_end|>: a tool call is text only (as in our fine-tuning data), a spoken reply is
+    interleaved text + audio. Identical to generate_interleaved for every other turn."""
+    from liquid_audio import LFMModality
+
+    in_emb = m._prefill(text=text, audio_in=audio_in, audio_in_lens=audio_in_lens, audio_out=audio_out,
+                        modality_flag=modality_flag)
+    mode, left, cache = LFMModality.TEXT, m.conf.interleaved_n_text, None
+    text_done, first, tool = False, True, False
+    for _ in range(max_new_tokens):
+        left -= 1
+        out = m.lfm(inputs_embeds=in_emb, past_key_values=cache, use_cache=True)
+        h, cache = out.last_hidden_state, out.past_key_values
+        if mode == LFMModality.TEXT:
+            logits = torch.nn.functional.linear(h[0, -1], m.lfm.embed_tokens.weight)
+            tok = m._sample_text_token(logits, temperature=text_temperature, top_k=text_top_k)
+            if tok == IM_END:
+                break
+            yield tok
+            if first and tok == TOOL_CALL_START:
+                tool = True
+            first = False
+            if tok == TEXT_END:
+                text_done = True
+            if not tool and (not left or text_done):
+                mode, left = LFMModality.AUDIO_OUT, m.conf.interleaved_n_audio
+            in_emb = m.lfm.embed_tokens(tok)[None, :]
+        else:
+            frame = m._sample_audio_frame(h[0, -1], temperature=audio_temperature, top_k=audio_top_k)
+            if not left and not text_done:
+                mode, left = LFMModality.TEXT, m.conf.interleaved_n_text
+            if frame[0] == EOS_AUDIO:
+                frame[:] = EOS_AUDIO
+                mode = LFMModality.TEXT
+            yield frame
+            in_emb = m.audio_embedding(frame + m.codebook_offsets).sum(0)[None, None, :]
+
+
 class LFM:
     def __init__(self, args):
         from liquid_audio import ChatState, LFM2AudioModel, LFM2AudioProcessor, LFMModality
@@ -225,8 +267,9 @@ class LFM:
         if self.dev == "cpu":  # liquid-audio's detokenizer calls .cuda(); keep it on CPU for smoke tests
             torch.nn.Module.cuda = lambda module, *a, **k: module
         t0 = now()
-        self.proc = LFM2AudioProcessor.from_pretrained(HF_REPO, device=self.dev).eval()
-        self.model = LFM2AudioModel.from_pretrained(HF_REPO, device=self.dev, dtype=dtype).eval()
+        src = Path(os.path.expanduser(args.model_dir)) if args.model_dir else HF_REPO  # Path = local folder
+        self.proc = LFM2AudioProcessor.from_pretrained(src, device=self.dev).eval()
+        self.model = LFM2AudioModel.from_pretrained(src, device=self.dev, dtype=dtype).eval()
         self.dtype = dtype
         try:
             self.mimi = self.proc.mimi.eval()
@@ -277,7 +320,7 @@ class LFM:
     def generate(self, chat, mode: str = "interleaved", stream_decode: bool = True, max_new: int | None = None,
                  audio_temperature: float | None = None, audio_top_k: int | None = None) -> dict:
         a = self.args
-        fn = self.model.generate_interleaved if mode == "interleaved" else self.model.generate_sequential
+        fn = (lambda **k: generate_hybrid(self.model, **k)) if mode == "interleaved" else self.model.generate_sequential
         kw = dict(max_new_tokens=max_new or a.max_new_tokens,
                   audio_temperature=a.audio_temperature if audio_temperature is None else audio_temperature,
                   audio_top_k=a.audio_top_k if audio_top_k is None else audio_top_k)
@@ -604,6 +647,7 @@ def main() -> None:
     p.add_argument("--no-breakdown", dest="breakdown", action="store_false",
                    help="skip the separate encoder / LM-prefill timing per turn")
     p.add_argument("--whisper", default="openai/whisper-large-v3-turbo")
+    p.add_argument("--model-dir", default=None, help="a fine-tuned model folder (lfm_finetune.py); default: base model")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--limit", type=int, default=0, help="only the first N questions (quick check)")
     p.add_argument("--seed", type=int, default=0)
@@ -626,7 +670,7 @@ def main() -> None:
     items = json.loads(args.questions_file.read_text(encoding="utf-8")) if args.questions_file else QUESTIONS
     if args.limit:
         items = items[: args.limit]
-    S: dict = {"args": {k: str(v) for k, v in vars(args).items()}}
+    S: dict = {"args": {k: str(v) for k, v in vars(args).items()}, "model": args.model_dir}
     system = setup_for(prompt, tools, "system" if args.placement == "auto" else args.placement)
 
     # ---- env
@@ -754,6 +798,7 @@ def main() -> None:
                            torch_dtype=torch.float16 if args.device != "cpu" else torch.float32,
                            device=0 if args.device != "cpu" else -1)
             refs, hyps, qrefs, qhyps = [], [], [], []
+            gk = {"language": "en", "task": "transcribe"}
             for line in open(out / "turns.jsonl", encoding="utf-8"):
                 row = json.loads(line)
                 if row.get("test") != "s2s":
@@ -763,15 +808,21 @@ def main() -> None:
                 if said and len(w) > sr // 4:
                     w16 = torchaudio.functional.resample(torch.from_numpy(w), sr, 16_000).numpy()
                     refs.append(norm(said))
-                    hyps.append(norm(asr({"raw": w16, "sampling_rate": 16_000})["text"]) or "-")
+                    hyps.append(norm(asr({"raw": w16, "sampling_rate": 16_000}, generate_kwargs=gk)["text"]) or "-")
+                    log({"test": "whisper_reply", "i": row["i"], "model_text": refs[-1], "heard": hyps[-1],
+                         "wer": jiwer.wer(refs[-1] or "-", hyps[-1])})
                 qw, qsr = sf.read(out / "wavs" / f"q{row['i']:02d}.wav", dtype="float32") \
                     if (out / "wavs" / f"q{row['i']:02d}.wav").exists() else (None, None)
                 if qw is not None:
                     q16 = torchaudio.functional.resample(torch.from_numpy(qw), qsr, 16_000).numpy()
                     qrefs.append(norm(row["q"]))
-                    qhyps.append(norm(asr({"raw": q16, "sampling_rate": 16_000})["text"]) or "-")
+                    qhyps.append(norm(asr({"raw": q16, "sampling_rate": 16_000}, generate_kwargs=gk)["text"]) or "-")
             S["reply_intelligibility_wer_pct"] = round(100 * jiwer.wer(refs, hyps), 1) if refs else None
             S["question_audio_wer_pct"] = round(100 * jiwer.wer(qrefs, qhyps), 1) if qrefs else None
+            per = [jiwer.wer(r or "-", h) for r, h in zip(refs, hyps)]
+            S["reply_intelligibility_median_wer_pct"] = round(100 * float(np.median(per)), 1) if per else None
+            for r, h, x in sorted(zip(refs, hyps, per), key=lambda t: -t[2])[:3]:
+                print(f"  worst reply (WER {100 * x:.0f}%)\n     model text: {r[:160]}\n     audio heard: {h[:160]}")
             print(f"  replies: Whisper word error rate {S['reply_intelligibility_wer_pct']}% "
                   f"(lower = clearer) | guest questions: {S['question_audio_wer_pct']}%")
         except Exception as e:  # noqa: BLE001
@@ -788,7 +839,7 @@ def main() -> None:
 
 def report(S: dict) -> str:
     e = S["env"]
-    L = [f"# LFM2.5-Audio-1.5B on the hotel concierge task (no fine-tuning)\n",
+    L = [f"# LFM2.5-Audio-1.5B on the hotel concierge task ({S.get('model') or 'base model, no fine-tuning'})\n",
          f"GPU {e['gpu']} | torch {e['torch']} | load {e['load_s']:.1f} s | weights {e['gpu_mem_after_load_gb'] or 0:.1f} GB"
          f" | peak {e.get('gpu_peak_mem_gb') or 0:.1f} GB | system prompt + tools {e['system_prompt_tokens']} tokens\n"]
     acc_rows = [(f"typed, prompt in {k}", a) for k, a in S.get("placement", {}).items()]
@@ -803,7 +854,8 @@ def report(S: dict) -> str:
         if "s2s" in S and "text" in S and S["text"]["accuracy"]["pass_pct"] is not None:
             L.append(f"\nSpeech-vs-text gap: {S['text']['accuracy']['pass_pct'] - S['s2s']['accuracy']['pass_pct']:+.1f} points"
                      " (text minus speech; the cost of hearing instead of reading)\n")
-    for k in ("asr_wer_pct", "reply_intelligibility_wer_pct", "question_audio_wer_pct"):
+    for k in ("asr_wer_pct", "reply_intelligibility_wer_pct", "reply_intelligibility_median_wer_pct",
+              "question_audio_wer_pct"):
         if S.get(k) is not None:
             L.append(f"- {k}: {S[k]}%")
     if "s2s" in S:
