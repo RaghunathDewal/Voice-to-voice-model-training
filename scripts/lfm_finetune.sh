@@ -6,8 +6,10 @@
 #   nohup bash scripts/lfm_finetune.sh > ~/lfm_ft.log 2>&1 &
 #   tail -f ~/lfm_ft.log
 #
-# Every stage is resumable: re-running skips finished audio clips. Extra args go to every stage, e.g.
+# Every stage is resumable: re-running skips finished audio clips. Extra args go to every python stage, e.g.
 #   bash scripts/lfm_finetune.sh --n-ghb 4000 --epochs 4
+# Second round with Qwen-reworded data in a fresh folder:
+#   WORK=~/lfm_ft2 STAGES="data rewrite voice build train eval" nohup bash scripts/lfm_finetune.sh > ~/lfm_ft2.log 2>&1 &
 set -euo pipefail
 export PYTHONUNBUFFERED=1   # show progress in the log immediately (nohup writes to a file)
 cd "$(dirname "$0")/.."
@@ -21,6 +23,9 @@ for s in $STAGES; do
     data)
       if [ -f "$WORK/convs_train.jsonl" ]; then echo "conversations exist, keeping them (delete $WORK to regenerate)";
       else python s2s/train/lfm_finetune.py data --work "$WORK" "${args[@]}"; fi ;;
+    rewrite)  # reword with an open Qwen model on vLLM (Docker); only conversations not yet rewritten
+      if [ -f "$WORK/convs_train.orig.jsonl" ]; then echo "already rewritten, skipping";
+      else bash scripts/lfm_qwen_rewrite.sh "$WORK"; fi ;;
     voice|build|train)
       python s2s/train/lfm_finetune.py "$s" --work "$WORK" "${args[@]}" ;;
     eval)
