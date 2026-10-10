@@ -90,7 +90,7 @@ class VoiceAgent:
                                    lora_dir=lora if os.path.isdir(lora) else None, merge_lora=True,
                                    attn_implementation=cfg.thinker.attn_implementation)
             thinker_desc = f"{cfg.thinker.model} + {lora if os.path.isdir(lora) else 'no LoRA'}"
-            if merged:
+            if merged and merged != cfg.thinker.model:  # a hub id equal to thinker.model is the same thinker
                 print(f"WARNING: talker was trained on thinker '{merged}' which is not available; using {thinker_desc}")
         self.thinker.model.eval()
         self.adapter = SpeechAdapter.load(os.path.join(speech_llm_dir, "adapter.pt")).to(self.device).eval()
