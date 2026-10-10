@@ -10,5 +10,5 @@ adapter:
   max_frames: 400             # 32 s: keeps the longest batches inside a 16 GB T4
 
 runtime:
-  speech_llm_dir: checkpoints/speech_llm_4b
+  speech_llm_dir: checkpoints/speech_llm_4b_v2   # MI300X run (scripts/mi300x_4b_adapter.sh); Kaggle one: speech_llm_4b
   talker_dir: checkpoints/talker_4b
