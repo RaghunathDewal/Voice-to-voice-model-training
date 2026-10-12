@@ -130,7 +130,27 @@ def main() -> None:
             if args.row_prompts:
                 return tools_by_name(r.get("tools"))
             return HOTEL_TOOLS if args.hotel_context else None
-        todo.sort(key=lambda r: len(r["text"]))
+        def generate(prompts: list[str]) -> list[str]:
+            """Greedy answers; a batch that runs out of GPU memory is split in half and retried."""
+            enc = tok(prompts, return_tensors="pt", padding=True, add_special_tokens=False).to(device)
+            try:
+                with torch.no_grad():
+                    gen = model.generate(**enc, max_new_tokens=args.max_new_tokens, do_sample=False,
+                                         pad_token_id=tok.pad_token_id)
+            except torch.OutOfMemoryError:
+                del enc
+                torch.cuda.empty_cache()
+                if len(prompts) == 1:
+                    print("skipped one prompt that does not fit in GPU memory", flush=True)
+                    return [""]
+                half = len(prompts) // 2
+                return generate(prompts[:half]) + generate(prompts[half:])
+            texts = [tok.decode(seq, skip_special_tokens=True).strip() for seq in gen[:, enc["input_ids"].shape[1]:]]
+            del enc, gen
+            return texts
+
+        # similar lengths in one batch (history included): less padding, fewer out-of-memory splits
+        todo.sort(key=lambda r: len(r["text"]) + sum(len(h.get("content") or "") for h in r.get("history") or []))
         tag = f" [GPU shard {args.shard}]" if args.shard is not None else ""
         for i in tqdm(range(0, len(todo), args.batch_size), desc=f"distill{tag}", mininterval=5):
             chunk = todo[i: i + args.batch_size]
@@ -139,12 +159,7 @@ def main() -> None:
                 + [{"role": "user", "content": sentence_case(r["text"])}],
                 tools=tools_for(r),
                 add_generation_prompt=True, enable_thinking=False, tokenize=False) for r in chunk]
-            enc = tok(prompts, return_tensors="pt", padding=True, add_special_tokens=False).to(device)
-            with torch.no_grad():
-                gen = model.generate(**enc, max_new_tokens=args.max_new_tokens, do_sample=False,
-                                     pad_token_id=tok.pad_token_id)
-            for r, seq in zip(chunk, gen[:, enc["input_ids"].shape[1]:]):
-                text = tok.decode(seq, skip_special_tokens=True).strip()
+            for r, text in zip(chunk, generate(prompts)):
                 if not text or "<think>" in text:
                     continue
                 result = {"id": r["id"]}
