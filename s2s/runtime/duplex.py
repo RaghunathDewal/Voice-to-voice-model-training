@@ -97,7 +97,7 @@ class DuplexSession:
         x = m.frame_inputs(guest_vec[None].to(self.device).float(), torch.tensor([self.prev_text], device=self.device),
                            self.prev_col[None]).float()
         h = self._run(x)
-        text_id = int(self.lm_head(h).float().argmax())
+        text_id = int(self.m.text_logits(h[None])[0].argmax())
         col = self._depth_sample(h, text_id)
         if self.t < m.delay:
             col[1:] = -1
@@ -120,7 +120,7 @@ class DuplexSession:
         ids, pending = [self.call_id], [self.call_id]
         for _ in range(self.max_tool_tokens):
             h = self._run(self._embed(pending))
-            nxt = int(self.lm_head(h).float().argmax())
+            nxt = int(self.m.text_logits(h[None])[0].argmax())
             ids.append(nxt)
             pending = [nxt]
             if nxt == self.call_end:

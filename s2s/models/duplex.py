@@ -79,8 +79,20 @@ class DuplexModel(nn.Module):
         self.depth_code_emb = nn.ModuleList([nn.Embedding(card, depth_d_model) for _ in range(num_codebooks - 1)])
         self.depth = CausalTransformer(depth_d_model, depth_layers, depth_heads, 4, 0.0)
         self.heads = nn.ModuleList([nn.Linear(depth_d_model, card) for _ in range(num_codebooks)])
+        # "nothing to say" score: the pretrained LM scores the PAD token very low; a trainable term lifts it
+        self.pad_head = nn.Linear(H, 1)
+        nn.init.zeros_(self.pad_head.weight)
+        nn.init.constant_(self.pad_head.bias, 20.0)  # Qwen3 scores the PAD token ~20 below the best token
 
     # ------------------------------------------------------------------ pieces
+    def text_logits(self, h: torch.Tensor) -> torch.Tensor:
+        """[N, H] -> [N, V] float: the LM head plus the trainable PAD term."""
+        _, lm_head, _ = unwrap_llm(self.llm)
+        logits = lm_head(h).float()
+        bonus = torch.zeros_like(logits)
+        bonus[:, self.pad_id] = self.pad_head(h.float()).squeeze(-1)
+        return logits + bonus
+
     def text_embed(self, ids: torch.Tensor) -> torch.Tensor:
         return unwrap_llm(self.llm)[2](ids)
 
@@ -146,7 +158,7 @@ class DuplexModel(nn.Module):
     # ------------------------------------------------------------------ training
     def forward(self, items: list[dict]) -> dict:
         device = self.in_scale.device
-        backbone, lm_head, _ = unwrap_llm(self.llm)
+        backbone, _, _ = unwrap_llm(self.llm)
         seqs = [self.assemble(it, device) for it in items]
         L = max(s["x"].shape[0] for s in seqs)
         H = seqs[0]["x"].shape[1]
@@ -161,12 +173,12 @@ class DuplexModel(nn.Module):
         texts = torch.cat([s["text"] for s in seqs])
         cols = torch.cat([s["grid"].t() for s in seqs])
         # text: every frame (PAD down-weighted) + the tool calls
-        logits = lm_head(h_frames).float()
+        logits = self.text_logits(h_frames)
         w = torch.where(texts == self.pad_id, self.pad_weight, 1.0)
         text_loss = (F.cross_entropy(logits, texts, reduction="none") * w).sum() / w.sum()
         h_seg = [hidden[i, s["seg_pos"]] for i, s in enumerate(seqs) if s["seg_pos"].numel()]
         seg_tgt = torch.cat([s["seg_tgt"] for s in seqs])
-        tool_loss = F.cross_entropy(lm_head(torch.cat(h_seg)).float(), seg_tgt, ignore_index=-100) \
+        tool_loss = F.cross_entropy(self.text_logits(torch.cat(h_seg)), seg_tgt, ignore_index=-100) \
             if h_seg and (seg_tgt != -100).any() else logits.new_zeros(())
         # audio
         alog = self.depth_logits(h_frames, texts, cols).float()
