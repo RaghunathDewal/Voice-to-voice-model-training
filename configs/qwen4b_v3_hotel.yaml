@@ -1,0 +1,7 @@
+# Adapter v3 with the hotel-tuned 4B as the thinker: Qwen3-4B-Instruct-2507 + a text-only hotel LoRA, merged
+# (scripts/mi300x_v3.sh, BRAIN=1). The LoRA only touches the attention / MLP projections, so the word-embedding
+# table - and with it the stage A alignment - is the base 4B's.
+base: qwen4b_v3.yaml
+
+thinker:
+  model: checkpoints/thinker_4b_hotel

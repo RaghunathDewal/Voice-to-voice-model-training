@@ -88,12 +88,15 @@ elif cmd in ("v3data", "v3manifests"):  # v3 manifests (+ every v3 feature archi
     subprocess.run("cp v3/manifests/*.jsonl data/manifests/", shell=True, check=True)
     if cmd == "v3manifests":
         sys.exit(0)
+    if os.path.exists("data/.v3_features_done"):  # already extracted on this machine (a second part / a rerun)
+        print("v3 features already here", flush=True); sys.exit(0)
     tars = sorted(f for f in api.list_repo_files(data, repo_type="dataset") if f.startswith("v3/feat-") and f.endswith(".tar"))
     print(f"{len(tars)} v3 feature archives", flush=True)
     for name in tars:
         t = hf_hub_download(data, name, repo_type="dataset", local_dir=work + "/tmp")
         subprocess.run(f"tar -xf {t} -C data && rm -f {t}", shell=True, check=True)
         print(f"  {name} extracted", flush=True)
+    open("data/.v3_features_done", "w").close()
 EOF
 }
 
@@ -208,7 +211,8 @@ train_data() {
     du -sh data/features
 }
 mix() { [ -f "$1" ] && printf '{path: %s, weight: %s}, ' "$1" "$2"; return 0; }
-q4() { [ -f "$M/${1}_q4.jsonl" ] && echo "$M/${1}_q4.jsonl" || echo "$M/${1}_nm.jsonl"; }
+ANS=${ANS:-q4}  # answers to train on: <set>_$ANS.jsonl (q4 = the base 4B's; mi300x_v3.sh: q4h = the hotel-tuned 4B's)
+q4() { [ -f "$M/${1}_$ANS.jsonl" ] && echo "$M/${1}_$ANS.jsonl" || echo "$M/${1}_nm.jsonl"; }
 
 # ============================================================== PART align
 if [ "$PART" = align ]; then
