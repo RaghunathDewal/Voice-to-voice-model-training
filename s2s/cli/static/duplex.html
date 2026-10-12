@@ -73,6 +73,7 @@ pre { white-space: pre-wrap; font-size: 12px; max-height: 260px; overflow: auto;
         </div>
         <span class="hint">your microphone</span><div class="meter"><i id="micm"></i></div>
         <span class="hint">agent voice</span><div class="meter"><i id="agm"></i></div>
+        <p class="hint" id="breakdown">per 80 ms frame: –</p>
         <p class="hint" id="speedhint">Compute must stay below 1.0 (real time). Above it, the lag grows.</p>
       </div>
       <div class="card" style="margin-top:14px">
@@ -153,6 +154,8 @@ async function start() {
     else if (m.type === 'stats') {
       $('#lag').textContent = m.lag_ms + ' ms'; $('#lag').className = m.lag_ms > 400 ? 'lagbad' : '';
       $('#rtf').textContent = m.rtf.toFixed(2); $('#rtf').className = m.rtf > 1 ? 'lagbad' : '';
+      if (m.llm_ms !== undefined) $('#breakdown').textContent =
+        `per 80 ms frame: LLM ${m.llm_ms} ms · audio head ${m.depth_ms} ms · decoder ${m.decode_ms} ms; listener ${m.listener_ms} ms (other GPU, in parallel)`;
     } else if (m.type === 'busy') { addMsg('tool', 'Someone else is in a call on this server. Try again later.'); }
   };
 }

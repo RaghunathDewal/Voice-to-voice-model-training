@@ -172,55 +172,93 @@ def main() -> None:
                 save_call(mic_rec, agent_rec)
 
     async def call_loop(sock, sr, sess, dec, listener, mic_rec, agent_rec, t0):
-        steps, reset = 0, False
-        while not reset:
-            msg = await sock.receive()
-            if msg.get("type") == "websocket.disconnect":
-                raise WebSocketDisconnect()
-            if msg.get("bytes"):
-                x = np.frombuffer(msg["bytes"], dtype="<i2").astype(np.float32) / 32768.0
-                x16 = resample(x, sr, 16000)
-                listener.push(x16)
-                if args.save_dir:
-                    mic_rec.append(x16)
-            elif msg.get("text"):
-                m = json.loads(msg["text"])
-                if m.get("type") == "reset":
-                    reset = True
-                    continue
-            if listener.ready() - listener.done < 2:   # encode every 160 ms
-                continue
+        """Two tasks: the receiver feeds the microphone to the listener (GPU 1) and queues its vectors; the
+        stepper runs the model on every queued frame (GPU 0) and decodes their audio in one Mimi call. The
+        listener and the model therefore work in parallel."""
+        frames: asyncio.Queue = asyncio.Queue()
+        enc_lock = threading.Lock()
+        timing = {"listener": 0.0, "chunks": 0, "decode": 0.0, "decoded": 0}
+        encoding = {"busy": False}
 
-            def work():
-                with gpu:
-                    frames = listener.new_frames()
-                    outs = []
-                    for f in frames:
-                        o = sess.step(f)
-                        wav = dec.push([o["frame"].clamp(min=0)]) if o["frame"] is not None else None
-                        outs.append((o, wav))
-                    return outs
+        def encode():
+            with enc_lock:
+                t = time.perf_counter()
+                out = listener.new_frames()
+                timing["listener"] += time.perf_counter() - t
+                timing["chunks"] += len(out)   # per 80 ms frame
+                return out
 
-            t_work = time.time()
-            outs = await asyncio.to_thread(work)
-            for o, wav in outs:
-                steps += 1
+        async def run_encode():
+            try:
+                for f in await asyncio.to_thread(encode):
+                    frames.put_nowait(f)
+            finally:
+                encoding["busy"] = False
+
+        async def receiver():
+            while True:
+                msg = await sock.receive()
+                if msg.get("type") == "websocket.disconnect":
+                    raise WebSocketDisconnect()
+                if msg.get("bytes"):
+                    x16 = resample(np.frombuffer(msg["bytes"], dtype="<i2").astype(np.float32) / 32768.0, sr, 16000)
+                    listener.push(x16)
+                    if args.save_dir:
+                        mic_rec.append(x16)
+                    if not encoding["busy"] and listener.ready() - listener.done >= 2:
+                        encoding["busy"] = True
+                        asyncio.create_task(run_encode())
+                elif msg.get("text") and json.loads(msg["text"]).get("type") == "reset":
+                    return
+
+        def work(batch):
+            with gpu:
+                outs = [sess.step(f) for f in batch]
+                done = [o["frame"].clamp(min=0) for o in outs if o["frame"] is not None]
+                t = time.perf_counter()
+                wav = dec.push(done) if done else None   # one decoder call for every finished frame
+                timing["decode"] += time.perf_counter() - t
+                timing["decoded"] += len(done)
+                return outs, wav
+
+        async def stepper():
+            last_stats = time.time()
+            while True:
+                batch = [await frames.get()]
+                while not frames.empty():
+                    batch.append(frames.get_nowait())
+                outs, wav = await asyncio.to_thread(work, batch)
                 if wav is not None and len(wav):
                     await sock.send_bytes(pcm16(wav))
                     if args.save_dir:
                         agent_rec.append(wav)
-                if o["tool"]:
-                    await sock.send_text(json.dumps({"type": "tool", "call": o["tool"]["call"],
-                                                     "result": o["tool"]["result"]}))
-                elif o["text"] != pad_id:
-                    piece = tok.decode([o["text"]], skip_special_tokens=True)
-                    if piece:
-                        await sock.send_text(json.dumps({"type": "text", "t": piece}))
-            if outs and steps % 12 < len(outs):
-                lag = (listener.ready() - sess.t) * 80
-                rtf = (time.time() - t_work) / max(1e-6, 0.08 * len(outs))
-                await sock.send_text(json.dumps({"type": "stats", "lag_ms": int(max(0, lag)), "rtf": round(rtf, 2),
-                                                 "seconds": round(time.time() - t0)}))
+                for o in outs:
+                    if o["tool"]:
+                        await sock.send_text(json.dumps({"type": "tool", "call": o["tool"]["call"],
+                                                         "result": o["tool"]["result"]}))
+                    elif o["text"] != pad_id:
+                        piece = tok.decode([o["text"]], skip_special_tokens=True)
+                        if piece:
+                            await sock.send_text(json.dumps({"type": "text", "t": piece}))
+                if time.time() - last_stats > 1.0:
+                    last_stats = time.time()
+                    st, n = sess.timing, max(1, sess.timing["frames"])
+                    per = {"llm_ms": 1000 * st["llm"] / n, "depth_ms": 1000 * st["depth"] / n,
+                           "decode_ms": 1000 * timing["decode"] / max(1, timing["decoded"]),
+                           "listener_ms": 1000 * timing["listener"] / max(1, timing["chunks"])}
+                    rtf = (per["llm_ms"] + per["depth_ms"] + per["decode_ms"]) / 80.0
+                    await sock.send_text(json.dumps({
+                        "type": "stats", "lag_ms": int(max(0, listener.ready() - sess.t) * 80), "rtf": round(rtf, 2),
+                        "seconds": round(time.time() - t0), **{k: round(v, 1) for k, v in per.items()}}))
+
+        recv, step = asyncio.create_task(receiver()), asyncio.create_task(stepper())
+        try:
+            done, _ = await asyncio.wait({recv, step}, return_when=asyncio.FIRST_COMPLETED)
+            for d in done:
+                d.result()   # re-raise a disconnect or an error
+        finally:
+            for task in (recv, step):
+                task.cancel()
 
     def save_call(mic_rec, agent_rec):
         if not (args.save_dir and mic_rec):

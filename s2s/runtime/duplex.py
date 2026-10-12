@@ -19,7 +19,7 @@ from s2s.data.duplex import PAD_TOKEN, prefix_ids
 from s2s.models.duplex import DuplexModel, unwrap_llm
 
 
-def load_duplex(ckpt_dir: str, device: torch.device, dtype: torch.dtype | None = None):
+def load_duplex(ckpt_dir: str, device: torch.device, dtype: torch.dtype | None = None, merge_lora: bool = True):
     from s2s.config import load_config
     from s2s.train.duplex import build_model
     from s2s.utils import resolve_dtype
@@ -28,18 +28,21 @@ def load_duplex(ckpt_dir: str, device: torch.device, dtype: torch.dtype | None =
                                                                "train_duplex.gradient_checkpointing=false"])
     dtype = dtype or resolve_dtype(cfg.train_duplex.get("dtype", "auto"), device)
     model, tok = build_model(cfg, device, dtype)
+    if merge_lora and hasattr(model.llm, "merge_and_unload"):  # same outputs, about half the GPU kernels per frame
+        model.llm = model.llm.merge_and_unload()
     model.eval()
     return model, tok, cfg, dtype
 
 
-def sample(logits: torch.Tensor, temperature: float, top_k: int, gen: torch.Generator | None) -> int:
+def sample(logits: torch.Tensor, temperature: float, top_k: int, gen: torch.Generator | None) -> torch.Tensor:
+    """One code, kept on the GPU (no CPU sync)."""
     if temperature <= 0:
-        return int(logits.argmax())
+        return logits.argmax()
     logits = logits.float() / temperature
     if top_k:
         v, i = logits.topk(min(top_k, logits.shape[-1]))
-        return int(i[torch.multinomial(torch.softmax(v, -1), 1, generator=gen)])
-    return int(torch.multinomial(torch.softmax(logits, -1), 1, generator=gen))
+        return i[torch.multinomial(torch.softmax(v, -1), 1, generator=gen)[0]]
+    return torch.multinomial(torch.softmax(logits, -1), 1, generator=gen)[0]
 
 
 class DuplexSession:
@@ -61,6 +64,7 @@ class DuplexSession:
         self.texts: list[int] = []
         self.tool_log: list[dict] = []
         self.t = 0
+        self.timing = {"llm": 0.0, "depth": 0.0, "frames": 0}
         self._run(self._embed(prefix_ids(tokenizer, system, tools)))
 
     @torch.no_grad()
@@ -78,17 +82,18 @@ class DuplexSession:
 
     @torch.no_grad()
     def _depth_sample(self, h: torch.Tensor, text_id: int) -> torch.Tensor:
+        """The 8 codes of this grid column, one depth-transformer position each (KV cache, like training)."""
         m = self.m
         h = h.float()
-        x0 = m.depth_in(h[None]) + m.depth_text(self._embed([text_id]).float())
-        inputs, codes = [x0], []
+        x0 = m.depth_in(h[None]) + m.depth_text(self._embed([text_id]).float())   # [1, d]
+        cache, x, codes = m.depth.new_cache(), x0, []
         for j in range(m.K):
-            out = m.depth(torch.stack(inputs, dim=1))
-            c = sample(m.heads[j](out[0, j]), self.temp, self.top_k, self.gen)
+            out = m.depth(x[:, None], cache=cache, start_pos=j)[:, -1]
+            c = sample(m.heads[j](out)[0], self.temp, self.top_k, self.gen)
             codes.append(c)
             if j + 1 < m.K:
-                inputs.append(x0 + m.depth_code_emb[j](torch.tensor([c], device=self.device)))
-        return torch.tensor(codes, device=self.device)
+                x = x0 + m.depth_code_emb[j](c.view(1))
+        return torch.stack(codes)
 
     @torch.no_grad()
     def step(self, guest_vec: torch.Tensor) -> dict:
@@ -96,9 +101,14 @@ class DuplexSession:
         m = self.m
         x = m.frame_inputs(guest_vec[None].to(self.device).float(), torch.tensor([self.prev_text], device=self.device),
                            self.prev_col[None]).float()
+        t0 = time.perf_counter()
         h = self._run(x)
-        text_id = int(self.m.text_logits(h[None])[0].argmax())
+        text_id = int(self.m.text_logits(h[None])[0].argmax())   # the one CPU sync per frame
+        t1 = time.perf_counter()
         col = self._depth_sample(h, text_id)
+        self.timing["llm"] += t1 - t0
+        self.timing["depth"] += time.perf_counter() - t1
+        self.timing["frames"] += 1
         if self.t < m.delay:
             col[1:] = -1
         self.grid.append(col)
