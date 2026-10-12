@@ -39,6 +39,9 @@ def build_model(cfg, device, dtype):
     llm = AutoModelForCausalLM.from_pretrained(tc.llm, dtype=dtype, attn_implementation="sdpa")
     for p in llm.parameters():
         p.requires_grad_(False)
+    from s2s.models.thinker import ignore_incompatible_torchao
+
+    ignore_incompatible_torchao()  # Kaggle ships torchao 0.10, which recent PEFT refuses
     lc = tc.lora
     llm = get_peft_model(llm, LoraConfig(r=int(lc.r), lora_alpha=int(lc.alpha), lora_dropout=float(lc.dropout),
                                          target_modules=list(lc.target_modules), task_type="CAUSAL_LM"))
