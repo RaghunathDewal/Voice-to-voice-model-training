@@ -27,7 +27,7 @@ say() { echo "[$(date +%H:%M:%S)] $*"; }
 
 say ">>> setup"
 pip install -q --no-deps -e .
-pip install -q peft accelerate soundfile librosa huggingface_hub fastapi uvicorn websockets
+pip install -q peft accelerate soundfile librosa jiwer huggingface_hub fastapi uvicorn websockets
 python -c "from transformers import AutoModelForRNNT" 2>/dev/null || pip install -q -U "transformers>=5.13"
 python -c "import torch; [print(i, torch.cuda.get_device_name(i)) for i in range(torch.cuda.device_count())]"
 

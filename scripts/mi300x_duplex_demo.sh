@@ -68,7 +68,7 @@ else
     say "no DO_TOKEN: remember to destroy the droplet yourself when you are done"
 fi
 
-if [ ! -x "$VENV/bin/python" ] || ! "$VENV/bin/python" -c "import fastapi, peft" 2>/dev/null; then
+if [ ! -x "$VENV/bin/python" ] || ! "$VENV/bin/python" -c "import fastapi, peft, jiwer, librosa" 2>/dev/null; then
     say ">>> setup (first time only)"
     if command -v apt-get >/dev/null 2>&1; then
         DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git curl libsndfile1 >/dev/null 2>&1 || true
@@ -78,7 +78,7 @@ if [ ! -x "$VENV/bin/python" ] || ! "$VENV/bin/python" -c "import fastapi, peft"
     [ -x "$VENV/bin/python" ] || uv venv -q -p 3.12 --managed-python --seed "$VENV"
     uv pip install -p "$VENV/bin/python" torch --index-url "$TORCH_INDEX"
     uv pip install -p "$VENV/bin/python" -q "transformers>=5.13" "peft>=0.11" accelerate numpy scipy soundfile \
-        librosa pyyaml tqdm huggingface_hub fastapi uvicorn websockets
+        librosa pyyaml tqdm jiwer huggingface_hub fastapi uvicorn websockets
 fi
 uv pip install -p "$VENV/bin/python" -q --no-deps -e .
 export PATH="$VENV/bin:$PATH"
