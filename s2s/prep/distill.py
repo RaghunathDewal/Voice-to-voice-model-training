@@ -25,6 +25,7 @@ from tqdm import tqdm
 
 from s2s.cli_common import base_parser, config_from_args
 from s2s.data.datasets import load_manifest
+from s2s.data.hotel import row_system, tools_by_name
 from s2s.models.thinker import Thinker
 from s2s.text import sentence_case
 from s2s.dist import resolve_num_workers, run_sharded, strip_gpu_args
@@ -38,7 +39,11 @@ def merge_shard_files(rows: list[dict], out: str) -> int:
     for path in sorted(glob.glob(out + ".shard*.jsonl")):
         for x in read_jsonl(path):
             r = by_id.get(x.get("id"))
-            if r is not None and ("response" in x or x.get("tool_calls")) and not (r.get("response") or r.get("tool_calls")):
+            if r is not None and x.get("distilled") and not r.get("distilled"):  # --row-prompts results
+                for k in ("reply", "tool_calls", "distilled"):
+                    r[k] = x.get(k)
+                n += 1
+            elif r is not None and ("response" in x or x.get("tool_calls")) and not (r.get("response") or r.get("tool_calls")):
                 for k in ("response", "tool_calls", "context", "tools"):
                     if k in x:
                         r[k] = x[k]
@@ -69,6 +74,10 @@ def main() -> None:
     p.add_argument("--hotel-context", action="store_true",
                    help="reply as the hotel agent: a random reservation + the hotel tools in the prompt (stored in the "
                         "row); valid tool calls become tool_calls rows, other tool output is dropped")
+    p.add_argument("--row-prompts", action="store_true",
+                   help="rows with their own `system` / `tools` (hotel_v3 data): the thinker answers the row's text "
+                        "with that prompt and tools, and its own reply / valid tool calls REPLACE the row's "
+                        "generated `reply` / `tool_calls` (self-generated targets); marked `distilled`")
     p.add_argument("--gpus", type=int, default=0, help="worker processes, one per GPU (0 = all visible GPUs)")
     p.add_argument("--shard", type=int, default=None, help=argparse.SUPPRESS)
     p.add_argument("--num-shards", type=int, default=1, help=argparse.SUPPRESS)
@@ -77,7 +86,10 @@ def main() -> None:
 
     rows = load_manifest(args.inp)
     merge_shard_files(rows, args.out)  # resume an interrupted multi-GPU run
-    todo = [r for r in rows[: args.max_utts] if not (r.get("response") or r.get("tool_calls"))]
+    if args.row_prompts:
+        todo = [r for r in rows[: args.max_utts] if not r.get("distilled")]
+    else:
+        todo = [r for r in rows[: args.max_utts] if not (r.get("response") or r.get("tool_calls"))]
     n_workers = resolve_num_workers(args.gpus)
     if args.shard is None and n_workers > 1 and len(todo) > 1 and cfg.device != "cpu":
         print(f"{len(todo)} rows to distill on {n_workers} GPUs")
@@ -110,7 +122,14 @@ def main() -> None:
                 r["tools"] = "hotel"
 
         def system_for(r: dict) -> str:
+            if args.row_prompts:
+                return row_system(r, base_system)
             return Thinker.system_content(base_system, r.get("context")) if args.hotel_context else base_system
+
+        def tools_for(r: dict):
+            if args.row_prompts:
+                return tools_by_name(r.get("tools"))
+            return HOTEL_TOOLS if args.hotel_context else None
         todo.sort(key=lambda r: len(r["text"]))
         tag = f" [GPU shard {args.shard}]" if args.shard is not None else ""
         for i in tqdm(range(0, len(todo), args.batch_size), desc=f"distill{tag}", mininterval=5):
@@ -118,7 +137,7 @@ def main() -> None:
             prompts = [tok.apply_chat_template(
                 [{"role": "system", "content": system_for(r)}] + list(r.get("history") or [])
                 + [{"role": "user", "content": sentence_case(r["text"])}],
-                tools=HOTEL_TOOLS if args.hotel_context else None,
+                tools=tools_for(r),
                 add_generation_prompt=True, enable_thinking=False, tokenize=False) for r in chunk]
             enc = tok(prompts, return_tensors="pt", padding=True, add_special_tokens=False).to(device)
             with torch.no_grad():
@@ -129,6 +148,18 @@ def main() -> None:
                 if not text or "<think>" in text:
                     continue
                 result = {"id": r["id"]}
+                if args.row_prompts:  # the thinker's own answer replaces the generated one
+                    names = {t["function"]["name"] for t in (tools_for(r) or [])}
+                    blobs = re.findall(r"<tool_call>(.*?)</tool_call>", text, flags=re.S)
+                    calls = [Thinker.parse_tool_call(b) for b in blobs]
+                    if blobs and (not all(calls) or any(c.get("name") not in names for c in calls)):
+                        continue  # malformed or unknown tool: keep the row's generated target
+                    reply = "" if blobs else text
+                    r.update(reply=reply, tool_calls=calls, distilled=True)
+                    result.update(reply=reply, tool_calls=calls, distilled=True)
+                    if shard_file:
+                        shard_file.write(json.dumps(result, ensure_ascii=False) + "\n")
+                    continue
                 if "<tool_call>" in text or text.lstrip().startswith("{"):
                     if not args.hotel_context:
                         continue
@@ -159,6 +190,10 @@ def main() -> None:
     write_jsonl(args.out, relativize(rows, args.out))
     for path in glob.glob(args.out + ".shard*.jsonl"):
         os.remove(path)
+    if args.row_prompts:
+        print(f"{sum(1 for r in rows if r.get('distilled'))} of {len(rows)} rows answered by the thinker itself "
+              f"({sum(1 for r in rows if r.get('distilled') and r.get('tool_calls'))} with tool calls) -> {args.out}")
+        return
     print(f"{sum(1 for r in rows if r.get('response'))} rows with responses, "
           f"{sum(1 for r in rows if r.get('tool_calls'))} with tool calls -> {args.out}")
 

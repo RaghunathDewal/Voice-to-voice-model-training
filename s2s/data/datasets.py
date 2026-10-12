@@ -72,7 +72,12 @@ def mixture_sampler(weights: list[float], num_samples: int, seed: int) -> Weight
 class SpeechLLMDataset(Dataset):
     def __init__(self, rows: list[dict], prompts: PromptBuilder, system_prompt: str, transcribe_instruction: str,
                  transcribe_prob: float, max_trailing_frames: int, max_frames: int, max_target_tokens: int,
-                 train: bool = True, eot_margin: int = 4, seed: int = 0):
+                 train: bool = True, eot_margin: int = 4, seed: int = 0, unclear_reply: str = "",
+                 tok_map: dict[int, int] | None = None, eot_early: int = 0, teacher: bool = False):
+        """unclear_reply: target for rows marked `unclear` (unintelligible audio).
+        tok_map: thinker token id -> index in the adapter's token head (word-level CTC targets in `tok`).
+        eot_early: end-of-turn labels turn to 1 this many frames BEFORE the speech ends (predict the end).
+        teacher: also return the TEXT prompt of the same turn (`teacher`) for the KD loss."""
         self.rows = rows
         self.prompts = prompts
         self.system_prompt = system_prompt
@@ -84,11 +89,17 @@ class SpeechLLMDataset(Dataset):
         self.train = train
         self.eot_margin = eot_margin
         self.seed = seed
+        self.unclear_reply = unclear_reply
+        self.tok_map = tok_map
+        self.eot_early = eot_early
+        self.teacher = teacher
 
     def __len__(self) -> int:
         return len(self.rows)
 
     def task_for(self, row: dict, rng: random.Random) -> str:
+        if row.get("unclear"):
+            return "unclear"
         if row.get("tool_calls") or row.get("reply"):
             return "tool"
         if row.get("response") and rng.random() >= self.transcribe_prob:
@@ -108,7 +119,14 @@ class SpeechLLMDataset(Dataset):
         system = row_system(row, self.system_prompt)
         tools = tools_by_name(row.get("tools"))
         history = row.get("history") or None  # earlier turns as text (multi-turn rows)
-        if task == "tool":
+        text = "" if task == "unclear" else row.get("text", "")
+        teacher = None
+        if self.teacher and task in ("tool", "respond") and text:
+            teacher = self.prompts.text_prompt_ids(system, sentence_case(text), tools, history)
+        if task == "unclear":
+            prefix, suffix = self.prompts.prompt_parts(system, tools, None, history)
+            target = self.prompts.target_ids(system, tools, content=self.unclear_reply, history=history)
+        elif task == "tool":
             prefix, suffix = self.prompts.prompt_parts(system, tools, None, history)
             target = self.prompts.target_ids(system, tools, content=row.get("reply", ""),
                                              tool_calls=row.get("tool_calls") or None, history=history)
@@ -120,13 +138,17 @@ class SpeechLLMDataset(Dataset):
             target = self.prompts.target_ids(system, None, content=sentence_case(row["text"]))
         target = target[: self.max_target_tokens]
 
+        end = max(0, speech_frames - self.eot_early)
         eot = np.full(t, -1, dtype=np.int64)
-        eot[: max(0, speech_frames - self.eot_margin)] = 0
-        eot[speech_frames:] = 1
+        eot[: max(0, end - self.eot_margin)] = 0
+        eot[end:] = 1
+        tok = None
+        if self.tok_map is not None:
+            tok = [self.tok_map[i] for i in self.prompts.ids(sentence_case(text)) if i in self.tok_map] if text else []
         return {
             "id": row.get("id", str(idx)), "task": task, "latent": torch.from_numpy(lat),
-            "prefix": prefix, "suffix": suffix, "target": target,
-            "ctc": ctc_encode(row.get("text", "")), "eot": torch.from_numpy(eot), "text": row.get("text", ""),
+            "prefix": prefix, "suffix": suffix, "target": target, "teacher": teacher, "tok": tok,
+            "ctc": ctc_encode(text), "eot": torch.from_numpy(eot), "text": text,
         }
 
 
@@ -145,6 +167,8 @@ def collate_speech_llm(items: list[dict]) -> dict:
         "prefix": [it["prefix"] for it in items], "suffix": [it["suffix"] for it in items],
         "target": [it["target"] for it in items], "ctc_targets": ctc_targets, "ctc_lengths": ctc_lengths,
         "ids": [it["id"] for it in items], "tasks": [it["task"] for it in items], "texts": [it["text"] for it in items],
+        "teacher": [it.get("teacher") for it in items],
+        "tok": [it["tok"] for it in items] if all(it.get("tok") is not None for it in items) else None,
     }
 
 

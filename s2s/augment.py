@@ -8,6 +8,9 @@ gives the same features. Needs only numpy/scipy (no noise corpus download):
   * microphone    band limiting (phone 300-3400 Hz, cheap laptop or phone mic)
   * noise         white / pink / brown / babble-like noise at 0-30 dB SNR
   * level         -20..+3 dB gain, occasional soft clipping
+  * phone line    (p_phone, off by default) 8 kHz telephone band + 8-bit mu-law codec, as on a phone call
+
+unintelligible(): speech buried in loud babble / noise, or noise only, for "sorry, I didn't catch that" rows.
 """
 
 from __future__ import annotations
@@ -57,8 +60,39 @@ def _snr_mix(wav: np.ndarray, noise: np.ndarray, snr_db: float) -> np.ndarray:
     return wav + noise * np.sqrt(ps / (pn * 10 ** (snr_db / 10)))
 
 
+def phone_line(x: np.ndarray, sr: int) -> np.ndarray:
+    """Narrowband telephone channel: down to 8 kHz, G.711-style 8-bit mu-law, back up to `sr`."""
+    from math import gcd
+
+    g = gcd(8000, sr)
+    y = signal.resample_poly(x, 8000 // g, sr // g)
+    peak = np.max(np.abs(y)) + 1e-9
+    y = y / peak
+    mu = 255.0
+    q = np.sign(y) * np.log1p(mu * np.abs(y)) / np.log1p(mu)       # compress
+    q = np.round((q + 1) * 127.5) / 127.5 - 1                       # 8-bit codes
+    y = np.sign(q) * np.expm1(np.abs(q) * np.log1p(mu)) / mu        # expand
+    return signal.resample_poly(y * peak, sr // g, 8000 // g)[: len(x)]
+
+
+def unintelligible(wav: np.ndarray, sr: int, key: str) -> np.ndarray:
+    """Audio nobody could transcribe: speech under loud chatter/noise (-12..-4 dB SNR), or noise alone."""
+    rng = np.random.default_rng(zlib.crc32(("unclear/" + key).encode()))
+    x = wav.astype(np.float64)
+    kind = rng.choice(["white", "pink", "brown", "babble"])
+    noise = _babble(len(x), sr, rng) if kind == "babble" else _colored_noise(len(x), kind, rng)
+    if rng.random() < 0.3:  # no speech at all, only the room
+        x = noise
+    else:
+        x = _snr_mix(x, noise, rng.uniform(-12, -4))
+        if rng.random() < 0.5:
+            x = phone_line(x, sr)
+    x = x / (np.max(np.abs(x)) + 1e-9) * 10 ** (rng.uniform(-20, 0) / 20) * 0.9
+    return np.clip(x, -1.0, 1.0).astype(np.float32)
+
+
 def augment(wav: np.ndarray, sr: int, key: str, p_reverb: float = 0.4, p_band: float = 0.35,
-            p_noise: float = 0.7, p_clip: float = 0.05) -> np.ndarray:
+            p_noise: float = 0.7, p_clip: float = 0.05, p_phone: float = 0.0) -> np.ndarray:
     rng = np.random.default_rng(zlib.crc32(key.encode()))
     x = wav.astype(np.float64)
     if len(x) == 0:
@@ -82,4 +116,6 @@ def augment(wav: np.ndarray, sr: int, key: str, p_reverb: float = 0.4, p_band: f
     x = x / peak * 10 ** (rng.uniform(-20, 3) / 20) * 0.9
     if rng.random() < p_clip:
         x = np.tanh(3 * x) / np.tanh(3)
+    if p_phone > 0 and rng.random() < p_phone:  # drawn last: with p_phone=0 the result is as before
+        x = phone_line(x, sr)
     return np.clip(x, -1.0, 1.0).astype(np.float32)

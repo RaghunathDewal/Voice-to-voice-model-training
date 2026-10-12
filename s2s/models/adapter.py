@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from s2s.modules.transformer import CausalTransformer, RMSNorm
 from s2s.text import CTC_VOCAB
@@ -25,11 +26,11 @@ from s2s.text import CTC_VOCAB
 class SpeechAdapter(nn.Module):
     def __init__(self, latent_dim: int, llm_dim: int, d_model: int = 1024, n_layers: int = 4,
                  n_heads: int = 16, ff_mult: int = 4, dropout: float = 0.1, ctc_upsample: int = 4,
-                 encoder: str = "mimi"):
+                 encoder: str = "mimi", token_vocab_size: int = 0):
         super().__init__()
         self.hparams = dict(latent_dim=latent_dim, llm_dim=llm_dim, d_model=d_model, n_layers=n_layers,
                             n_heads=n_heads, ff_mult=ff_mult, dropout=dropout, ctc_upsample=ctc_upsample,
-                            encoder=encoder)
+                            encoder=encoder, token_vocab_size=token_vocab_size)
         self.encoder_spec = encoder
         self.in_norm = nn.LayerNorm(latent_dim)
         self.in_proj = nn.Linear(latent_dim, d_model)
@@ -43,12 +44,20 @@ class SpeechAdapter(nn.Module):
         self.ctc_upsample = ctc_upsample
         self.ctc_head = nn.Linear(d_model, len(CTC_VOCAB) * ctc_upsample)
         self.eot_head = nn.Linear(d_model, 1)
+        # word-level CTC tied to the thinker's own (frozen) token embeddings: each output vector is scored by
+        # its cosine similarity to the embeddings of a fixed set of thinker tokens (`tok_vocab`), plus a learned
+        # blank. Pulls the speech vectors to where the thinker reads those words, and gives word confidences.
+        self.token_vocab_size = token_vocab_size
+        if token_vocab_size:
+            self.register_buffer("tok_vocab", torch.zeros(token_vocab_size, dtype=torch.long))
+            self.tok_blank = nn.Parameter(torch.randn(llm_dim) * 0.02)
+            self.tok_scale = nn.Parameter(torch.tensor(10.0))
 
     @classmethod
     def from_config(cls, cfg, latent_dim: int, llm_dim: int) -> "SpeechAdapter":
         return cls(latent_dim=latent_dim, llm_dim=llm_dim, d_model=cfg.d_model, n_layers=cfg.n_layers,
                    n_heads=cfg.n_heads, ff_mult=cfg.ff_mult, dropout=cfg.dropout, ctc_upsample=cfg.ctc_upsample,
-                   encoder=str(cfg.get("encoder", "mimi")))
+                   encoder=str(cfg.get("encoder", "mimi")), token_vocab_size=int(cfg.get("token_vocab_size", 0) or 0))
 
     @torch.no_grad()
     def init_scale(self, text_embedding_rms: float) -> None:
@@ -57,6 +66,19 @@ class SpeechAdapter(nn.Module):
         self.speech_start.copy_(unit / unit.pow(2).mean().sqrt() * text_embedding_rms)
         unit = torch.randn_like(self.speech_end)
         self.speech_end.copy_(unit / unit.pow(2).mean().sqrt() * text_embedding_rms)
+
+    def set_token_vocab(self, token_ids) -> None:
+        ids = torch.as_tensor(sorted(set(int(i) for i in token_ids)), dtype=torch.long)
+        if ids.numel() != self.token_vocab_size:
+            raise ValueError(f"{ids.numel()} token ids for a head of size {self.token_vocab_size}")
+        self.tok_vocab.copy_(ids.to(self.tok_vocab.device))
+
+    def token_logits(self, embeds: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+        """embeds [B, T, llm_dim] (the vectors given to the thinker), table = the thinker's input embedding
+        matrix -> [B, T, 1 + V] logits; index 0 is blank, index i >= 1 is thinker token tok_vocab[i - 1]."""
+        words = F.normalize(table[self.tok_vocab].float(), dim=-1)
+        allv = torch.cat([F.normalize(self.tok_blank.float(), dim=-1)[None], words], 0)
+        return self.tok_scale * (F.normalize(embeds.float(), dim=-1) @ allv.T)
 
     def boundary_embeddings(self) -> tuple[torch.Tensor, torch.Tensor]:
         return self.speech_start, self.speech_end

@@ -1,0 +1,39 @@
+# Adapter v3 for Qwen3-4B-Instruct-2507 (frozen): NVIDIA Nemotron streaming listener at 160 ms chunks,
+# an adapter with a word head tied to the 4B's own embedding table, trained in two stages
+# (s2s/train/align_adapter.py, then s2s/train/speech_llm.py with KD). Run: scripts/kaggle_v3.sh.
+base: qwen4b.yaml
+
+adapter:
+  encoder: nemotron:nvidia/nemotron-speech-streaming-en-0.6b@1   # @1 = 1 lookahead frame = 160 ms chunks
+  d_model: 512
+  n_layers: 6
+  n_heads: 8
+  max_frames: 400
+
+train_align:
+  output_dir: checkpoints/speech_llm_v3a
+  init_output_from: checkpoints/speech_llm_4b_v2   # its output layers already speak to this 4B
+  batch_size: 32
+  lr: 1.0e-3
+  warmup_steps: 1000
+  max_steps: 200000
+  eot_early_frames: 3
+  eval_every: 2000
+  save_every: 2000
+  log_every: 100
+  num_workers: 4
+
+train_speech_llm:
+  output_dir: checkpoints/speech_llm_v3
+  init_from: checkpoints/speech_llm_v3a
+  train_lora: false
+  kd_weight: 1.0            # match the 4B reading the text (BLSP-KD)
+  ce_weight: 0.5            # targets are the 4B's own answers (DeSTA), so CE and KD agree
+  tok_weight: 0.3           # keep the word-level alignment from stage A
+  eot_early_frames: 3
+  transcribe_prob: 0.35
+  adapter_lr: 2.0e-4
+  warmup_steps: 100
+
+runtime:
+  speech_llm_dir: checkpoints/speech_llm_v3

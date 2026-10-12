@@ -54,15 +54,18 @@ from s2s.utils import autocast_ctx, cosine_lr, count_params, resolve_dtype, save
 class SpeechLLMTrainModule(torch.nn.Module):
     """Adapter + (LoRA) thinker as one module so DDP can synchronise their gradients."""
 
-    def __init__(self, thinker: Thinker, adapter: SpeechAdapter, ctc_weight: float, eot_weight: float):
+    def __init__(self, thinker: Thinker, adapter: SpeechAdapter, ctc_weight: float, eot_weight: float,
+                 kd_weight: float = 0.0, tok_weight: float = 0.0, ce_weight: float = 1.0):
         super().__init__()
         self.adapter = adapter
         self.lm = thinker.model
         self._thinker = [thinker]  # plain list: not registered as a submodule twice
         self.ctc_weight, self.eot_weight = ctc_weight, eot_weight
+        self.kd_weight, self.tok_weight, self.ce_weight = kd_weight, tok_weight, ce_weight
 
     def forward(self, batch: dict) -> dict:
-        return speech_llm_losses(self._thinker[0], self.adapter, batch, self.ctc_weight, self.eot_weight)
+        return speech_llm_losses(self._thinker[0], self.adapter, batch, self.ctc_weight, self.eot_weight,
+                                 kd_weight=self.kd_weight, tok_weight=self.tok_weight, ce_weight=self.ce_weight)
 
 
 def build_models(cfg, device, dtype, init_from: str | None, train_lora: bool, latent_dim: int):
@@ -172,13 +175,21 @@ def main() -> None:
     thinker.model.train()
     adapter.train()
     log("models ready, wrapping for DDP ..." if world > 1 else "models ready")
-    module = SpeechLLMTrainModule(thinker, adapter, tc.ctc_weight, tc.eot_weight)
+    kd_w, tok_w = float(tc.get("kd_weight") or 0), float(tc.get("tok_weight") or 0)
+    if tok_w and not getattr(adapter, "token_vocab_size", 0):
+        log("tok_weight ignored: this adapter has no token head (train it with s2s.train.align_adapter first)")
+        tok_w = 0.0
+    module = SpeechLLMTrainModule(thinker, adapter, tc.ctc_weight, tc.eot_weight, kd_weight=kd_w, tok_weight=tok_w,
+                                  ce_weight=float(tc.get("ce_weight", 1.0)))
+    log(f"losses: ce {tc.get('ce_weight', 1.0)} kd {kd_w} tok {tok_w} ctc {tc.ctc_weight} eot {tc.eot_weight}")
     model = DDP(module, device_ids=[device.index] if device.type == "cuda" else None) if world > 1 else module
 
     common = dict(prompts=thinker.prompts, system_prompt=cfg.thinker.system_prompt,
                   transcribe_instruction=cfg.thinker.transcribe_instruction, transcribe_prob=tc.transcribe_prob,
                   max_trailing_frames=tc.max_trailing_frames, max_frames=cfg.adapter.max_frames,
-                  max_target_tokens=tc.max_target_tokens)
+                  max_target_tokens=tc.max_target_tokens, unclear_reply=cfg.runtime.get("unclear_reply", ""),
+                  eot_early=int(tc.get("eot_early_frames") or 0), teacher=kd_w > 0,
+                  tok_map=({int(t): i + 1 for i, t in enumerate(adapter.tok_vocab.tolist())} if tok_w else None))
     train_ds = SpeechLLMDataset(rows, train=True, **common)
     valid_ds = SpeechLLMDataset(valid_rows, train=False, **common)
     total_samples = int(tc.max_steps) * int(tc.batch_size) * grad_accum
@@ -211,7 +222,7 @@ def main() -> None:
             with autocast_ctx(device, dtype):
                 out = model(batch)
             scaler.scale(out["loss"] / grad_accum).backward()
-        for k in ("loss", "lm", "ctc", "eot"):
+        for k in ("loss", "lm", "ctc", "eot", "kd", "tok"):
             running[k] = running.get(k, 0.0) + float(out[k].detach()) / grad_accum
         accum += 1
         if accum < grad_accum:

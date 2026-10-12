@@ -40,30 +40,100 @@ def assemble_inputs(thinker: Thinker, adapter: SpeechAdapter, speech: torch.Tens
     return embeds, mask, (lab_out if target is not None else None)
 
 
-def target_lm_loss(thinker: Thinker, embeds: torch.Tensor, mask: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    """Next-token cross entropy computed only where there is a label.
+def _causal_lm(thinker: Thinker):
+    return thinker.model.get_base_model() if hasattr(thinker.model, "get_base_model") else thinker.model
+
+
+def target_logits(thinker: Thinker, embeds: torch.Tensor, mask: torch.Tensor, labels: torch.Tensor):
+    """LM logits only where there is a label: (logits [N, V], targets [N], row index [N]), rows in order.
 
     Running the LM head on every position (prompt + speech + target) would
     materialise [B, S, 151k] logits; for ~1000-token sequences that alone is
     several GB. Only the target positions are needed.
     """
-    causal_lm = thinker.model.get_base_model() if hasattr(thinker.model, "get_base_model") else thinker.model
+    causal_lm = _causal_lm(thinker)
     hidden = causal_lm.model(inputs_embeds=embeds, attention_mask=mask, use_cache=False).last_hidden_state
     shifted = labels[:, 1:]
     keep = shifted != -100
-    logits = causal_lm.lm_head(hidden[:, :-1][keep])
-    return F.cross_entropy(logits.float(), shifted[keep])
+    rows = torch.nonzero(keep, as_tuple=True)[0]
+    return causal_lm.lm_head(hidden[:, :-1][keep]), shifted[keep], rows
+
+
+def target_lm_loss(thinker: Thinker, embeds: torch.Tensor, mask: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    """Next-token cross entropy computed only where there is a label."""
+    logits, targets, _ = target_logits(thinker, embeds, mask, labels)
+    return F.cross_entropy(logits.float(), targets)
+
+
+@torch.no_grad()
+def teacher_logits(thinker: Thinker, teacher: list[list[int]], target: list[list[int]]) -> torch.Tensor:
+    """The thinker reading the TEXT version of the same turn (prompt ids ending with the assistant header),
+    teacher-forced on the same target: logits [N, V] for the target tokens of these rows, rows in order."""
+    device = thinker.device
+    seqs = [list(p) + list(t) for p, t in zip(teacher, target)]
+    n = max(len(x) for x in seqs)
+    ids = torch.zeros(len(seqs), n, dtype=torch.long, device=device)
+    mask = torch.zeros(len(seqs), n, dtype=torch.long, device=device)
+    labels = torch.full((len(seqs), n), -100, dtype=torch.long, device=device)
+    for i, (x, t) in enumerate(zip(seqs, target)):
+        ids[i, : len(x)] = torch.tensor(x, device=device)
+        mask[i, : len(x)] = 1
+        if t:
+            labels[i, len(x) - len(t): len(x)] = torch.tensor(t, device=device)
+    logits, _, _ = target_logits(thinker, thinker.embed(ids).to(thinker.dtype), mask, labels)
+    return logits
+
+
+def kd_loss(student: torch.Tensor, teacher: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
+    """KL(teacher || student) per target token, averaged (BLSP-KD: the thinker's next-token distribution
+    from speech should match its distribution from the text of the same turn)."""
+    t = temperature
+    log_s = F.log_softmax(student.float() / t, dim=-1)
+    log_t = F.log_softmax(teacher.float() / t, dim=-1)
+    return (log_t.exp() * (log_t - log_s)).sum(-1).mean() * t * t
+
+
+def token_ctc_loss(adapter: SpeechAdapter, embeds: torch.Tensor, lengths: torch.Tensor,
+                   tok_targets: list[list[int]], table: torch.Tensor) -> torch.Tensor:
+    """CTC over thinker tokens with the head tied to the thinker's embedding table (see SpeechAdapter).
+    tok_targets are indices into the head (1 + position in tok_vocab); empty = only blanks (unclear audio)."""
+    return token_ctc_from_logits(adapter.token_logits(embeds, table), lengths, tok_targets)
+
+
+def token_ctc_from_logits(logits: torch.Tensor, lengths: torch.Tensor, tok_targets: list[list[int]]) -> torch.Tensor:
+    logp = F.log_softmax(logits.float(), dim=-1).transpose(0, 1)  # [T, B, 1+V]
+    flat = torch.tensor([i for t in tok_targets for i in t], dtype=torch.long, device=logits.device)
+    tlen = torch.tensor([len(t) for t in tok_targets], dtype=torch.long, device=logits.device)
+    return F.ctc_loss(logp, flat, lengths.to(logits.device), tlen, blank=0, zero_infinity=True)
 
 
 def speech_llm_losses(thinker: Thinker, adapter: SpeechAdapter, batch: dict, ctc_weight: float,
-                      eot_weight: float) -> dict[str, torch.Tensor]:
+                      eot_weight: float, kd_weight: float = 0.0, tok_weight: float = 0.0,
+                      ce_weight: float = 1.0) -> dict[str, torch.Tensor]:
+    """lm (cross entropy on the target), ctc (characters), eot, and when enabled:
+    kd  (KL to the thinker reading the text of the same turn, rows that have `teacher` ids)
+    tok (word-level CTC tied to the thinker's embeddings, adapters with a token head)."""
     device = thinker.device
     latents = batch["latents"].to(device)
     lengths = batch["lengths"].to(device)
     out = adapter(latents)
     embeds, mask, labels = assemble_inputs(thinker, adapter, out["embeds"], lengths,
                                            batch["prefix"], batch["suffix"], batch["target"])
-    lm_loss = target_lm_loss(thinker, embeds, mask, labels)
+    logits, targets, rows = target_logits(thinker, embeds, mask, labels)
+    lm_loss = F.cross_entropy(logits.float(), targets)
+    zero = lm_loss.new_zeros(())
+
+    kd = zero
+    teacher = batch.get("teacher") or [None] * len(batch["target"])
+    kd_rows = [i for i, t in enumerate(teacher) if t is not None and batch["target"][i]]
+    if kd_weight and kd_rows:
+        t_logits = teacher_logits(thinker, [teacher[i] for i in kd_rows], [batch["target"][i] for i in kd_rows])
+        sel = torch.isin(rows, torch.tensor(kd_rows, device=rows.device))
+        kd = kd_loss(logits[sel], t_logits)
+
+    tok = zero
+    if tok_weight and getattr(adapter, "token_vocab_size", 0) and batch.get("tok") is not None:
+        tok = token_ctc_loss(adapter, out["embeds"], lengths, batch["tok"], thinker.embed_tokens().weight)
 
     logp = F.log_softmax(out["ctc_logits"].float(), dim=-1).transpose(0, 1)  # [T', B, V]
     ctc_loss = F.ctc_loss(logp, batch["ctc_targets"].to(device), lengths * adapter.ctc_upsample,
@@ -74,9 +144,10 @@ def speech_llm_losses(thinker: Thinker, adapter: SpeechAdapter, batch: dict, ctc
     if valid.any():
         eot_loss = F.binary_cross_entropy_with_logits(out["eot_logits"].float()[valid], eot[valid].float())
     else:
-        eot_loss = lm_loss.new_zeros(())
-    total = lm_loss + ctc_weight * ctc_loss + eot_weight * eot_loss
+        eot_loss = zero
+    total = ce_weight * lm_loss + ctc_weight * ctc_loss + eot_weight * eot_loss + kd_weight * kd + tok_weight * tok
     return {"loss": total, "lm": lm_loss.detach(), "ctc": ctc_loss.detach(), "eot": eot_loss.detach(),
+            "kd": kd.detach(), "tok": tok.detach(),
             "ctc_logits": out["ctc_logits"].detach(), "eot_logits": out["eot_logits"].detach()}
 
 

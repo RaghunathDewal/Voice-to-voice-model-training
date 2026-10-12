@@ -12,6 +12,10 @@ Specs:
     whisper:<hf id>                                  whole utterance (padded to 30 s), 4 x d_model
     parakeet:<hf id>        e.g. nvidia/parakeet-ctc-0.6b      FastConformer, 12.5 Hz, whole utterance
     moonshine:<hf id>       e.g. moonshine-ai/moonshine-streaming-small   sliding window, streams, 4 x d
+    nemotron:<hf id>[@k]    e.g. nvidia/nemotron-speech-streaming-en-0.6b@1   cache-aware streaming FastConformer,
+                            12.5 Hz, 1024-d; k = lookahead frames (0, 1, 6, 13 -> 80, 160, 560, 1120 ms chunks).
+                            One pass over the whole utterance with the chunked attention mask gives the same
+                            features as chunk-by-chunk streaming (checked against the streaming transcripts).
 """
 
 from __future__ import annotations
@@ -161,6 +165,39 @@ class MoonshineEncoder(SpeechEncoder):
         return [stack_to_12_5hz(h[i], n_frames(len(w), 16000), 4).cpu() for i, w in enumerate(wavs)]
 
 
+class NemotronEncoder(SpeechEncoder):
+    streaming = True
+
+    def __init__(self, model: str, device: torch.device, dtype: torch.dtype, lookahead: int = 1):
+        from transformers import AutoModelForRNNT, AutoProcessor
+
+        self.proc = AutoProcessor.from_pretrained(model)
+        full = AutoModelForRNNT.from_pretrained(model, dtype=dtype)
+        self.enc = full.get_encoder().to(device).eval()
+        del full
+        self.lookahead = int(lookahead)
+        self.device, self.dtype = device, dtype
+        self.name = f"nemotron:{model}@{self.lookahead}"
+        self.dim = int(self.enc.config.hidden_size)
+        self.params_m = sum(p.numel() for p in self.enc.parameters()) / 1e6
+
+    @torch.no_grad()
+    def encode(self, wavs):
+        inp = self.proc.feature_extractor(wavs, sampling_rate=16000, return_tensors="pt", padding=True)
+        mask = inp.get("attention_mask")
+        h = self.enc(input_features=inp["input_features"].to(self.device, self.dtype),
+                     attention_mask=mask.to(self.device) if mask is not None else None,
+                     num_lookahead_tokens=self.lookahead).last_hidden_state.float()
+        out = []
+        for i, w in enumerate(wavs):
+            t = n_frames(len(w), 16000)
+            x = h[i, :t]
+            if x.shape[0] < t:
+                x = torch.cat([x, x[-1:].expand(t - x.shape[0], -1)], dim=0)
+            out.append(x.cpu())
+        return out
+
+
 def build_encoder(spec: str, device: torch.device) -> SpeechEncoder:
     kind, _, model = spec.partition(":")
     half = torch.float16 if device.type == "cuda" else torch.float32
@@ -170,6 +207,9 @@ def build_encoder(spec: str, device: torch.device) -> SpeechEncoder:
         return WhisperEncoder(model or "openai/whisper-small", device, half)
     if kind == "parakeet":  # fp32: FastConformer is not validated in fp16, and T4 has no fast bf16
         return ParakeetEncoder(model or "nvidia/parakeet-ctc-0.6b", device, torch.float32)
+    if kind == "nemotron":  # fp32 like Parakeet (same FastConformer family)
+        name, _, k = model.partition("@")
+        return NemotronEncoder(name or "nvidia/nemotron-speech-streaming-en-0.6b", device, torch.float32, int(k or 1))
     if kind == "moonshine":
         return MoonshineEncoder(model or "moonshine-ai/moonshine-streaming-small", device, half)
     raise ValueError(f"unknown encoder spec {spec!r}")

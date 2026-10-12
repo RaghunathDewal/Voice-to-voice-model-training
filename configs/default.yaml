@@ -87,6 +87,10 @@ train_speech_llm:
   max_minutes: 0            # >0: fit the run into this many minutes (shrinks max_steps during warm-up)
   max_grad_norm: 1.0
   transcribe_prob: 0.3      # fraction of samples trained on the transcription task
+  kd_weight: 0.0            # >0: KL to the thinker reading the text of the same turn (adapter v3, stage B)
+  ce_weight: 1.0
+  tok_weight: 0.0           # >0 with a token-head adapter: keep the word-level CTC on during stage B
+  eot_early_frames: 0
   ctc_weight: 0.3
   eot_weight: 0.1
   max_trailing_frames: 8    # random 0..N trailing silence frames kept per sample
@@ -96,6 +100,28 @@ train_speech_llm:
   save_every: 1000
   log_every: 20
   num_workers: 2
+
+train_align:                # stage A of adapter v3 (s2s/train/align_adapter.py): no thinker layers in the loop
+  train_manifests: []
+  valid_manifest: null
+  output_dir: checkpoints/speech_llm_v3a
+  init_output_from: null    # an adapter for the same thinker: its output layers are copied
+  batch_size: 64
+  lr: 1.0e-3
+  weight_decay: 0.01
+  warmup_steps: 500
+  max_steps: 200000
+  max_minutes: 0
+  max_grad_norm: 1.0
+  tok_weight: 1.0           # word-level CTC tied to the thinker's embedding table
+  ctc_weight: 0.3           # character CTC (runtime confidence)
+  eot_weight: 0.1
+  eot_early_frames: 3       # end-of-turn fires ~240 ms before the speech ends
+  eval_every: 2000
+  eval_batches: 20
+  save_every: 2000
+  log_every: 100
+  num_workers: 4
 
 train_talker:
   train_manifests:
