@@ -74,10 +74,16 @@ elif cmd == "ckpt":                     # download each listed checkpoint folder
             snapshot_download(ckpt, local_dir=".", allow_patterns=[f"checkpoints/{name}/*.pt", f"checkpoints/{name}/*.json",
                                                                    f"checkpoints/{name}/*.yaml", f"checkpoints/{name}/DONE"])
             print(f"found {name}", flush=True)
-elif cmd == "v3data":                   # v3 manifests + every v3 feature archive
+elif cmd == "v3tars":                   # names of the feature archives already uploaded
+    print("\n".join(f for f in api.list_repo_files(data, repo_type="dataset") if f.startswith("v3/feat-")))
+elif cmd in ("v3data", "v3manifests"):  # v3 manifests (+ every v3 feature archive for v3data)
+    if not any(f.startswith("v3/manifests/") for f in api.list_repo_files(data, repo_type="dataset")):
+        print("no v3 data uploaded yet", flush=True); sys.exit(0)
     snapshot_download(data, repo_type="dataset", local_dir=".", allow_patterns=["v3/manifests/*"])
     os.makedirs("data/manifests", exist_ok=True)
     subprocess.run("cp v3/manifests/*.jsonl data/manifests/", shell=True, check=True)
+    if cmd == "v3manifests":
+        sys.exit(0)
     tars = sorted(f for f in api.list_repo_files(data, repo_type="dataset") if f.startswith("v3/feat-") and f.endswith(".tar"))
     print(f"{len(tars)} v3 feature archives", flush=True)
     for name in tars:
@@ -110,10 +116,11 @@ if [ "$PART" = data ]; then
         "slurp_train|slurp|train|--max-utts $(n 15000)|$(n 8000)"
         "slurp_dev|slurp|devel|--max-utts $(n 400)|0"
     )
+    step restore hf v3manifests   # a rerun skips everything an earlier data session already uploaded
     download() {
         for job in "${SETS[@]}"; do
             IFS='|' read -r name preset split extra _ <<< "$job"
-            [ -f "$M/${name}_raw.jsonl" ] && { echo "$name: have it"; continue; }
+            [ -f "$M/${name}_raw.jsonl" ] || [ -f "$M/${name}_nm.jsonl" ] && { echo "$name: have it"; continue; }
             accent=()
             [ "$name" = cv_india ] && accent=(--accent-match "India|South Asia")
             # shellcheck disable=SC2086
@@ -124,7 +131,7 @@ if [ "$PART" = data ]; then
     step download download
 
     hotel() {  # hotel speech with tools, regenerated (only features of the old hotel audio were kept)
-        [ -f "$M/hotel5_train_audio.jsonl" ] && { echo "hotel audio: have it"; return; }
+        [ -f "$M/hotel5_train_audio.jsonl" ] || [ -f "$M/hotel5_eval_nm.jsonl" ] && { echo "hotel audio: have it"; return; }
         apt-get -qq install -y espeak-ng > /dev/null 2>&1 || true
         pip install -q "kokoro>=0.9" "misaki[en]"
         python -m s2s.prep.hotel_data $CFG --version 3 --train "$(n 10000)" --eval 300 --prefix hotel5
@@ -137,6 +144,19 @@ am_eric am_liam am_onyx am_echo bf_alice bf_isabella bf_lily bm_daniel bm_lewis 
     }
     step hotel hotel
 
+    upload() {  # manifests + the feature archives not uploaded yet
+        mkdir -p "$WORK/up/v3/manifests"
+        cp $M/*_nm.jsonl "$WORK/up/v3/manifests/"
+        ls $M/*_q4.jsonl > /dev/null 2>&1 && cp $M/*_q4.jsonl "$WORK/up/v3/manifests/"
+        local have; have=$(hf v3tars)
+        for d in data/features/*_nm; do
+            [ -d "$d" ] || continue
+            local t="v3/feat-$(basename "$d").tar"
+            grep -qx "$t" <<< "$have" || tar -C data -cf "$WORK/up/$t" "features/$(basename "$d")"
+        done
+        du -sh "$WORK/up"
+        hf push "$WORK/up" "" dataset && rm -rf "${WORK:?}/up"
+    }
     features() {  # Nemotron 160 ms features; ~45% of clips get echo / band / noise, of those 40% a phone line
         feat() {  # feat <raw manifest> <out name> [extract args]
             local inp=$1 out=$2; shift 2
@@ -150,10 +170,11 @@ am_eric am_liam am_onyx am_echo bf_alice bf_isabella bf_lily bm_daniel bm_lewis 
         feat hotel5_train_audio hotel5_train_nm --augment-prob 0.6 --phone-prob 0.5
         feat hotel5_eval_audio hotel5_eval_nm
         # "sorry, I didn't catch that": unintelligible versions of other clips
-        head -n "$(n 4000)" $M/cv_train_raw.jsonl > $M/unclear_raw.jsonl
+        [ -f $M/unclear_nm.jsonl ] || head -n "$(n 4000)" $M/cv_train_raw.jsonl > $M/unclear_raw.jsonl
         feat unclear_raw unclear_nm --unclear
     }
     step features features
+    step upload_features upload
 
     answers() {  # the 4B's own answers to the correct transcripts (self-generated targets)
         for job in "${SETS[@]}"; do
@@ -170,17 +191,7 @@ am_eric am_liam am_onyx am_echo bf_alice bf_isabella bf_lily bm_daniel bm_lewis 
     }
     step answers answers
 
-    upload() {
-        mkdir -p "$WORK/up/v3/manifests"
-        cp $M/*_nm.jsonl $M/*_q4.jsonl "$WORK/up/v3/manifests/"
-        for d in data/features/*_nm; do
-            local t="$WORK/up/v3/feat-$(basename "$d").tar"
-            [ -f "$t" ] || tar -C data -cf "$t" "features/$(basename "$d")"
-        done
-        du -sh "$WORK/up"
-        hf push "$WORK/up" "" dataset && rm -rf "$WORK/up"
-    }
-    step upload upload
+    step upload_answers upload
     say "PART data DONE"
 fi
 
