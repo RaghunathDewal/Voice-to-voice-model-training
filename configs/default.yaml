@@ -146,6 +146,39 @@ train_talker:
   log_every: 20
   num_workers: 2
 
+train_duplex:               # full-duplex experiment (s2s/train/duplex.py); data from s2s.prep.duplex_data
+  llm: Qwen/Qwen3-0.6B
+  dtype: auto               # fp16 on T4, bf16 on newer GPUs
+  lora: {r: 32, alpha: 64, dropout: 0.05, target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]}
+  gradient_checkpointing: true
+  feat_dim: 1024            # listener vector width (Nemotron)
+  codebook_size: 2048
+  depth_d_model: 512
+  depth_layers: 4
+  depth_heads: 8
+  acoustic_delay: 1
+  pad_weight: 0.5           # text loss weight of "nothing to say" frames
+  semantic_weight: 2.0      # Mimi codebook 1 weighs double in the audio loss
+  train_manifest: data/manifests/duplex_train.jsonl
+  valid_manifest: data/manifests/duplex_eval.jsonl
+  output_dir: checkpoints/duplex
+  init_from: null
+  max_frames: 625           # 50 s per call; longer calls are cut
+  batch_size: 1
+  grad_accum: 8
+  lr: 1.0e-3                # new layers (fusion, depth, heads)
+  lora_lr: 2.0e-4
+  weight_decay: 0.01
+  warmup_steps: 200
+  max_steps: 6000
+  max_minutes: 0
+  max_grad_norm: 1.0
+  eval_every: 500
+  eval_batches: 25
+  save_every: 500
+  log_every: 20
+  num_workers: 2
+
 runtime:
   speech_llm_dir: checkpoints/speech_llm_tools   # adapter.pt + lora/
   talker_dir: checkpoints/talker
