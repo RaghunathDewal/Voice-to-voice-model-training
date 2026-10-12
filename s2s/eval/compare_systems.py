@@ -95,13 +95,24 @@ def paraphrase(rows: list[dict], device, name: str = "Qwen/Qwen3-4B-Instruct-250
     return changed
 
 
-def build_testset(args, device) -> list[dict]:
-    path = os.path.join(args.out, "testset.jsonl")
+def build_texts(args, device) -> list[dict]:
+    """Step 1 (GPU): the new requests, re-worded when asked. Cached in texts.jsonl."""
+    path = os.path.join(args.out, "texts.jsonl")
     if os.path.exists(path):
         return read_jsonl(path)
     rows = generate_examples_v3(args.n, seed=args.seed, follow_up_prob=0.0)
     if args.paraphrase:
         print(f"paraphrased {paraphrase(rows, device, args.paraphrase_model)} of {len(rows)} requests", flush=True)
+    write_jsonl(path, rows)
+    return rows
+
+
+def build_testset(args, device) -> list[dict]:
+    """Step 2 (Kokoro TTS, may run in a separate Python 3.12 env): speech for every request (+ noisy copies)."""
+    path = os.path.join(args.out, "testset.jsonl")
+    if os.path.exists(path):
+        return read_jsonl(path)
+    rows = build_texts(args, device)
     from kokoro import KPipeline
 
     pipes, rng = {}, random.Random(args.seed)
@@ -265,10 +276,17 @@ def main() -> None:
     p.add_argument("--whisper", default="openai/whisper-small")
     p.add_argument("--out", default="results/compare")
     p.add_argument("--device", default="auto")
+    p.add_argument("--stage", default="all", choices=["all", "texts", "audio"],
+                   help="texts: only write the requests; audio: only speak them (Kokoro); all: everything")
     args = p.parse_args()
     device = resolve_device(args.device)
     os.makedirs(args.out, exist_ok=True)
+    if args.stage == "texts":
+        build_texts(args, device)
+        return
     items = build_testset(args, device)
+    if args.stage == "audio":
+        return
     by_id = {r["id"]: r for r in items}
     print(f"{len(items)} test recordings ({len(by_id)} requests)", flush=True)
 

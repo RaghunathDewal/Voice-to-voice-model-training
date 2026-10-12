@@ -32,8 +32,22 @@ say() { echo "[$(date +%H:%M:%S)] $*"; }
 say ">>> setup"
 apt-get -qq install -y espeak-ng > /dev/null 2>&1 || true
 pip install -q --no-deps -e .
-pip install -q jiwer peft accelerate soundfile librosa huggingface_hub "kokoro>=0.9" "misaki[en]"
+pip install -q jiwer peft accelerate soundfile librosa huggingface_hub
 python -c "from transformers import AutoModelForRNNT, ParakeetForCTC" 2>/dev/null || pip install -q -U "transformers>=5.13"
+# Kokoro (it speaks the test requests) supports Python <= 3.12; newer Kaggle images run 3.13
+if python -c "import sys; sys.exit(0 if sys.version_info[:2] <= (3, 12) else 1)"; then
+    pip install -q "kokoro>=0.9" "misaki[en]"
+    TTS_PY=python
+else
+    say "$(python -V) is too new for Kokoro: a small Python 3.12 environment speaks the test requests"
+    pip install -q uv
+    uv venv -q -p 3.12 --seed /tmp/tts312
+    uv pip install -p /tmp/tts312/bin/python -q torch --index-url https://download.pytorch.org/whl/cpu
+    uv pip install -p /tmp/tts312/bin/python -q "kokoro>=0.9" "misaki[en]" soundfile scipy numpy pyyaml jiwer \
+        huggingface_hub
+    uv pip install -p /tmp/tts312/bin/python -q --no-deps -e .
+    TTS_PY=/tmp/tts312/bin/python
+fi
 python -c "import torch; [print(i, torch.cuda.get_device_name(i)) for i in range(torch.cuda.device_count())]"
 
 say ">>> download the three systems"
@@ -53,7 +67,12 @@ EOF
 ARGS=(--n "$N" --systems "$SYSTEMS" --out "$OUT")
 [ "$PARAPHRASE" = 1 ] && ARGS+=(--paraphrase)
 [ "$NOISY" = 1 ] && ARGS+=(--noisy)
-say ">>> compare (${ARGS[*]})"
+say ">>> test requests (${ARGS[*]})"
+python -m s2s.eval.compare_systems "${ARGS[@]}" --stage texts 2>&1 | grep -v -e "Warning" -e "warnings.warn" || true
+say ">>> speaking them (Kokoro)"
+$TTS_PY -m s2s.eval.compare_systems "${ARGS[@]}" --stage audio --device cpu 2>&1 | grep -v -e "Warning" -e "warnings.warn" || true
+[ -f "$OUT/testset.jsonl" ] || { say "the test audio was not created: see the lines above"; exit 1; }
+say ">>> compare"
 python -m s2s.eval.compare_systems "${ARGS[@]}" 2>&1 | grep --line-buffered -v -e "Warning" -e "warnings.warn" | tee "$OUT/compare.log"
 
 say ">>> upload the results (needs a write token; skipped otherwise)"
