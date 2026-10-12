@@ -269,6 +269,28 @@ def write_manifest(cfg, split: str, calls: list[dict], encoder: str) -> None:
     print(write_jsonl(manifest_path(cfg, split), rows), f"calls -> {manifest_path(cfg, split)}")
 
 
+def spawn_shards(argv: list[str], procs: int, n_gpus: int) -> None:
+    import subprocess
+
+    out, skip = [], False
+    for a in argv:  # drop --procs N (the shards are the workers)
+        if skip:
+            skip = False
+        elif a == "--procs":
+            skip = True
+        elif not a.startswith("--procs="):
+            out.append(a)
+    argv = out
+    running = []
+    for k in range(procs):
+        env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(k % max(1, n_gpus)))
+        cmd = [sys.executable, "-m", "s2s.prep.duplex_data", *argv, "--shard", str(k), "--num-shards", str(procs)]
+        running.append(subprocess.Popen(cmd, env=env))
+    failed = [k for k, p in enumerate(running) if p.wait() != 0]
+    if failed:
+        raise SystemExit(f"shard(s) {failed} failed; re-run (finished calls are kept)")
+
+
 def main() -> None:
     p = base_parser(__doc__)
     p.add_argument("stage", choices=["script", "audio", "features"])
@@ -281,6 +303,7 @@ def main() -> None:
     p.add_argument("--phone-prob", type=float, default=0.4)
     p.add_argument("--drop-audio", action="store_true", help="features: delete the wavs once a call is done")
     p.add_argument("--gpus", type=int, default=0)
+    p.add_argument("--procs", type=int, default=0, help="worker processes in total (several may share a GPU)")
     p.add_argument("--shard", type=int, default=None, help=argparse.SUPPRESS)
     p.add_argument("--num-shards", type=int, default=1, help=argparse.SUPPRESS)
     args = p.parse_args()
@@ -288,8 +311,12 @@ def main() -> None:
     if args.stage == "script":
         return stage_script(cfg, args)
     n = resolve_num_workers(args.gpus)
-    if args.shard is None and n > 1 and cfg.device != "cpu":
-        run_sharded("s2s.prep.duplex_data", strip_gpu_args(sys.argv[1:]), n)
+    procs = max(n, args.procs)
+    if args.shard is None and procs > 1 and cfg.device != "cpu":
+        if procs == n:
+            run_sharded("s2s.prep.duplex_data", strip_gpu_args(sys.argv[1:]), n)
+        else:  # several processes per GPU (Kokoro is mostly CPU-bound)
+            spawn_shards(strip_gpu_args(sys.argv[1:]), procs, n)
         if args.stage == "features":
             write_manifest(cfg, args.split, read_jsonl(calls_path(cfg, args.split)), args.encoder)
         return
