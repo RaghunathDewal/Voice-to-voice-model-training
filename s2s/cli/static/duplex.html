@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Duplex Concierge</title>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --ink: #1b1f24; --muted: #5f6b7a; --line: #e2e6eb;
+  --accent: #1f5fbf; --accent-ink: #ffffff; --agent: #eaf1fc; --tool: #fff7e6; --tool-line: #f0d9a8;
+  --ok: #1e8e3e; --warn: #b26a00; --bad: #c5221f;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #111418; --panel: #1a1f25; --ink: #e8ebef; --muted: #9aa5b1; --line: #2b323a;
+    --accent: #6ea0ff; --accent-ink: #0b1220; --agent: #1d2a3d; --tool: #2d2614; --tool-line: #5a4a22;
+    --ok: #6fcf87; --warn: #f0b35a; --bad: #ff7b72;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 980px; margin: 0 auto; padding: 20px 16px 40px; }
+h1 { font-size: 20px; margin: 0 0 4px; }
+.sub { color: var(--muted); margin: 0 0 16px; }
+.bar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 14px; }
+button { font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--ink); padding: 9px 16px; border-radius: 8px; cursor: pointer; }
+button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }
+button:disabled { opacity: .5; cursor: default; }
+label { color: var(--muted); font-size: 13px; display: inline-flex; align-items: center; gap: 6px; }
+input[type=number] { width: 64px; font: inherit; padding: 5px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--ink); }
+.grid { display: grid; grid-template-columns: 300px 1fr; gap: 14px; }
+@media (max-width: 760px) { .grid { grid-template-columns: 1fr; } }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
+.card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 8px; }
+.stats { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 12px; }
+.stat b { display: block; font-size: 18px; font-variant-numeric: tabular-nums; }
+.stat span { color: var(--muted); font-size: 12px; }
+.meter { height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; margin: 4px 0 10px; }
+.meter i { display: block; height: 100%; width: 0; background: var(--ok); transition: width .08s; }
+.pill { display: inline-block; font-size: 12px; padding: 2px 8px; border-radius: 99px; border: 1px solid var(--line); margin: 0 4px 4px 0; }
+details { margin-top: 8px; } summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+pre { white-space: pre-wrap; font-size: 12px; max-height: 260px; overflow: auto; color: var(--muted); }
+#chat { min-height: 360px; max-height: 62vh; overflow: auto; display: flex; flex-direction: column; gap: 8px; }
+.msg { padding: 9px 12px; border-radius: 10px; background: var(--agent); max-width: 92%; }
+.msg small { display: block; color: var(--muted); font-size: 11px; margin-bottom: 2px; }
+.tool { background: var(--tool); border: 1px solid var(--tool-line); font-size: 13px; }
+.tool code { font-size: 12px; word-break: break-word; }
+.hint { color: var(--muted); font-size: 13px; }
+#conn.on { color: var(--ok); } #conn.off { color: var(--bad); }
+.lagbad { color: var(--warn); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Full-duplex hotel concierge <span class="hint">(experiment)</span></h1>
+  <p class="sub">Use headphones, press Start and just talk. The agent greets you first. You can speak while it talks: it should stop when you cut in and keep going when you only say "mhm".</p>
+  <div class="bar">
+    <button id="start" class="primary">Start call</button>
+    <button id="newcall" disabled>New call</button>
+    <button id="stop" disabled>End</button>
+    <label>temperature <input id="temp" type="number" step="0.1" min="0" max="1.5" value="0.6"></label>
+    <label>top-k <input id="topk" type="number" step="5" min="0" max="500" value="30"></label>
+    <label><input id="raw" type="checkbox"> raw mic</label>
+    <span id="conn" class="off">Disconnected</span>
+  </div>
+  <div class="grid">
+    <div>
+      <div class="card">
+        <h2>Live</h2>
+        <div class="stats">
+          <div class="stat"><b id="lag">–</b><span>model lag</span></div>
+          <div class="stat"><b id="rtf">–</b><span>compute / real time</span></div>
+        </div>
+        <span class="hint">your microphone</span><div class="meter"><i id="micm"></i></div>
+        <span class="hint">agent voice</span><div class="meter"><i id="agm"></i></div>
+        <p class="hint" id="speedhint">Compute must stay below 1.0 (real time). Above it, the lag grows.</p>
+      </div>
+      <div class="card" style="margin-top:14px">
+        <h2>This call's hotel</h2>
+        <div id="prop" class="hint">Start a call to get a random property.</div>
+        <div id="tools"></div>
+        <details><summary>system prompt</summary><pre id="sys"></pre></details>
+      </div>
+    </div>
+    <div class="card">
+      <h2>What the agent says (its inner text) and does</h2>
+      <div id="chat"></div>
+    </div>
+  </div>
+</main>
+<script>
+const $ = s => document.querySelector(s);
+let ctx, ws, stream, worklet, micAn, agAn, outGain, playHead = 0, lastText = 0, cur = null;
+
+function setConn(cls, text) { const c = $('#conn'); c.className = cls; c.textContent = text; }
+function addMsg(cls, html) { const d = document.createElement('div'); d.className = 'msg ' + cls; d.innerHTML = html; $('#chat').appendChild(d); $('#chat').scrollTop = 1e9; return d; }
+function esc(s) { return String(s).replace(/[&<>]/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;'}[c])); }
+function agentText(t) {
+  const now = performance.now();
+  if (!cur || now - lastText > 1200) { cur = addMsg('', '<small>agent</small><span></span>'); }
+  lastText = now;
+  cur.querySelector('span').textContent += t; $('#chat').scrollTop = 1e9;
+}
+function playChunk(pcm) {
+  const f = new Float32Array(pcm.length); for (let i = 0; i < pcm.length; i++) f[i] = pcm[i] / 32768;
+  const buf = ctx.createBuffer(1, f.length, 24000); buf.copyToChannel(f, 0);
+  const s = ctx.createBufferSource(); s.buffer = buf; s.connect(outGain);
+  const now = ctx.currentTime;
+  if (playHead < now + 0.02) playHead = now + 0.15;   // jitter buffer; also recovers after a stall
+  s.start(playHead); playHead += buf.duration;
+}
+function meters() {
+  const lvl = an => { if (!an) return 0; const a = new Float32Array(an.fftSize); an.getFloatTimeDomainData(a); let s = 0; for (const v of a) s += v * v; return Math.min(1, Math.sqrt(s / a.length) * 6); };
+  $('#micm').style.width = (lvl(micAn) * 100) + '%'; $('#agm').style.width = (lvl(agAn) * 100) + '%';
+  requestAnimationFrame(meters);
+}
+async function start() {
+  ctx = ctx || new AudioContext();
+  await ctx.resume();
+  outGain = ctx.createGain(); agAn = ctx.createAnalyser(); agAn.fftSize = 1024; outGain.connect(agAn); outGain.connect(ctx.destination);
+  const clean = !$('#raw').checked;
+  stream = await navigator.mediaDevices.getUserMedia({audio: {echoCancellation: true, noiseSuppression: clean, autoGainControl: clean, channelCount: 1}});
+  const code = "class C extends AudioWorkletProcessor{process(i){const c=i[0][0];if(c)this.port.postMessage(c.slice(0));return true}};registerProcessor('cap',C);";
+  await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([code], {type: 'application/javascript'})));
+  worklet = new AudioWorkletNode(ctx, 'cap'); const src = ctx.createMediaStreamSource(stream);
+  src.connect(worklet); const mute = ctx.createGain(); mute.gain.value = 0; worklet.connect(mute).connect(ctx.destination);
+  micAn = ctx.createAnalyser(); micAn.fftSize = 1024; src.connect(micAn);
+  let buf = [], n = 0; const chunk = Math.round(ctx.sampleRate * 0.08);
+  worklet.port.onmessage = e => {   // the microphone streams ALL the time (full duplex)
+    if (!ws || ws.readyState !== 1) return;
+    buf.push(e.data); n += e.data.length; if (n < chunk) return;
+    const pcm = new Int16Array(n); let o = 0;
+    for (const b of buf) for (let i = 0; i < b.length; i++) pcm[o++] = Math.max(-1, Math.min(1, b[i])) * 32767;
+    buf = []; n = 0; ws.send(pcm.buffer);
+  };
+  setConn('', 'Connecting');
+  ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws'); ws.binaryType = 'arraybuffer';
+  ws.onopen = () => {
+    ws.send(JSON.stringify({type: 'hello', sr: ctx.sampleRate, temperature: +$('#temp').value, top_k: +$('#topk').value}));
+    setConn('on', 'Connected'); $('#start').disabled = true; $('#stop').disabled = false; $('#newcall').disabled = false;
+  };
+  ws.onclose = () => { setConn('off', 'Disconnected'); stopMic(); $('#start').disabled = false; $('#stop').disabled = true; $('#newcall').disabled = true; };
+  ws.onmessage = ev => {
+    if (typeof ev.data !== 'string') { playChunk(new Int16Array(ev.data)); return; }
+    const m = JSON.parse(ev.data);
+    if (m.type === 'session') {
+      $('#chat').innerHTML = ''; cur = null;
+      $('#prop').textContent = m.property; $('#sys').textContent = m.system;
+      $('#tools').innerHTML = (m.tools.length ? m.tools : ['no tools']).map(t => `<span class="pill">${esc(t)}</span>`).join('');
+      addMsg('', `<small>new call · temperature ${m.temperature}, top-k ${m.top_k}</small>Waiting for the agent to greet you…`);
+    } else if (m.type === 'text') agentText(m.t);
+    else if (m.type === 'tool') { cur = null; addMsg('tool', `<small>tool call</small><code>${esc(JSON.stringify(m.call))}</code><br><small>result</small><code>${esc(JSON.stringify(m.result))}</code>`); }
+    else if (m.type === 'stats') {
+      $('#lag').textContent = m.lag_ms + ' ms'; $('#lag').className = m.lag_ms > 400 ? 'lagbad' : '';
+      $('#rtf').textContent = m.rtf.toFixed(2); $('#rtf').className = m.rtf > 1 ? 'lagbad' : '';
+    } else if (m.type === 'busy') { addMsg('tool', 'Someone else is in a call on this server. Try again later.'); }
+  };
+}
+function stopMic() { if (stream) stream.getTracks().forEach(t => t.stop()); stream = null; if (worklet) worklet.disconnect(); worklet = null; micAn = null; }
+$('#start').onclick = () => start().catch(e => { addMsg('tool', 'Could not start: ' + esc(e.message)); setConn('off', 'Disconnected'); });
+$('#stop').onclick = () => { if (ws) ws.close(); };
+$('#newcall').onclick = () => { if (ws && ws.readyState === 1) { playHead = 0; ws.send(JSON.stringify({type: 'reset'})); } };
+requestAnimationFrame(meters);
+</script>
+</body>
+</html>
