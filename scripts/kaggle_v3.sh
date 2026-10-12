@@ -25,6 +25,10 @@ DATA_REPO=$HF_USER/s2s-data-pk
 BUDGET_MIN=${BUDGET_MIN:-500}          # minutes this session may use in total (Kaggle stops at ~9-12 h)
 SCALE=${SCALE:-1.0}                    # PART=data: multiply every hour / row count (0.05 for a quick trial)
 N_TEST=${N_TEST:-150}
+POLISH_BATCH=${POLISH_BATCH:-4}        # PART=polish: batch x accumulation = 32 (a big GPU: 16 x 2, same result)
+POLISH_ACCUM=${POLISH_ACCUM:-8}
+TEST_MIN=${TEST_MIN:-110}              # PART=polish: minutes kept for the test after training
+TEST_PAR=${TEST_PAR:-1}                # PART=polish: test sets run at the same time on each GPU
 REPO_DIR=$(cd "$(dirname "$0")/.." && pwd)
 WORK=${WORK:-/tmp/s2s_v3}
 OUT=${OUT:-$( [ -d /kaggle/working ] && echo /kaggle/working/v3_$PART || echo "$WORK/out_$PART")}
@@ -99,7 +103,7 @@ pip install -q jiwer peft accelerate soundfile librosa pyarrow huggingface_hub
 python -c "from transformers import AutoModelForRNNT" 2>/dev/null || pip install -q -U "transformers>=5.13"
 python -c "import torch, transformers; print('transformers', transformers.__version__, '|', torch.cuda.device_count(), 'x', \
 torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')"
-[ "$NGPU" -gt 1 ] && TRAIN="torchrun --standalone --nproc_per_node=$NGPU -m" || TRAIN="python -m"
+[ "$NGPU" -gt 1 ] && LAUNCH="torchrun --standalone --nproc_per_node=$NGPU -m" || LAUNCH="python -m"
 
 # =============================================================== PART data
 if [ "$PART" = data ]; then
@@ -216,12 +220,19 @@ $(mix "$(q4 spokenwoz_train)" 0.15)$(mix "$(q4 slurp_train)" 0.12)$(mix "$(q4 ho
     ( while sleep 1200; do [ -f checkpoints/speech_llm_v3a/adapter.pt ] && hf push checkpoints/speech_llm_v3a checkpoints/speech_llm_v3a; done ) \
         > "$OUT/logs/sync.log" 2>&1 &
     SYNC=$!
-    MIN=$(( $(minutes_left) - 25 ))
-    step align $TRAIN s2s.train.align_adapter $CFG --set "train_align.train_manifests=$TRAIN" \
-        train_align.valid_manifest=$M/slurp_dev_nm.jsonl train_align.max_minutes="$MIN" \
-        train_align.resume_from=checkpoints/speech_llm_v3a
+    ok=0
+    for attempt in 1 2 3 4 5; do  # an error mid-run restarts from the last save (every eval) with a new data order
+        MIN=$(( $(minutes_left) - 25 ))
+        [ "$MIN" -ge 20 ] || break
+        if step align_$attempt $LAUNCH s2s.train.align_adapter $CFG --set "train_align.train_manifests=$TRAIN" \
+            train_align.valid_manifest=$M/slurp_dev_nm.jsonl train_align.max_minutes="$MIN" \
+            train_align.resume_from=checkpoints/speech_llm_v3a seed=$(( 1233 + attempt )); then ok=1; break; fi
+        say "align stopped with an error (attempt $attempt, see $OUT/logs/align_$attempt.log); restarting in 60 s"
+        pkill -f s2s.train.align_adapter 2>/dev/null || true; sleep 60
+    done
     kill $SYNC 2>/dev/null || true
-    touch checkpoints/speech_llm_v3a/DONE
+    [ -f checkpoints/speech_llm_v3a/adapter.pt ] || { say "align saved nothing: see $OUT/logs/align_*.log"; exit 1; }
+    if [ "$ok" = 1 ]; then touch checkpoints/speech_llm_v3a/DONE; else say "align did not finish cleanly: NOT marked DONE"; fi
     hf push checkpoints/speech_llm_v3a checkpoints/speech_llm_v3a
     say "PART align DONE: checkpoints/speech_llm_v3a"
 fi
@@ -240,14 +251,23 @@ $(mix "$(q4 ami_ihm)" 0.04)$(mix "$(q4 ami_sdm)" 0.04)$(mix "$(q4 mls_train)" 0.
         ( while sleep 1200; do [ -f checkpoints/speech_llm_v3/adapter.pt ] && hf push checkpoints/speech_llm_v3 checkpoints/speech_llm_v3; done ) \
             > "$OUT/logs/sync.log" 2>&1 &
         SYNC=$!
-        MIN=$(( $(minutes_left) - 110 ))  # leave time for the test
-        step polish $TRAIN s2s.train.speech_llm $CFG --set train_speech_llm.init_from="checkpoints/$INIT" \
-            "train_speech_llm.train_manifests=$TRAIN" train_speech_llm.valid_manifest="$(q4 hotel5_eval)" \
-            train_speech_llm.max_steps=20000 train_speech_llm.max_minutes="$MIN" train_speech_llm.batch_size=4 \
-            train_speech_llm.grad_accum=8 train_speech_llm.num_workers=4 train_speech_llm.log_every=10 \
-            train_speech_llm.eval_every=250 train_speech_llm.eval_batches=10 train_speech_llm.save_every=250
+        ok=0
+        for attempt in 1 2 3 4 5; do  # an error mid-run restarts from the last save (every 250 steps)
+            MIN=$(( $(minutes_left) - TEST_MIN ))  # leave time for the test
+            [ "$MIN" -ge 15 ] || break
+            [ "$attempt" -gt 1 ] && [ -f checkpoints/speech_llm_v3/adapter.pt ] && INIT=speech_llm_v3
+            if step polish_$attempt $LAUNCH s2s.train.speech_llm $CFG --set train_speech_llm.init_from="checkpoints/$INIT" \
+                "train_speech_llm.train_manifests=$TRAIN" train_speech_llm.valid_manifest="$(q4 hotel5_eval)" \
+                train_speech_llm.max_steps=20000 train_speech_llm.max_minutes="$MIN" train_speech_llm.batch_size="$POLISH_BATCH" \
+                train_speech_llm.grad_accum="$POLISH_ACCUM" train_speech_llm.num_workers=4 train_speech_llm.log_every=10 \
+                train_speech_llm.eval_every=250 train_speech_llm.eval_batches=10 train_speech_llm.save_every=250 \
+                seed=$(( 1233 + attempt )); then ok=1; break; fi
+            say "polish stopped with an error (attempt $attempt, see $OUT/logs/polish_$attempt.log); restarting in 60 s"
+            pkill -f s2s.train.speech_llm 2>/dev/null || true; sleep 60
+        done
         kill $SYNC 2>/dev/null || true
-        touch checkpoints/speech_llm_v3/DONE
+        [ -f checkpoints/speech_llm_v3/adapter.pt ] || { say "polish saved nothing: see $OUT/logs/polish_*.log"; exit 1; }
+        [ "$ok" = 1 ] && touch checkpoints/speech_llm_v3/DONE
         hf push checkpoints/speech_llm_v3 checkpoints/speech_llm_v3
     fi
 
@@ -260,11 +280,12 @@ $(mix "$(q4 ami_ihm)" 0.04)$(mix "$(q4 ami_sdm)" 0.04)$(mix "$(q4 mls_train)" 0.
         # the same names as the baseline test, so the noisy clips get exactly the same noise
         f slurp_test 0.0 slurp_pk; f slurp_test 1.0 slurp_noisy_pk; f spokenwoz_test 0.0 spokenwoz_pk
         f edacc_test 0.0 edacc_pk; f edacc_test 1.0 edacc_noisy_pk
-        gpu=0
+        i=0
         for s in slurp_pk slurp_noisy_pk spokenwoz_pk edacc_pk edacc_noisy_pk "$(basename "$(q4 hotel5_eval)" .jsonl)"; do
+            gpu=$(( i % NGPU ))
             CUDA_VISIBLE_DEVICES=$gpu python -m s2s.eval.speech_vs_text $CFG --speech-llm-dir checkpoints/speech_llm_v3 \
                 --manifest "$M/$s.jsonl" --max "$N_TEST" --name "$s" --out-dir "$OUT" > "$OUT/logs/test_$s.log" 2>&1 &
-            gpu=$(( (gpu + 1) % NGPU )); [ "$gpu" = 0 ] && wait
+            i=$(( i + 1 )); [ $(( i % (NGPU * TEST_PAR) )) = 0 ] && wait
         done
         wait
         grep -h "^\[" "$OUT"/logs/test_*.log || true
