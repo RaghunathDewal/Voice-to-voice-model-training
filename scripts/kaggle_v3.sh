@@ -183,10 +183,13 @@ am_eric am_liam am_onyx am_echo bf_alice bf_isabella bf_lily bm_daniel bm_lewis 
             [ -f "$M/${name}_q4.jsonl" ] && continue
             python -m s2s.prep.distill $CFG --gpus "$NGPU" --batch-size 48 --max-new-tokens 80 --max-utts "$count" \
                 --in "$M/${name}_nm.jsonl" --out "$M/${name}_q4.jsonl" | tail -1
+            upload | tail -1   # each finished set is saved, so a rerun only answers the rest
         done
         for s in hotel5_train hotel5_eval; do  # hotel rows: answered with their own prompt and tools
-            [ -f "$M/${s}_q4.jsonl" ] || python -m s2s.prep.distill $CFG --gpus "$NGPU" --batch-size 16 \
-                --max-new-tokens 120 --max-utts 100000 --row-prompts --in "$M/${s}_nm.jsonl" --out "$M/${s}_q4.jsonl" | tail -1
+            [ -f "$M/${s}_q4.jsonl" ] && continue
+            python -m s2s.prep.distill $CFG --gpus "$NGPU" --batch-size 16 --max-new-tokens 120 --max-utts 100000 \
+                --row-prompts --in "$M/${s}_nm.jsonl" --out "$M/${s}_q4.jsonl" | tail -1
+            upload | tail -1
         done
     }
     step answers answers
