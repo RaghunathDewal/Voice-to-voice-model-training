@@ -69,6 +69,7 @@ ARGS=(--n "$N" --systems "$SYSTEMS" --out "$OUT")
 [ "$NOISY" = 1 ] && ARGS+=(--noisy)
 say ">>> test requests (${ARGS[*]})"
 python -m s2s.eval.compare_systems "${ARGS[@]}" --stage texts 2>&1 | grep -v -e "Warning" -e "warnings.warn" || true
+[ -f "$OUT/texts.jsonl" ] || { say "the test requests were not created: see the lines above"; exit 1; }
 say ">>> speaking them (Kokoro)"
 $TTS_PY -m s2s.eval.compare_systems "${ARGS[@]}" --stage audio --device cpu 2>&1 | grep -v -e "Warning" -e "warnings.warn" || true
 [ -f "$OUT/testset.jsonl" ] || { say "the test audio was not created: see the lines above"; exit 1; }
