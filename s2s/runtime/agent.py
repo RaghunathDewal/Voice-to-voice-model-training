@@ -104,7 +104,9 @@ class VoiceAgent:
         else:
             from s2s.models.encoders import build_encoder
 
-            self.input_encoder = build_encoder(self.encoder_spec, self.device)
+            # runtime.encoder_device: put the listener on another GPU (e.g. cuda:1 on Kaggle's 2x T4 next to a 4B thinker)
+            enc_dev = rt.get("encoder_device")
+            self.input_encoder = build_encoder(self.encoder_spec, resolve_device(enc_dev) if enc_dev else self.device)
         # only Mimi is causal: its frames never change, so they can be prefilled while the user speaks
         self.incremental_input = self.input_encoder is None
         print(f"[agent] input encoder: {self.encoder_spec}")

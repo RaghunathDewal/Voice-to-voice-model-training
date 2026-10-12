@@ -180,6 +180,7 @@ train_duplex:               # full-duplex experiment (s2s/train/duplex.py); data
   num_workers: 2
 
 runtime:
+  encoder_device: null      # e.g. cuda:1: run the speech listener on a second GPU (Kaggle 2x T4 with a 4B thinker)
   speech_llm_dir: checkpoints/speech_llm_tools   # adapter.pt + lora/
   talker_dir: checkpoints/talker
   max_new_tokens: 200
