@@ -40,7 +40,7 @@ from s2s.models.speech_llm import token_ctc_from_logits
 from s2s.models.thinker import PromptBuilder
 from s2s.text import ctc_greedy_decode, sentence_case
 from s2s.train.common import apply_time_budget, fmt, make_grad_scaler, optimizer_step
-from s2s.utils import cosine_lr, count_params, save_json, set_seed
+from s2s.utils import cosine_lr, count_params, load_matching, save_json, set_seed
 
 OUTPUT_PARAMS = ("out_proj.weight", "out_proj.bias", "out_norm.weight", "out_scale", "speech_start", "speech_end")
 
@@ -143,6 +143,11 @@ def main() -> None:
         copied = [k for k in OUTPUT_PARAMS if k in old and old[k].shape == own[k].shape]
         adapter.load_state_dict({k: old[k] for k in copied}, strict=False)
         log(f"output layers from {src}: {copied}")
+    resume = tc.get("resume_from")
+    if resume and os.path.exists(os.path.join(resume, "adapter.pt")):  # a previous session of this stage
+        old = torch.load(os.path.join(resume, "adapter.pt"), map_location="cpu", weights_only=False)["state_dict"]
+        fresh = load_matching(adapter, old)
+        log(f"resumed from {resume}; left fresh: {fresh or 'nothing'}")
     enc = acfg.get("encoder", "mimi")
     found = {r.get("encoder", "mimi") for r in rows + valid_rows}
     if found != {enc}:

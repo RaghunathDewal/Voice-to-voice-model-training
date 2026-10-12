@@ -106,6 +106,7 @@ train_align:                # stage A of adapter v3 (s2s/train/align_adapter.py)
   valid_manifest: null
   output_dir: checkpoints/speech_llm_v3a
   init_output_from: null    # an adapter for the same thinker: its output layers are copied
+  resume_from: null         # this stage's own earlier checkpoint (a new session continues from it)
   batch_size: 64
   lr: 1.0e-3
   weight_decay: 0.01
