@@ -47,15 +47,18 @@ class ExternalTTS:
             pcm = r.read()
         return np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0, sr
 
-    def stream(self) -> "PhraseStream":
-        return PhraseStream(self)
+    def stream(self, quick_start: bool = True) -> "PhraseStream":
+        """quick_start: cut the first phrase early (the start of a turn; after a tool call the guest is already
+        hearing the first reply, so the next one is cut at sentence ends like the rest)."""
+        return PhraseStream(self, quick_start)
 
 
 class PhraseStream:
     """push() reply text pieces, take ready() audio after each token, finish() at the end of the reply."""
 
-    def __init__(self, tts: ExternalTTS):
+    def __init__(self, tts: ExternalTTS, quick_start: bool = True):
         self.tts = tts
+        self.quick_start = quick_start
         self.buf = ""
         self.boundary = False  # the buffer ends at punctuation; cut there if the next piece starts a new word
         self.sent = 0
@@ -72,7 +75,7 @@ class PhraseStream:
             if last in ABBREV or (len(last) == 1 and last.isalpha()):
                 end = ""  # "St." / "Dr." / an initial: not a pause
         strong, weak = bool(end) and end in STRONG, bool(end) and end in WEAK  # ("" in "abc" is True)
-        if self.sent == 0:  # the first phrase: short, so speech starts early: the first pause (even one word:
+        if self.sent == 0 and self.quick_start:  # the first phrase: short, so speech starts early: the first pause (even one word:
             # "Absolutely!", "I'm sorry,"), or a few words when no pause comes ("Your unit is located at | 5103 ...")
             return strong or (n >= self.tts.first_words and weak) or n >= self.tts.first_max_words
         return (n >= self.tts.min_words and strong) or (n >= 2 * self.tts.min_words and weak) or n >= self.tts.max_words

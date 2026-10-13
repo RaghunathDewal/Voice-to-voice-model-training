@@ -301,7 +301,7 @@ class VoiceSession:
                         yield {"type": "token", "text": piece}
                     elif a.tts is not None:
                         if phrases is None:
-                            phrases = a.tts.stream()
+                            phrases = a.tts.stream(quick_start=round_idx == 0)
                         spoken.append(tok)
                         timer.mark("first_spoken_token")
                         yield {"type": "token", "text": piece}
