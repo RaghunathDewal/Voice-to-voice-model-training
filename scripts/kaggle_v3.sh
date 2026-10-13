@@ -9,6 +9,10 @@
 #                        -> checkpoints/speech_llm_v3a
 #   PART=polish  (~8 h)  stage B: KD to the 4B reading the text + answers / repeat / unclear / multi-turn / tools
 #                        -> checkpoints/speech_llm_v3, then the public speech-vs-text test (same as the baseline)
+#   PART=data V4=1 (~6-8 h) v4 data: ~310 h more accented / spontaneous English (Common Voice accents, VoxPopuli,
+#                        Emilia-YODAS talk shows, YODAS-Granary YouTube), features + the 4B's answers -> HF
+#   PART=v4      (~11 h) from the final v3: align on the bigger mix (speech_llm_v4a, ALIGN_MIN), then polish
+#                        (speech_llm_v4, with v3's speech LoRA), then the Gate 1 test (results logs/v4_gate1)
 #   PART=hybrid  (~10 h) hybrid input: the listener's own transcript is added after the speech (Gate 1 was amber:
 #                        text wins on accents / phone calls, speech vectors in noise). Transcripts for the training
 #                        rows from the stored features, then a polish from the final v3 (speech_llm_v3, LoRA)
@@ -22,11 +26,11 @@
 # Licences: SpokenWOZ is CC BY-NC 4.0, so this adapter is for non-commercial use.
 set -euo pipefail
 
-PART=${PART:?set PART=data, align, polish or hybrid}
+PART=${PART:?set PART=data, align, polish, hybrid or v4}
 HF_USER=${HF_USER:-ThunderBlade7773}
 CKPT_REPO=$HF_USER/s2s-checkpoints
 DATA_REPO=$HF_USER/s2s-data-pk
-BUDGET_MIN=${BUDGET_MIN:-$( [ "$PART" = hybrid ] && echo 650 || echo 500 )}  # minutes this session may use (Kaggle stops at 12 h)
+BUDGET_MIN=${BUDGET_MIN:-$(case $PART in hybrid) echo 650;; v4) echo 690;; *) echo 500;; esac)}  # minutes this session may use (Kaggle stops at 12 h)
 SCALE=${SCALE:-1.0}                    # PART=data: multiply every hour / row count (0.05 for a quick trial)
 N_TEST=${N_TEST:-150}
 POLISH_BATCH=${POLISH_BATCH:-4}        # PART=polish: batch x accumulation = 32 (a big GPU: 16 x 2, same result)
@@ -35,13 +39,15 @@ TEST_MIN=${TEST_MIN:-110}              # PART=polish: minutes kept for the test 
 TEST_PAR=${TEST_PAR:-1}                # PART=polish: test sets run at the same time on each GPU
 TEST_ONLY=${TEST_ONLY:-0}              # PART=polish: 1 = only the Gate 1 test, on the latest speech_llm_v3 on Hugging Face
                                        # (no training, nothing uploaded but the results, under logs/v3_gate1_step<N>)
-POLISH_LORA=${POLISH_LORA:-$( [ "$PART" = hybrid ] && echo 1 || echo 0 )}  # PART=polish: 1 = also train a LoRA on the 4B so it learns to read the
+POLISH_LORA=${POLISH_LORA:-$( [ "$PART" = hybrid ] || [ "$PART" = v4 ] && echo 1 || echo 0 )}  # PART=polish: 1 = also train a LoRA on the 4B so it learns to read the
                                        # adapter's vectors (the KD teacher stays the original 4B)
 LORA_LR=${LORA_LR:-1e-4}
 REPO_DIR=$(cd "$(dirname "$0")/.." && pwd)
 WORK=${WORK:-/tmp/s2s_v3}
 OUT=${OUT:-$( [ -d /kaggle/working ] && echo /kaggle/working/v3_$PART || echo "$WORK/out_$PART")}
 CFG=${CFG:-"--config configs/qwen4b_v3$( [ "$PART" = hybrid ] && echo h).yaml"}
+ALIGN_MIN=${ALIGN_MIN:-210}            # PART=v4: minutes of align (fast: no 4B) before the polish
+ALIGN_LR=${ALIGN_LR:-3e-4}             # PART=v4: lower than v3's 1e-3, the adapter is already trained
 ASR_ROWS=${ASR_ROWS:-8000}              # PART=hybrid: training rows per data set that get the listener's transcript
 ENC=nemotron:nvidia/nemotron-speech-streaming-en-0.6b@1
 M=data/manifests
@@ -135,6 +141,15 @@ if [ "$PART" = data ]; then
         "slurp_train|slurp|train|--max-utts $(n 15000)|$(n 8000)"
         "slurp_dev|slurp|devel|--max-utts $(n 400)|0"
     )
+    V4_SETS="cv_accents vox_en emilia_en yodas_en"
+    if [ "${V4:-0}" = 1 ]; then  # v4: accented / spontaneous English, all allowing commercial use
+        SETS+=(
+            "cv_accents|commonvoice|train|--max-hours $(n 100) --max-per-accent 2 --seed 7 --min-words 3|$(n 8000)"
+            "vox_en|voxpopuli_en|train|--max-hours $(n 60) --max-per-accent 0.5 --min-words 4|$(n 4000)"
+            "emilia_en|emilia_en|train|--max-hours $(n 100) --max-per-accent 1 --min-words 4|$(n 8000)"
+            "yodas_en|yodas_en|train|--max-hours $(n 50) --max-per-accent 0.3 --min-words 4|$(n 4000)"
+        )
+    fi
     step restore hf v3manifests   # a rerun skips everything an earlier data session already uploaded
     download() {
         for job in "${SETS[@]}"; do
@@ -186,6 +201,9 @@ am_eric am_liam am_onyx am_echo bf_alice bf_isabella bf_lily bm_daniel bm_lewis 
             IFS='|' read -r name _ <<< "$job"
             if [ "$name" = slurp_dev ]; then feat ${name}_raw ${name}_nm; else feat ${name}_raw ${name}_nm --augment-prob 0.45 --phone-prob 0.4; fi
         done
+        for name in $V4_SETS; do  # the v4 audio is only needed for its features: free the disk
+            [ -f "$M/${name}_nm.jsonl" ] && rm -rf "data/hf_asr/$name"
+        done
         feat hotel5_train_audio hotel5_train_nm --augment-prob 0.6 --phone-prob 0.5
         feat hotel5_eval_audio hotel5_eval_nm
         # "sorry, I didn't catch that": unintelligible versions of other clips
@@ -219,7 +237,7 @@ fi
 
 # ============================================================== shared: data for training
 train_data() {
-    step download_data bash -c "$(declare -f hf); hf v3data; hf ckpt speech_llm_4b_v2 speech_llm_v3a speech_llm_v3 speech_llm_v3h"
+    step download_data bash -c "$(declare -f hf); hf v3data; hf ckpt speech_llm_4b_v2 speech_llm_v3a speech_llm_v3 speech_llm_v3h speech_llm_v4a speech_llm_v4"
     du -sh data/features
 }
 mix() { [ -f "$1" ] && printf '{path: %s, weight: %s}, ' "$1" "$2"; return 0; }
@@ -254,9 +272,42 @@ $(mix "$(q4 spokenwoz_train)" 0.15)$(mix "$(q4 slurp_train)" 0.12)$(mix "$(q4 ho
 fi
 
 # ============================================================== PART polish
-if [ "$PART" = polish ] || [ "$PART" = hybrid ]; then
+if [ "$PART" = polish ] || [ "$PART" = hybrid ] || [ "$PART" = v4 ]; then
     train_data
-    if [ "$PART" = hybrid ]; then  # from the final v3 (adapter + speech LoRA), the listener's transcript added
+    if [ "$PART" = v4 ]; then  # from the final v3: align on the bigger mix, then polish (with v3's speech LoRA)
+        PDIR=speech_llm_v4; START=speech_llm_v4a; RESULTS=logs/v4_gate1
+        [ -f checkpoints/speech_llm_v3/DONE ] || { say "the final speech_llm_v3 (DONE) is not on Hugging Face"; exit 1; }
+        [ -f $M/emilia_en_nm.jsonl ] || { say "no v4 data on Hugging Face: run PART=data V4=1 first"; exit 1; }
+        nmf() { echo "$M/${1}_nm.jsonl"; }  # align needs only the text: every row (not only the answered ones)
+        if [ "$TEST_ONLY" != 1 ] && [ ! -f checkpoints/speech_llm_v4a/DONE ]; then
+            ATRAIN="[$(mix "$(nmf cv_train)" 0.05)$(mix "$(nmf cv_india)" 0.05)$(mix "$(nmf cv_accents)" 0.14)\
+$(mix "$(nmf vox_en)" 0.09)$(mix "$(nmf emilia_en)" 0.15)$(mix "$(nmf yodas_en)" 0.08)$(mix "$(nmf peoples_train)" 0.05)\
+$(mix "$(nmf peoples_dirty)" 0.03)$(mix "$(nmf ami_ihm)" 0.03)$(mix "$(nmf ami_sdm)" 0.03)$(mix "$(nmf mls_train)" 0.04)\
+$(mix "$(nmf spokenwoz_train)" 0.10)$(mix "$(nmf slurp_train)" 0.08)$(mix "$(nmf hotel5_train)" 0.06)$(mix $M/unclear_nm.jsonl 0.02)]"
+            ATRAIN=${ATRAIN/%, ]/]}
+            ( while sleep 1200; do [ -f checkpoints/speech_llm_v4a/adapter.pt ] && hf push checkpoints/speech_llm_v4a checkpoints/speech_llm_v4a; done ) \
+                > "$OUT/logs/sync_align.log" 2>&1 &
+            ASYNC=$!
+            aok=0
+            for attempt in 1 2 3; do  # an error restarts from the last save
+                AFROM=speech_llm_v3; [ -f checkpoints/speech_llm_v4a/adapter.pt ] && AFROM=speech_llm_v4a
+                AMIN=$(( ALIGN_MIN - (SECONDS - T_START) / 60 + 30 ))  # setup counted in: ALIGN_MIN from the start
+                [ "$AMIN" -ge 20 ] || { aok=1; break; }
+                if step align4_$attempt $LAUNCH s2s.train.align_adapter $CFG --set "train_align.train_manifests=$ATRAIN" \
+                    train_align.valid_manifest=$M/slurp_dev_nm.jsonl train_align.max_minutes="$AMIN" \
+                    train_align.output_dir=checkpoints/speech_llm_v4a train_align.resume_from="checkpoints/$AFROM" \
+                    train_align.lr="$ALIGN_LR" train_align.warmup_steps=500 seed=$(( 4233 + attempt )); then aok=1; break; fi
+                say "align stopped with an error (attempt $attempt); restarting in 60 s"
+                pkill -f s2s.train.align_adapter 2>/dev/null || true; sleep 60
+            done
+            kill $ASYNC 2>/dev/null || true
+            [ -f checkpoints/speech_llm_v4a/adapter.pt ] || { say "align saved nothing: see $OUT/logs/align4_*.log"; exit 1; }
+            [ "$aok" = 1 ] && touch checkpoints/speech_llm_v4a/DONE
+            hf push checkpoints/speech_llm_v4a checkpoints/speech_llm_v4a
+        fi
+        # the polish starts from the v4 adapter with v3's speech LoRA (align does not touch the 4B)
+        [ -d checkpoints/speech_llm_v4a/lora ] || cp -r checkpoints/speech_llm_v3/lora checkpoints/speech_llm_v4a/lora
+    elif [ "$PART" = hybrid ]; then  # from the final v3 (adapter + speech LoRA), the listener's transcript added
         PDIR=speech_llm_v3h; START=speech_llm_v3; RESULTS=logs/v3h_gate1
         [ -f checkpoints/speech_llm_v3/DONE ] || { say "the final speech_llm_v3 (DONE) is not on Hugging Face"; exit 1; }
     else
@@ -294,9 +345,16 @@ if [ "$PART" = polish ] || [ "$PART" = hybrid ]; then
     else
         UNCLEAR=$M/unclear_nm.jsonl
     fi
+    if [ "$PART" = v4 ]; then
+        TRAIN="[$(mix "$(q4 hotel5_train)" 0.20)$(mix "$(q4 spokenwoz_train)" 0.12)$(mix "$(q4 slurp_train)" 0.10)\
+$(mix "$(q4 cv_train)" 0.04)$(mix "$(q4 cv_india)" 0.04)$(mix "$(q4 cv_accents)" 0.10)$(mix "$(q4 vox_en)" 0.07)\
+$(mix "$(q4 emilia_en)" 0.12)$(mix "$(q4 yodas_en)" 0.06)$(mix "$(q4 peoples_train)" 0.04)$(mix "$(q4 peoples_dirty)" 0.02)\
+$(mix "$(q4 ami_ihm)" 0.02)$(mix "$(q4 ami_sdm)" 0.02)$(mix "$(q4 mls_train)" 0.02)$(mix $UNCLEAR 0.03)]"
+    else
     TRAIN="[$(mix "$(q4 hotel5_train)" 0.24)$(mix "$(q4 spokenwoz_train)" 0.16)$(mix "$(q4 slurp_train)" 0.12)\
 $(mix "$(q4 cv_train)" 0.14)$(mix "$(q4 cv_india)" 0.05)$(mix "$(q4 peoples_train)" 0.07)$(mix "$(q4 peoples_dirty)" 0.04)\
 $(mix "$(q4 ami_ihm)" 0.04)$(mix "$(q4 ami_sdm)" 0.04)$(mix "$(q4 mls_train)" 0.05)$(mix $UNCLEAR 0.05)]"
+    fi
     TRAIN=${TRAIN/%, ]/]}
     if [ "$TEST_ONLY" = 1 ]; then
         [ -f "checkpoints/$PDIR/adapter.pt" ] || { say "no $PDIR on Hugging Face to test"; exit 1; }

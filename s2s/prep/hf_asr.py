@@ -58,6 +58,16 @@ PRESETS = {
     "edacc": {"repo": "edinburghcstr/edacc", "prefix": "data/{split}-", "text": "text", "accent": "accent"},
     "voxpopuli_accented": {"repo": "facebook/voxpopuli", "prefix": "en_accented/{split}-",
                            "text": "normalized_text", "accent": "accent"},
+    # v4: accented / spontaneous English with commercial-friendly licences
+    # European Parliament speeches, many non-native speakers (CC0); speaker_id caps hours per speaker
+    "voxpopuli_en": {"repo": "facebook/voxpopuli", "prefix": "en/{split}-", "text": "raw_text",
+                     "accent": "speaker_id"},
+    # Emilia-YODAS English: talk shows, interviews, podcasts (CC BY 4.0; the 616 h English mirror, Emilia's own
+    # transcripts - the mirror's extra Scribe labels are partly non-commercial and are not used)
+    "emilia_en": {"repo": "MrDragonFox/EN_Emilia_Yodas_616h", "prefix": "data/{split}-", "text": "text_emilia",
+                  "accent": "speaker"},
+    # YODAS-Granary English (NVIDIA-cleaned YouTube speech, CC BY 3.0); one source video = one "accent" (cap)
+    "yodas_en": {"repo": "espnet/yodas-granary", "prefix": "data/en", "text": "text", "accent": "original_audio_id"},
     "fleurs": {"repo": "google/fleurs", "prefix": "parquet-data/en_us/{split}-", "text": "transcription"},
     # Indian-accented English (CC BY 4.0, accept its terms on HF first); only a "test" split exists
     "svarah": {"repo": "ai4bharat/Svarah", "prefix": "data/{split}-", "text": "text", "audio": "audio_filepath",
