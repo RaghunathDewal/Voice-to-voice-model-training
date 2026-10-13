@@ -45,7 +45,7 @@ LORA_LR=${LORA_LR:-1e-4}
 REPO_DIR=$(cd "$(dirname "$0")/.." && pwd)
 WORK=${WORK:-/tmp/s2s_v3}
 OUT=${OUT:-$( [ -d /kaggle/working ] && echo /kaggle/working/v3_$PART || echo "$WORK/out_$PART")}
-CFG=${CFG:-"--config configs/qwen4b_v3$( [ "$PART" = hybrid ] && echo h).yaml"}
+CFG=${CFG:-"--config configs/qwen4b_v3$( [ "$PART" = hybrid ] && echo h || true).yaml"}
 ALIGN_MIN=${ALIGN_MIN:-210}            # PART=v4: minutes of align (fast: no 4B) before the polish
 ALIGN_LR=${ALIGN_LR:-3e-4}             # PART=v4: lower than v3's 1e-3, the adapter is already trained
 ASR_ROWS=${ASR_ROWS:-8000}              # PART=hybrid: training rows per data set that get the listener's transcript
