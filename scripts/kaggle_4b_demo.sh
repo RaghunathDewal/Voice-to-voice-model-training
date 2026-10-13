@@ -15,6 +15,8 @@
 #   TALKER=best            the talker checkpoint with the lowest eval loss (step 1000) instead of the final one
 #   PROMPT=/path/file.txt  your own system prompt (property facts, booking); default: the built-in hotel demo
 #   TOOLS=order_product,create_issue   only these tools (default: all built-in hotel tools); TOOLS=none: no tools
+#   EXTRA_SETS="runtime.emit_every_frames=1"   more config overrides (space-separated key=value)
+# Applications (e.g. a Gemini-Live-style bridge server) connect to wss://<link>/live: s2s/cli/live_api.py.
 set -euo pipefail
 
 HF_USER=${HF_USER:-ThunderBlade7773}
@@ -64,6 +66,7 @@ EOF
 SETS=()   # one --set with every override (a second --set would replace the first)
 [ "$NGPU" -gt 1 ] && SETS+=(runtime.encoder_device=cuda:1)
 [ -n "$THINKER" ] && SETS+=("thinker.model=checkpoints/$THINKER")
+for kv in ${EXTRA_SETS:-}; do SETS+=("$kv"); done
 EXTRA=()
 [ ${#SETS[@]} -gt 0 ] && EXTRA+=(--set "${SETS[@]}")
 [ -n "$PROMPT" ] && EXTRA+=(--system-prompt-file "$PROMPT")
