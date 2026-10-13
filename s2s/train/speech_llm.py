@@ -27,6 +27,7 @@ Checkpoint directory layout: adapter.pt (stores the encoder spec), lora/ (PEFT, 
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import os
 import sys
@@ -211,7 +212,8 @@ def main() -> None:
     log(f"train rows {len(rows)}, valid rows {len(valid_rows)}")
 
     log("starting training loop")
-    step, accum = 0, 0
+    step, accum, skipped = 0, 0, 0
+    recent_norms: collections.deque = collections.deque(maxlen=100)
     t0 = time.time()
     running: dict[str, float] = {}
     arm_watchdog()
@@ -231,7 +233,22 @@ def main() -> None:
         scale = cosine_lr(step, tc.warmup_steps, tc.max_steps)
         for g in opt.param_groups:
             g["lr"] = g["base_lr"] * scale
-        gnorm = optimizer_step(opt, scaler, adapter_params + lora_params, tc.max_grad_norm)
+        # a freak batch (gradient far above the recent typical size, or not finite) is skipped: one such
+        # update can push the adapter off the thinker's word vectors
+        scaler.unscale_(opt)
+        gnorm = float(torch.nn.utils.clip_grad_norm_(adapter_params + lora_params, tc.max_grad_norm))
+        spike = float(tc.get("skip_spike_factor") or 0)
+        typical = float(np.median(recent_norms)) if len(recent_norms) >= 20 else None
+        if not np.isfinite(gnorm) or (spike and typical and gnorm > spike * typical):
+            opt.zero_grad(set_to_none=True)
+            scaler.update()
+            skipped += 1
+            log(f"step {step + 1}: skipped an update (gradient {gnorm:.0f}, typical {typical or 0:.0f}); {skipped} so far")
+        else:
+            scaler.step(opt)
+            scaler.update()
+            opt.zero_grad(set_to_none=True)
+            recent_norms.append(gnorm)
         step += 1
         arm_watchdog()
         apply_time_budget(tc, step, t0, device, log)

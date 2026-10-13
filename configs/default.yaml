@@ -90,6 +90,7 @@ train_speech_llm:
   kd_weight: 0.0            # >0: KL to the thinker reading the text of the same turn (adapter v3, stage B)
   ce_weight: 1.0
   tok_weight: 0.0           # >0 with a token-head adapter: keep the word-level CTC on during stage B
+  skip_spike_factor: 0      # >0: skip an update whose gradient is this many times the recent median (or not finite)
   eot_early_frames: 0
   ctc_weight: 0.3
   eot_weight: 0.1

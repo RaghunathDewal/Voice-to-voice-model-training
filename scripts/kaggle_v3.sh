@@ -247,6 +247,10 @@ if [ "$PART" = polish ]; then
     train_data
     [ -f checkpoints/speech_llm_v3a/adapter.pt ] || { say "run PART=align first"; exit 1; }
     INIT=speech_llm_v3a
+    if [ "${POLISH_FRESH:-0}" = 1 ]; then  # start again from the align checkpoint (an earlier polish went wrong)
+        say "POLISH_FRESH=1: discarding any earlier polish checkpoint, starting from speech_llm_v3a"
+        rm -rf checkpoints/speech_llm_v3
+    fi
     [ -f checkpoints/speech_llm_v3/adapter.pt ] && [ ! -f checkpoints/speech_llm_v3/DONE ] && INIT=speech_llm_v3  # resume
     TRAIN="[$(mix "$(q4 hotel5_train)" 0.24)$(mix "$(q4 spokenwoz_train)" 0.16)$(mix "$(q4 slurp_train)" 0.12)\
 $(mix "$(q4 cv_train)" 0.14)$(mix "$(q4 cv_india)" 0.05)$(mix "$(q4 peoples_train)" 0.07)$(mix "$(q4 peoples_dirty)" 0.04)\

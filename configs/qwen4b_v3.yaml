@@ -29,11 +29,12 @@ train_speech_llm:
   train_lora: false
   kd_weight: 1.0            # match the 4B reading the text (BLSP-KD)
   ce_weight: 0.5            # targets are the 4B's own answers (DeSTA), so CE and KD agree
-  tok_weight: 0.3           # keep the word-level alignment from stage A
+  tok_weight: 1.0           # keep the word-level alignment from stage A (0.3 let one bad update knock it out)
   eot_early_frames: 3
   transcribe_prob: 0.35
-  adapter_lr: 2.0e-4
-  warmup_steps: 100
+  adapter_lr: 5.0e-5        # 2e-4 blew up at the end of warm-up (gradient 38,400, word loss 2 -> 159)
+  warmup_steps: 300
+  skip_spike_factor: 10     # skip an update whose gradient is >10x the recent median
 
 runtime:
   speech_llm_dir: checkpoints/speech_llm_v3
