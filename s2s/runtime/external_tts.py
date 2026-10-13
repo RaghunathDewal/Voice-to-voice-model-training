@@ -1,8 +1,7 @@
 """Speak the thinker's reply with an external TTS server instead of our talker (runtime.tts_url).
 
-The reply text arrives token by token. It is cut into phrases: the first one as soon as it is a few words
-long and reaches a pause (",", ".", "?" ...), so speech starts while the thinker is still writing; later
-ones at sentence ends. Each phrase is sent to the server in a background thread (one at a time, in order)
+The reply text arrives token by token. It is cut into phrases: the first one at its first pause (",", ".", "?" ...)
+or after a few words, so speech starts while the thinker is still writing; later ones at sentence ends. Each phrase is sent to the server in a background thread (one at a time, in order)
 and its audio is handed out as soon as it is ready, so the thinker keeps generating meanwhile.
 
 Server protocol (s2s/cli/qwen_tts_server.py): POST <url> {"text": "..."} -> raw int16 mono PCM, with the
@@ -33,10 +32,11 @@ def clean_for_speech(text: str) -> str:
 
 
 class ExternalTTS:
-    def __init__(self, url: str, first_words: int = 3, min_words: int = 6, max_words: int = 28,
-                 timeout: float = 60.0):
+    def __init__(self, url: str, first_words: int = 2, first_max_words: int = 5, min_words: int = 6,
+                 max_words: int = 28, timeout: float = 60.0):
         self.url = url
-        self.first_words, self.min_words, self.max_words = first_words, min_words, max_words
+        self.first_words, self.first_max_words = first_words, first_max_words
+        self.min_words, self.max_words = min_words, max_words
         self.timeout = timeout
 
     def synth(self, text: str) -> tuple[np.ndarray, int]:
@@ -72,8 +72,9 @@ class PhraseStream:
             if last in ABBREV or (len(last) == 1 and last.isalpha()):
                 end = ""  # "St." / "Dr." / an initial: not a pause
         strong, weak = bool(end) and end in STRONG, bool(end) and end in WEAK  # ("" in "abc" is True)
-        if self.sent == 0:  # the first phrase: short, at the first pause (even one word: "Absolutely!"), so speech starts early
-            return strong or (n >= self.tts.first_words and weak) or n >= 12
+        if self.sent == 0:  # the first phrase: short, so speech starts early: the first pause (even one word:
+            # "Absolutely!", "I'm sorry,"), or a few words when no pause comes ("Your unit is located at | 5103 ...")
+            return strong or (n >= self.tts.first_words and weak) or n >= self.tts.first_max_words
         return (n >= self.tts.min_words and strong) or (n >= 2 * self.tts.min_words and weak) or n >= self.tts.max_words
 
     def _submit(self) -> None:
