@@ -116,6 +116,18 @@ class VoiceAgent:
 
             self.tts = ExternalTTS(str(rt.tts_url))
             print(f"[agent] voice: external TTS at {rt.tts_url} (the talker is not used)")
+        # hybrid input: the listener's own transcript follows the speech (configs: hybrid.enabled, Nemotron only)
+        self.transcriber = None
+        hy = cfg.get("hybrid") or {}
+        if hy.get("enabled"):
+            if not str(self.encoder_spec).startswith("nemotron"):
+                raise ValueError("hybrid.enabled needs the Nemotron listener (adapter.encoder nemotron:...)")
+            from s2s.models.nemotron_text import NemotronTranscriber
+
+            enc_dev = rt.get("encoder_device")
+            self.transcriber = NemotronTranscriber.load(str(hy.model), resolve_device(enc_dev) if enc_dev else self.device)
+            self.hybrid_template = str(hy.template)
+            print("[agent] hybrid input: speech + the listener's transcript")
         # only Mimi is causal: its frames never change, so they can be prefilled while the user speaks
         self.incremental_input = self.input_encoder is None
         print(f"[agent] input encoder: {self.encoder_spec}")
@@ -295,15 +307,27 @@ class VoiceSession:
         ids = [] if self.first_turn else self.next_open_ids
         embeds = [self.a.thinker.embed(torch.tensor(ids, device=self.a.device))] if ids else []
         embeds.append(start[None].to(self.a.thinker.dtype))
+        at = self.n_tokens
         self._feed_embeds(torch.cat(embeds, dim=0))
+        self._remember_text(ids, at)
 
-    def _close_turn(self):
+    def _remember_text(self, ids: list[int], at: int) -> None:
+        """Text fed together with speech vectors (turn markers, the listener's transcript) is also kept for
+        prompt lookup, at its positions in the thinker's memory."""
+        self.text_ids.extend(ids)
+        self.text_pos.extend(range(at, at + len(ids)))
+
+    def _close_turn(self, extra_ids: list[int] | None = None):
+        """extra_ids: text after the speech, inside the guest's turn (hybrid input: the listener's transcript)."""
         _, end = self.a.adapter.boundary_embeddings()
-        ids = self.first_close_ids if self.first_turn else self.next_close_ids
+        ids = list(extra_ids or []) + list(self.first_close_ids if self.first_turn else self.next_close_ids)
         self.first_turn = False
         embeds = torch.cat([end[None].to(self.a.thinker.dtype),
                             self.a.thinker.embed(torch.tensor(ids, device=self.a.device))], dim=0)
-        return self._feed_embeds(embeds)
+        at = self.n_tokens + 1  # after the end-of-speech vector
+        out = self._feed_embeds(embeds)
+        self._remember_text(ids, at)
+        return out
 
     # ----------------------------------------------------------- generation
     @torch.no_grad()
@@ -567,12 +591,18 @@ class StreamingTurn:
         if self.latents is None and len(self.audio):  # whole-utterance encoder: encode the turn now
             self.add_latents(a.encode_input([self.audio])[0], wav_frames=None)
             self.timer.mark("input_encoded")
-        asr, asr_conf = None, None
+        asr, asr_conf, extra = None, None, []
         if self.latents is not None:
             ctc = a.adapter(self.latents[None].to(a.device))["ctc_logits"][0].argmax(-1).tolist()
             transcript = ctc_greedy_decode(ctc)
             if hasattr(a.input_encoder, "transcribe_with_confidence"):  # Parakeet's own ASR head, same encoder output
                 asr, asr_conf = a.input_encoder.transcribe_with_confidence([self.latents])[0]
+            elif a.transcriber is not None:  # hybrid: Nemotron's own transcript, from the same encoder output
+                from s2s.models.nemotron_text import transcript_ids
+
+                asr = a.transcriber([self.latents])[0]
+                extra = transcript_ids(a.thinker.prompts, asr, a.hybrid_template)
+                self.timer.mark("listener_text")
         else:
             transcript = ""
         if a.cfg.runtime.get("skip_empty_turns", True) and not (asr or transcript).strip():
@@ -591,7 +621,7 @@ class StreamingTurn:
         yield {"type": "user_transcript", "text": transcript, "asr": asr, "asr_confidence": asr_conf, "unclear": unclear,
                "eot_prob_last": self.eot_probs[-1] if self.eot_probs else None,
                "endpoint_reason": self.endpointer.reason}
-        logits, hidden = self.s._close_turn()
+        logits, hidden = self.s._close_turn(extra)
         cuda_sync(a.device)
         self.timer.mark("prefill_done")
         forced = None

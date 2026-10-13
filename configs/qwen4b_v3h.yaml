@@ -1,0 +1,18 @@
+# Adapter v3 HYBRID: the 4B gets the speech vectors AND the listener's own transcript (Nemotron RNN-T text from
+# the same encoder output). Gate 1 (step 750): v3 beat the transcript path in noise but lost on accents and phone
+# calls, where the plain text helped. The hybrid gives the 4B both. Continues from the final v3 checkpoint
+# (adapter + speech LoRA). Run: PART=hybrid bash scripts/kaggle_v3.sh
+base: qwen4b_v3.yaml
+
+hybrid:
+  enabled: true
+
+train_speech_llm:
+  output_dir: checkpoints/speech_llm_v3h
+  init_from: checkpoints/speech_llm_v3
+  train_lora: true          # the v3 speech LoRA keeps training: the 4B learns to use both inputs
+  warmup_steps: 100         # a new input on a trained model: short warm-up
+  transcribe_prob: 0.2      # "repeat what was said" matters less now that the transcript is in the input
+
+runtime:
+  speech_llm_dir: checkpoints/speech_llm_v3h

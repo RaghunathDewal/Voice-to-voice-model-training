@@ -9,6 +9,10 @@
 #                        -> checkpoints/speech_llm_v3a
 #   PART=polish  (~8 h)  stage B: KD to the 4B reading the text + answers / repeat / unclear / multi-turn / tools
 #                        -> checkpoints/speech_llm_v3, then the public speech-vs-text test (same as the baseline)
+#   PART=hybrid  (~10 h) hybrid input: the listener's own transcript is added after the speech (Gate 1 was amber:
+#                        text wins on accents / phone calls, speech vectors in noise). Transcripts for the training
+#                        rows from the stored features, then a polish from the final v3 (speech_llm_v3, LoRA)
+#                        -> checkpoints/speech_llm_v3h, then the same Gate 1 test (results logs/v3h_gate1)
 #
 # Kaggle: Accelerator "GPU T4 x2", Internet on, secret HF_TOKEN with WRITE access to
 # ThunderBlade7773/s2s-checkpoints and ThunderBlade7773/s2s-data-pk.
@@ -18,11 +22,11 @@
 # Licences: SpokenWOZ is CC BY-NC 4.0, so this adapter is for non-commercial use.
 set -euo pipefail
 
-PART=${PART:?set PART=data, align or polish}
+PART=${PART:?set PART=data, align, polish or hybrid}
 HF_USER=${HF_USER:-ThunderBlade7773}
 CKPT_REPO=$HF_USER/s2s-checkpoints
 DATA_REPO=$HF_USER/s2s-data-pk
-BUDGET_MIN=${BUDGET_MIN:-500}          # minutes this session may use in total (Kaggle stops at ~9-12 h)
+BUDGET_MIN=${BUDGET_MIN:-$( [ "$PART" = hybrid ] && echo 650 || echo 500 )}  # minutes this session may use (Kaggle stops at 12 h)
 SCALE=${SCALE:-1.0}                    # PART=data: multiply every hour / row count (0.05 for a quick trial)
 N_TEST=${N_TEST:-150}
 POLISH_BATCH=${POLISH_BATCH:-4}        # PART=polish: batch x accumulation = 32 (a big GPU: 16 x 2, same result)
@@ -31,13 +35,14 @@ TEST_MIN=${TEST_MIN:-110}              # PART=polish: minutes kept for the test 
 TEST_PAR=${TEST_PAR:-1}                # PART=polish: test sets run at the same time on each GPU
 TEST_ONLY=${TEST_ONLY:-0}              # PART=polish: 1 = only the Gate 1 test, on the latest speech_llm_v3 on Hugging Face
                                        # (no training, nothing uploaded but the results, under logs/v3_gate1_step<N>)
-POLISH_LORA=${POLISH_LORA:-0}          # PART=polish: 1 = also train a LoRA on the 4B so it learns to read the
+POLISH_LORA=${POLISH_LORA:-$( [ "$PART" = hybrid ] && echo 1 || echo 0 )}  # PART=polish: 1 = also train a LoRA on the 4B so it learns to read the
                                        # adapter's vectors (the KD teacher stays the original 4B)
 LORA_LR=${LORA_LR:-1e-4}
 REPO_DIR=$(cd "$(dirname "$0")/.." && pwd)
 WORK=${WORK:-/tmp/s2s_v3}
 OUT=${OUT:-$( [ -d /kaggle/working ] && echo /kaggle/working/v3_$PART || echo "$WORK/out_$PART")}
-CFG=${CFG:-"--config configs/qwen4b_v3.yaml"}
+CFG=${CFG:-"--config configs/qwen4b_v3$( [ "$PART" = hybrid ] && echo h).yaml"}
+ASR_ROWS=${ASR_ROWS:-8000}              # PART=hybrid: training rows per data set that get the listener's transcript
 ENC=nemotron:nvidia/nemotron-speech-streaming-en-0.6b@1
 M=data/manifests
 : "${HF_TOKEN:?HF_TOKEN is not set (Kaggle: Add-ons > Secrets)}"
@@ -214,7 +219,7 @@ fi
 
 # ============================================================== shared: data for training
 train_data() {
-    step download_data bash -c "$(declare -f hf); hf v3data; hf ckpt speech_llm_4b_v2 speech_llm_v3a speech_llm_v3"
+    step download_data bash -c "$(declare -f hf); hf v3data; hf ckpt speech_llm_4b_v2 speech_llm_v3a speech_llm_v3 speech_llm_v3h"
     du -sh data/features
 }
 mix() { [ -f "$1" ] && printf '{path: %s, weight: %s}, ' "$1" "$2"; return 0; }
@@ -249,35 +254,66 @@ $(mix "$(q4 spokenwoz_train)" 0.15)$(mix "$(q4 slurp_train)" 0.12)$(mix "$(q4 ho
 fi
 
 # ============================================================== PART polish
-if [ "$PART" = polish ]; then
+if [ "$PART" = polish ] || [ "$PART" = hybrid ]; then
     train_data
-    [ -f checkpoints/speech_llm_v3a/adapter.pt ] || { say "run PART=align first"; exit 1; }
-    INIT=speech_llm_v3a
-    if [ "${POLISH_FRESH:-0}" = 1 ]; then  # start again from the align checkpoint (an earlier polish went wrong)
-        say "POLISH_FRESH=1: discarding any earlier polish checkpoint, starting from speech_llm_v3a"
-        rm -rf checkpoints/speech_llm_v3
+    if [ "$PART" = hybrid ]; then  # from the final v3 (adapter + speech LoRA), the listener's transcript added
+        PDIR=speech_llm_v3h; START=speech_llm_v3; RESULTS=logs/v3h_gate1
+        [ -f checkpoints/speech_llm_v3/DONE ] || { say "the final speech_llm_v3 (DONE) is not on Hugging Face"; exit 1; }
+    else
+        PDIR=speech_llm_v3; START=speech_llm_v3a; RESULTS=logs/v3_polish
+        [ -f checkpoints/speech_llm_v3a/adapter.pt ] || { say "run PART=align first"; exit 1; }
     fi
-    [ -f checkpoints/speech_llm_v3/adapter.pt ] && [ ! -f checkpoints/speech_llm_v3/DONE ] && INIT=speech_llm_v3  # resume
+    INIT=$START
+    if [ "${POLISH_FRESH:-0}" = 1 ]; then  # start again from the start checkpoint (an earlier run went wrong)
+        say "POLISH_FRESH=1: discarding any earlier $PDIR checkpoint, starting from $START"
+        rm -rf "checkpoints/$PDIR"
+    fi
+    [ -f "checkpoints/$PDIR/adapter.pt" ] && [ ! -f "checkpoints/$PDIR/DONE" ] && INIT=$PDIR  # resume
+    if [ "$PART" = hybrid ] && [ "$TEST_ONLY" != 1 ]; then
+        hybrid_asr() {  # the listener's transcript ("asr") for a random subset of each training set, both GPUs
+            local files=()
+            for set in hotel5_train spokenwoz_train slurp_train cv_train cv_india peoples_train peoples_dirty ami_ihm \
+                       ami_sdm mls_train hotel5_eval; do
+                f=$(q4 $set); [ -f "$f" ] && files+=("$f")
+            done
+            [ -f $M/unclear_nm.jsonl ] && files+=("$M/unclear_nm.jsonl")
+            for g in $(seq 0 $(( NGPU - 1 ))); do
+                part=(); for j in "${!files[@]}"; do [ $(( j % NGPU )) = "$g" ] && part+=("${files[$j]}"); done
+                [ ${#part[@]} -gt 0 ] && CUDA_VISIBLE_DEVICES=$g python -m s2s.prep.asr_transcripts --in "${part[@]}" \
+                    --max-rows "$ASR_ROWS" > "$OUT/logs/asr_$g.log" 2>&1 &
+            done
+            wait
+            cat "$OUT"/logs/asr_*.log | grep -e "rows in" -e "Error" || true
+        }
+        step hybrid_asr hybrid_asr
+        for f in "$(q4 hotel5_train)" "$(q4 hotel5_eval)"; do  # the main sets must have their transcripts
+            [ -f "${f%.jsonl}_asr.jsonl" ] || { say "no transcripts for $f: see $OUT/logs/asr_*.log"; exit 1; }
+        done
+        q4() { local f; f=$( [ -f "$M/${1}_$ANS.jsonl" ] && echo "$M/${1}_$ANS.jsonl" || echo "$M/${1}_nm.jsonl"); echo "${f%.jsonl}_asr.jsonl"; }
+        UNCLEAR=$M/unclear_nm_asr.jsonl
+    else
+        UNCLEAR=$M/unclear_nm.jsonl
+    fi
     TRAIN="[$(mix "$(q4 hotel5_train)" 0.24)$(mix "$(q4 spokenwoz_train)" 0.16)$(mix "$(q4 slurp_train)" 0.12)\
 $(mix "$(q4 cv_train)" 0.14)$(mix "$(q4 cv_india)" 0.05)$(mix "$(q4 peoples_train)" 0.07)$(mix "$(q4 peoples_dirty)" 0.04)\
-$(mix "$(q4 ami_ihm)" 0.04)$(mix "$(q4 ami_sdm)" 0.04)$(mix "$(q4 mls_train)" 0.05)$(mix $M/unclear_nm.jsonl 0.05)]"
+$(mix "$(q4 ami_ihm)" 0.04)$(mix "$(q4 ami_sdm)" 0.04)$(mix "$(q4 mls_train)" 0.05)$(mix $UNCLEAR 0.05)]"
     TRAIN=${TRAIN/%, ]/]}
     if [ "$TEST_ONLY" = 1 ]; then
-        [ -f checkpoints/speech_llm_v3/adapter.pt ] || { say "no speech_llm_v3 on Hugging Face to test"; exit 1; }
-        STEP=$(python -c "import json; print(json.load(open('checkpoints/speech_llm_v3/state.json')).get('step', 'x'))" 2>/dev/null || echo x)
-        say "TEST_ONLY=1: Gate 1 on speech_llm_v3 step $STEP (no training, the checkpoint is not uploaded)"
-    elif [ ! -f checkpoints/speech_llm_v3/DONE ]; then
-        ( while sleep 1200; do [ -f checkpoints/speech_llm_v3/adapter.pt ] && hf push checkpoints/speech_llm_v3 checkpoints/speech_llm_v3; done ) \
+        [ -f "checkpoints/$PDIR/adapter.pt" ] || { say "no $PDIR on Hugging Face to test"; exit 1; }
+        STEP=$(python -c "import json; print(json.load(open('checkpoints/$PDIR/state.json')).get('step', 'x'))" 2>/dev/null || echo x)
+        say "TEST_ONLY=1: Gate 1 on $PDIR step $STEP (no training, the checkpoint is not uploaded)"
+    elif [ ! -f "checkpoints/$PDIR/DONE" ]; then
+        ( while sleep 1200; do [ -f "checkpoints/$PDIR/adapter.pt" ] && hf push "checkpoints/$PDIR" "checkpoints/$PDIR"; done ) \
             > "$OUT/logs/sync.log" 2>&1 &
         SYNC=$!
         ok=0
         for attempt in 1 2 3 4 5; do  # an error mid-run restarts from the last save (every 250 steps)
             MIN=$(( $(minutes_left) - TEST_MIN ))  # leave time for the test
             [ "$MIN" -ge 15 ] || break
-            [ "$attempt" -gt 1 ] && [ -f checkpoints/speech_llm_v3/adapter.pt ] && INIT=speech_llm_v3
+            [ "$attempt" -gt 1 ] && [ -f "checkpoints/$PDIR/adapter.pt" ] && INIT=$PDIR
             if step polish_$attempt $LAUNCH s2s.train.speech_llm $CFG --set train_speech_llm.init_from="checkpoints/$INIT" \
                 "train_speech_llm.train_manifests=$TRAIN" train_speech_llm.valid_manifest="$(q4 hotel5_eval)" \
-                train_speech_llm.max_steps=20000 train_speech_llm.max_minutes="$MIN" train_speech_llm.batch_size="$POLISH_BATCH" \
+                train_speech_llm.output_dir="checkpoints/$PDIR" train_speech_llm.max_steps=20000 train_speech_llm.max_minutes="$MIN" train_speech_llm.batch_size="$POLISH_BATCH" \
                 train_speech_llm.grad_accum="$POLISH_ACCUM" train_speech_llm.num_workers=4 train_speech_llm.log_every=10 \
                 train_speech_llm.eval_every=250 train_speech_llm.eval_batches=10 train_speech_llm.save_every=250 \
                 train_speech_llm.train_lora=$( [ "$POLISH_LORA" = 1 ] && echo true || echo false ) \
@@ -286,9 +322,9 @@ $(mix "$(q4 ami_ihm)" 0.04)$(mix "$(q4 ami_sdm)" 0.04)$(mix "$(q4 mls_train)" 0.
             pkill -f s2s.train.speech_llm 2>/dev/null || true; sleep 60
         done
         kill $SYNC 2>/dev/null || true
-        [ -f checkpoints/speech_llm_v3/adapter.pt ] || { say "polish saved nothing: see $OUT/logs/polish_*.log"; exit 1; }
-        [ "$ok" = 1 ] && touch checkpoints/speech_llm_v3/DONE
-        hf push checkpoints/speech_llm_v3 checkpoints/speech_llm_v3
+        [ -f "checkpoints/$PDIR/adapter.pt" ] || { say "polish saved nothing: see $OUT/logs/polish_*.log"; exit 1; }
+        [ "$ok" = 1 ] && touch "checkpoints/$PDIR/DONE"
+        hf push "checkpoints/$PDIR" "checkpoints/$PDIR"
     fi
 
     public_test() {  # the same public test as the Nemotron baseline (fair + strict judge), adapter v3 only
@@ -301,9 +337,10 @@ $(mix "$(q4 ami_ihm)" 0.04)$(mix "$(q4 ami_sdm)" 0.04)$(mix "$(q4 mls_train)" 0.
         f slurp_test 0.0 slurp_pk; f slurp_test 1.0 slurp_noisy_pk; f spokenwoz_test 0.0 spokenwoz_pk
         f edacc_test 0.0 edacc_pk; f edacc_test 1.0 edacc_noisy_pk
         i=0
-        for s in slurp_pk slurp_noisy_pk spokenwoz_pk edacc_pk edacc_noisy_pk "$(basename "$(q4 hotel5_eval)" .jsonl)"; do
+        HOTEL_EVAL=$(basename "$(q4 hotel5_eval)" .jsonl)
+        for s in slurp_pk slurp_noisy_pk spokenwoz_pk edacc_pk edacc_noisy_pk "$HOTEL_EVAL"; do
             gpu=$(( i % NGPU ))
-            CUDA_VISIBLE_DEVICES=$gpu python -m s2s.eval.speech_vs_text $CFG --speech-llm-dir checkpoints/speech_llm_v3 \
+            CUDA_VISIBLE_DEVICES=$gpu python -m s2s.eval.speech_vs_text $CFG --speech-llm-dir "checkpoints/$PDIR" \
                 --manifest "$M/$s.jsonl" --max "$N_TEST" --name "$s" --out-dir "$OUT" > "$OUT/logs/test_$s.log" 2>&1 &
             i=$(( i + 1 )); [ $(( i % (NGPU * TEST_PAR) )) = 0 ] && wait
         done
@@ -311,6 +348,6 @@ $(mix "$(q4 ami_ihm)" 0.04)$(mix "$(q4 ami_sdm)" 0.04)$(mix "$(q4 mls_train)" 0.
         grep -h "^\[" "$OUT"/logs/test_*.log || true
     }
     step public_test public_test
-    if [ "$TEST_ONLY" = 1 ]; then hf push "$OUT" "logs/v3_gate1_step$STEP" || true; else hf push "$OUT" "logs/v3_polish" || true; fi
-    say "PART polish DONE: checkpoints/speech_llm_v3; results in $OUT"
+    if [ "$TEST_ONLY" = 1 ]; then hf push "$OUT" "${RESULTS/_polish/_gate1}_step$STEP" || true; else hf push "$OUT" "$RESULTS" || true; fi
+    say "PART $PART DONE: checkpoints/$PDIR; results in $OUT"
 fi

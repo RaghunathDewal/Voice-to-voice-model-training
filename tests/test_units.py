@@ -235,3 +235,44 @@ def test_compact_tool_result():
     assert out["products"][:3] == products["products"][:3] and out["products"][3] == "... and 37 more"
     assert out["note"] == "x" * 10 + "..."
     assert compact_result(products, max_items=0) is products and compact_result({"ok": True}) == {"ok": True}
+
+
+def test_nemotron_transcriber_matches_transformers_generate():
+    """The hybrid input's transcript decoder (from stored encoder features) gives exactly the tokens of
+    transformers' own RNN-T generate(), and the same tokens batched as one row at a time."""
+    import pytest
+    import torch
+
+    tr_mod = pytest.importorskip("transformers")
+    if not hasattr(tr_mod, "NemotronAsrStreamingForRNNT"):
+        pytest.skip("transformers without Nemotron streaming ASR")
+    from transformers import NemotronAsrStreamingConfig, NemotronAsrStreamingForRNNT
+
+    from s2s.models.nemotron_text import NemotronTranscriber, transcript_ids
+
+    torch.manual_seed(0)
+    c = NemotronAsrStreamingConfig(vocab_size=33, decoder_hidden_size=32, blank_token_id=32,
+                                   encoder_config=dict(hidden_size=64, num_hidden_layers=2, num_attention_heads=2,
+                                                       num_key_value_heads=2, intermediate_size=128,
+                                                       subsampling_conv_channels=16, dropout=0.0, layerdrop=0.0))
+    model = NemotronAsrStreamingForRNNT(c).eval()
+    model.generation_config.decoder_start_token_id = model.generation_config.pad_token_id = 32
+    with torch.no_grad():
+        model.joint.head.weight.mul_(40)
+        model.joint.head.bias[32] = 2.0  # a realistic mix of blanks and word pieces
+    x = torch.randn(3, 240, 80)
+    tr = NemotronTranscriber.from_model(model, torch.device("cpu"))
+    feats, refs = [], []
+    for i, n in enumerate([240, 160, 100]):
+        with torch.no_grad():
+            refs.append([t for t in model.generate(input_features=x[i:i + 1, :n], return_dict_in_generate=True)
+                         .sequences[0].tolist() if t != 32])
+            feats.append(model.get_audio_features(input_features=x[i:i + 1, :n]).last_hidden_state[0])
+    assert all(refs) and [tr.ids([f])[0] for f in feats] == refs
+    assert tr.ids(feats) == refs  # batched (padded) = one at a time
+
+    class P:
+        def ids(self, s):
+            return [len(w) for w in s.split()]
+    assert transcript_ids(P(), "  ", "x {text}") == []
+    assert transcript_ids(P(), "hi there", "\n(heard: {text})") == [7, 2, 6]

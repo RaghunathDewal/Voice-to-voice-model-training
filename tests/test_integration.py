@@ -610,3 +610,62 @@ def test_speech_text_keeps_spaces_before_numbers_and_says_times_naturally(agent,
         srv.shutdown()
     assert " ".join(spoken) == "Your check-in is scheduled for 3 PM on December 24, 2026."
     assert not any(x.rstrip().endswith(("3", "3:00")) for x in spoken[:-1])
+
+
+def test_hybrid_input_puts_the_listener_transcript_after_the_speech(agent, monkeypatch, tmp_path):
+    """Hybrid input (hybrid.enabled): (A) training rows get the transcript right after the speech, inside the
+    guest's turn, sometimes left out in training; (B) the live agent sends the same text to the 4B and reports it
+    as what the guest said; (C) the Gate 1 test runs with it and reports the listener's word error rate."""
+    import json as _json
+    import sys
+
+    import s2s.models.nemotron_text as nt
+    from s2s.data.datasets import SpeechLLMDataset
+    from s2s.models.nemotron_text import transcript_ids
+
+    th, tmpl = agent.thinker, "\n(speech recogniser heard: {text})"
+    heard = transcript_ids(th.prompts, "what time is checkout", tmpl)
+    lat = tmp_path / "a.npy"
+    np.save(lat, np.random.default_rng(0).standard_normal((30, 64)).astype(np.float32))
+    row = {"id": "r1", "latent": str(lat), "text": "what time is checkout", "response": "It is at 11 AM.",
+           "asr": "what time is checkout"}
+    common = dict(prompts=th.prompts, system_prompt="You are a concierge.", transcribe_instruction="Repeat.",
+                  transcribe_prob=0.0, max_trailing_frames=0, max_frames=100, max_target_tokens=64)
+    plain = SpeechLLMDataset([row], train=False, **common)[0]
+    hybrid = SpeechLLMDataset([row], train=False, hybrid_template=tmpl, **common)[0]
+    assert hybrid["suffix"] == heard + list(plain["suffix"])  # transcript first, then the turn is closed
+    assert SpeechLLMDataset([row], train=True, hybrid_template=tmpl, hybrid_drop=1.0, **common)[0]["suffix"] \
+        == plain["suffix"]  # left out in training (drop)
+    no_asr = {k: v for k, v in row.items() if k != "asr"}
+    assert SpeechLLMDataset([no_asr], train=False, hybrid_template=tmpl, **common)[0]["suffix"] == plain["suffix"]
+
+    class FakeTranscriber:  # stands in for Nemotron's text decoder (checked in test_units against transformers)
+        def __call__(self, feats):
+            return ["what time is checkout" for _ in feats]
+
+    monkeypatch.setattr(agent, "transcriber", FakeTranscriber(), raising=False)
+    monkeypatch.setattr(agent, "hybrid_template", tmpl, raising=False)
+    session = agent.new_session(tools=None)
+    wav = np.random.default_rng(1).standard_normal(24000).astype(np.float32) * 0.05
+    events = list(session.respond(wav))
+    said = next(e for e in events if e["type"] == "user_transcript")
+    assert said["asr"] == "what time is checkout"
+    ids = session.text_ids
+    assert any(ids[i:i + len(heard)] == heard for i in range(len(ids)))  # the 4B got the transcript
+    monkeypatch.setattr(agent, "transcriber", None)
+
+    # (C) the Gate 1 test in hybrid mode
+    monkeypatch.setattr(nt.NemotronTranscriber, "load", classmethod(lambda cls, name, device: FakeTranscriber()))
+    man = tmp_path / "m.jsonl"
+    man.write_text(_json.dumps({k: v for k, v in no_asr.items() if k != "response"}) + "\n")
+    from s2s.eval import speech_vs_text
+
+    cfg_args = ["--config", os.path.join(ROOT, "configs", "default.yaml"), "--set",
+                f"thinker.model={agent.cfg.thinker.model}", "device=cpu", "hybrid.enabled=true"]
+    monkeypatch.setattr(sys, "argv", ["speech_vs_text", *cfg_args, "--speech-llm-dir", str(tmp_path / "speech"),
+                                      "--manifest", str(man), "--name", "h", "--max", "1", "--max-new", "4",
+                                      "--out-dir", str(tmp_path / "out")])
+    speech_vs_text.main()
+    res = _json.loads((tmp_path / "out" / "h.json").read_text())
+    assert res["summary"]["hybrid"] and res["summary"]["listener_wer"] == 0.0
+    assert res["rows"][0]["listener_text"] == "what time is checkout"

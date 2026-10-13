@@ -191,6 +191,12 @@ def main() -> None:
                   max_target_tokens=tc.max_target_tokens, unclear_reply=cfg.runtime.get("unclear_reply", ""),
                   eot_early=int(tc.get("eot_early_frames") or 0), teacher=kd_w > 0,
                   tok_map=({int(t): i + 1 for i, t in enumerate(adapter.tok_vocab.tolist())} if tok_w else None))
+    hy = cfg.get("hybrid") or {}
+    if hy.get("enabled"):  # hybrid input: the listener's transcript follows the speech (rows need "asr")
+        common.update(hybrid_template=str(hy.template), hybrid_drop=float(hy.get("drop_prob", 0.0)))
+        n_asr = sum(bool(r.get("asr")) for r in rows)
+        log(f"hybrid input: {n_asr}/{len(rows)} training rows carry the listener's transcript "
+            f"(left out for {float(hy.get('drop_prob', 0.0)) * 100:.0f}% in training)")
     train_ds = SpeechLLMDataset(rows, train=True, **common)
     valid_ds = SpeechLLMDataset(valid_rows, train=False, **common)
     total_samples = int(tc.max_steps) * int(tc.batch_size) * grad_accum

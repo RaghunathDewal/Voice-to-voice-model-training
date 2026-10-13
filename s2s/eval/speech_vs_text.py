@@ -103,6 +103,13 @@ def main() -> None:
         verdict = generate_text(f"Guest message: {message}\nReply A: {a}\nReply B: {b}", system_prompt, max_new=3)
         return verdict.strip().upper().startswith("SAME")
 
+    hy = cfg.get("hybrid") or {}
+    transcriber = None
+    if hy.get("enabled"):  # hybrid input: the listener's own transcript follows the speech, as in training
+        from s2s.models.nemotron_text import NemotronTranscriber, transcript_ids
+
+        transcriber = NemotronTranscriber.load(str(hy.model), device)
+
     results = []
     for r in tqdm(rows, desc=f"speech vs text [{args.name}]", mininterval=30):
         lat = np.load(r["latent"]).astype(np.float32)
@@ -118,17 +125,21 @@ def main() -> None:
                 emb, _, _ = assemble_inputs(thinker, adapter, out["embeds"], torch.tensor([t]), [prefix], [suffix], None)
                 return clean(tok.decode(greedy_generate(thinker, emb, max_new), skip_special_tokens=False))
 
+        listener_text, extra = None, []
+        if transcriber is not None:
+            listener_text = r.get("asr") or transcriber([torch.from_numpy(lat)])[0]
+            extra = transcript_ids(thinker.prompts, listener_text, str(hy.template))
         pre, suf = thinker.prompts.prompt_parts(row_sys, tools, None, history)
-        speech_reply = from_speech(pre, suf, args.max_new)
+        speech_reply = from_speech(pre, extra + list(suf), args.max_new)
         text_reply = generate_text(sentence_case(r["text"]), row_sys, history, tools=tools)
         pre, suf = thinker.prompts.prompt_parts(system, None, cfg.thinker.transcribe_instruction)
-        heard = from_speech(pre, suf, 100)
+        heard = from_speech(pre, extra + list(suf), 100)
         msg = sentence_case(r["text"])
         exact = text_reply == speech_reply
         row = {
             "id": r.get("id"), "text": r["text"], "history": history, "heard": heard,
             "ctc": ctc_greedy_decode(out["ctc_logits"][0].argmax(-1).tolist()),
-            "text_reply": text_reply, "speech_reply": speech_reply, "exact": exact,
+            "text_reply": text_reply, "speech_reply": speech_reply, "exact": exact, "listener_text": listener_text,
             "same": judge(msg, text_reply, speech_reply, JUDGE_SYSTEM),
             "same_fair": judge(msg, text_reply, speech_reply, FAIR_JUDGE_SYSTEM),
         }
@@ -151,7 +162,10 @@ def main() -> None:
         "heard_wer": spoken_wer(refs, [x["heard"] for x in results]),
         "ctc_wer": spoken_wer(refs, [x["ctc"] for x in results]),
         "multi_turn_rows": sum(bool(x["history"]) for x in results),
+        "hybrid": transcriber is not None,
     }
+    if transcriber is not None:
+        summary["listener_wer"] = spoken_wer(refs, [x["listener_text"] or "" for x in results])
     if asr:
         for k, hyps in next(iter(asr.values())).items():  # recogniser WER for every setting it was run with
             summary[f"asr_{k}_wer"] = spoken_wer(refs, [asr[x["id"]][k] for x in results])
@@ -162,7 +176,9 @@ def main() -> None:
     line = (f"[{args.name}] n={n}  ADAPTER same answer: strict {summary['same_answer'] * 100:.1f}% / fair "
             f"{summary['same_answer_fair'] * 100:.1f}%  identical {summary['identical_answer'] * 100:.1f}%  "
             f"heard WER {summary['heard_wer'] * 100:.1f}%  CTC WER {summary['ctc_wer'] * 100:.1f}%  "
-            f"multi-turn rows {summary['multi_turn_rows']}")
+            f"multi-turn rows {summary['multi_turn_rows']}"
+            + (f"  HYBRID (speech + listener transcript, listener WER {summary['listener_wer'] * 100:.1f}%)"
+               if transcriber is not None else ""))
     for k in asr_keys:
         line += (f"\n[{args.name}] RECOGNISER {k}ms + 4B: strict {summary[f'asr_{k}_same'] * 100:.1f}% / fair "
                  f"{summary[f'asr_{k}_same_fair'] * 100:.1f}%  identical {summary[f'asr_{k}_identical'] * 100:.1f}%  "

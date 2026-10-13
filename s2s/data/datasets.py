@@ -73,11 +73,15 @@ class SpeechLLMDataset(Dataset):
     def __init__(self, rows: list[dict], prompts: PromptBuilder, system_prompt: str, transcribe_instruction: str,
                  transcribe_prob: float, max_trailing_frames: int, max_frames: int, max_target_tokens: int,
                  train: bool = True, eot_margin: int = 4, seed: int = 0, unclear_reply: str = "",
-                 tok_map: dict[int, int] | None = None, eot_early: int = 0, teacher: bool = False):
+                 tok_map: dict[int, int] | None = None, eot_early: int = 0, teacher: bool = False,
+                 hybrid_template: str | None = None, hybrid_drop: float = 0.0):
         """unclear_reply: target for rows marked `unclear` (unintelligible audio).
         tok_map: thinker token id -> index in the adapter's token head (word-level CTC targets in `tok`).
         eot_early: end-of-turn labels turn to 1 this many frames BEFORE the speech ends (predict the end).
-        teacher: also return the TEXT prompt of the same turn (`teacher`) for the KD loss."""
+        teacher: also return the TEXT prompt of the same turn (`teacher`) for the KD loss.
+        hybrid_template: hybrid input: the listener's own transcript (row field "asr") follows the speech, as text
+        in this template (s2s.models.nemotron_text.transcript_ids); in training it is left out with probability
+        hybrid_drop, so the speech alone still works."""
         self.rows = rows
         self.prompts = prompts
         self.system_prompt = system_prompt
@@ -93,6 +97,8 @@ class SpeechLLMDataset(Dataset):
         self.tok_map = tok_map
         self.eot_early = eot_early
         self.teacher = teacher
+        self.hybrid_template = hybrid_template
+        self.hybrid_drop = hybrid_drop
 
     def __len__(self) -> int:
         return len(self.rows)
@@ -137,6 +143,10 @@ class SpeechLLMDataset(Dataset):
             prefix, suffix = self.prompts.prompt_parts(system, None, self.transcribe_instruction)
             target = self.prompts.target_ids(system, None, content=sentence_case(row["text"]))
         target = target[: self.max_target_tokens]
+        if self.hybrid_template and row.get("asr") and not (self.train and rng.random() < self.hybrid_drop):
+            from s2s.models.nemotron_text import transcript_ids
+
+            suffix = transcript_ids(self.prompts, row["asr"], self.hybrid_template) + list(suffix)
 
         end = max(0, speech_frames - self.eot_early)
         eot = np.full(t, -1, dtype=np.int64)

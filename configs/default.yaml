@@ -213,3 +213,12 @@ runtime:
     quick_silence_ms: 0     # e.g. 160: end the turn this early when the EOT head is sure (0 = off)
     quick_eot_threshold: 0.8
     eot_threshold: 0.5
+
+# Hybrid input: the 4B gets the speech vectors AND the listener's own transcript (Nemotron's RNN-T text, decoded
+# from the same encoder output: s2s/models/nemotron_text.py). Text helps with accents / phone calls, the speech
+# vectors with noise. Training rows need the "asr" field (s2s.prep.asr_transcripts).
+hybrid:
+  enabled: false
+  model: nvidia/nemotron-speech-streaming-en-0.6b
+  template: "\n(speech recogniser heard: {text})"
+  drop_prob: 0.1            # training: no transcript for this share of rows (the speech alone must still work)
