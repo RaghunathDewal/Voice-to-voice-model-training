@@ -109,6 +109,7 @@ class VoiceAgent:
             enc_dev = rt.get("encoder_device")
             self.input_encoder = build_encoder(self.encoder_spec, resolve_device(enc_dev) if enc_dev else self.device)
         # runtime.tts_url: speak with an external TTS server (e.g. Qwen3-TTS) instead of the talker
+        self.static = None  # runtime.cuda_graphs: StaticThinker, set up by warm_up()
         self.tts = None
         if rt.get("tts_url"):
             from s2s.runtime.external_tts import ExternalTTS
@@ -151,6 +152,15 @@ class VoiceAgent:
         finally:
             self.tts = tts
         print(f"[agent] warm-up turn {time.time() - t0:.1f}s", flush=True)
+        if self.cfg.runtime.get("cuda_graphs") and self.static is None:
+            from s2s.runtime.cuda_graph import StaticThinker
+
+            st = StaticThinker(self.thinker.model, self.layer_idx, need_hidden=self.tts is None,
+                               max_tokens=int(self.cfg.runtime.get("graph_max_tokens", 6144)),
+                               device=self.device, dtype=self.thinker.dtype)
+            probe = self.thinker.prompts.ids("Hello! Welcome to the hotel, how can I help you today?")
+            if st.capture(lambda ids: self.thinker.embed(torch.tensor(ids, device=self.device)), probe):
+                self.static = st
 
     def new_session(self, system_prompt: str | None = None, context: str | None = None,
                     tools: list | None = None, backend=None) -> "VoiceSession":
@@ -172,13 +182,19 @@ class VoiceSession:
         self.prefix_ids, self.first_close_ids = prompts.prompt_parts(system, tools, None)
         self.next_open_ids, self.next_close_ids = prompts.user_turn_parts()
         self.generator = torch.Generator(device=agent.device) if agent.device.type == "cuda" else None
+        if agent.static is not None:
+            agent.static.reset(self)  # this conversation takes the fixed-size cache
         with torch.no_grad():
             self._feed_ids(self.prefix_ids)  # system prompt + context + tools, prefilled once
 
     # ------------------------------------------------------------- thinker io
     @torch.no_grad()
     def _feed_embeds(self, embeds: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """embeds [n, H] -> (logits at last position [V], selected hidden states [n_sel, H])."""
+        """embeds [n, H] -> (logits at last position [V], selected hidden states [n_sel, H]; None when the
+        CUDA-graph path runs with an external TTS, which does not need them)."""
+        if self.a.static is not None:
+            self.n_tokens += embeds.shape[0]
+            return self.a.static.forward(self, embeds)
         th = self.a.thinker
         out = th.model(inputs_embeds=embeds[None].to(th.dtype), past_key_values=self.past, use_cache=True,
                        output_hidden_states=True, logits_to_keep=1)
@@ -408,7 +424,7 @@ class StreamingTurn:
             frame = self.audio[f * hop:(f + 1) * hop]
             eot = 0.0
             if (not ep.is_speech(frame) and ep.speech_ms >= ep.min_speech_ms
-                    and ep.silence_ms + ep.frame_ms >= ep.min_silence_ms):
+                    and ep.silence_ms + ep.frame_ms >= ep.eot_check_ms):
                 eot = self.s.a.eot_probability(self.audio[: (f + 1) * hop])
                 self.eot_probs.append(eot)
             if ep.update(frame, eot):

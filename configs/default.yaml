@@ -183,6 +183,8 @@ train_duplex:               # full-duplex experiment (s2s/train/duplex.py); data
 runtime:
   encoder_device: null      # e.g. cuda:1: run the speech listener on a second GPU (Kaggle 2x T4 with a 4B thinker)
   tts_url: null             # e.g. http://127.0.0.1:7790/tts: speak with an external TTS server (s2s/cli/qwen_tts_server.py)
+  cuda_graphs: false        # replay the thinker's reply step from a CUDA (HIP on AMD) graph; checked at startup, falls back
+  graph_max_tokens: 6144    # with cuda_graphs: fixed KV cache size (system prompt + whole conversation)
   speech_llm_dir: checkpoints/speech_llm_tools   # adapter.pt + lora/
   talker_dir: checkpoints/talker
   max_new_tokens: 200
@@ -202,4 +204,6 @@ runtime:
     min_speech_ms: 240
     min_silence_ms: 320     # earliest end-of-turn decision (needs EOT head agreement)
     max_silence_ms: 1000    # end of turn regardless of EOT head
+    quick_silence_ms: 0     # e.g. 160: end the turn this early when the EOT head is sure (0 = off)
+    quick_eot_threshold: 0.8
     eot_threshold: 0.5

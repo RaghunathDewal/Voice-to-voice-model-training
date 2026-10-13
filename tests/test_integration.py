@@ -465,3 +465,41 @@ def test_v3_calls_places_the_reply_after_the_detected_end_of_turn(agent, monkeyp
     assert 1.5 < start < 4.0 and run["turns"][0]["end_detected_s"] > 1.5
     out, _ = sf.read(tmp_path / "out" / "c.wav")
     assert np.abs(out[: int(1.5 * sr)]).max() == 0 and np.abs(out).max() > 0
+
+
+def test_static_cache_thinker_matches_the_normal_path(agent):
+    """runtime.cuda_graphs: the fixed-size cache path gives the same logits as the normal path (the graph replay
+    itself needs a GPU and is checked against this path when recorded); one conversation owns the cache."""
+    from s2s.runtime.cuda_graph import StaticThinker
+
+    th = agent.thinker
+    st = StaticThinker(th.model, agent.layer_idx, need_hidden=True, max_tokens=64, device=agent.device, dtype=th.dtype)
+    assert st.capture(lambda ids: th.embed(torch.tensor(ids)), th.prompts.ids("hello there")) is False  # CPU
+    ids = th.prompts.ids("Hello, welcome to the hotel. How can I help?")
+    emb = th.embed(torch.tensor(ids))
+    with torch.no_grad():
+        ref = th.model(inputs_embeds=emb[None, :-3], use_cache=True)
+        past, ref_logits = ref.past_key_values, []
+        for i in range(len(ids) - 3, len(ids)):
+            out = th.model(inputs_embeds=emb[None, i:i + 1], past_key_values=past, use_cache=True)
+            past = out.past_key_values
+            ref_logits.append(out.logits[0, -1])
+    owner = object()
+    st.reset(owner)
+    st.forward(owner, emb[:-3])
+    got = [st.forward(owner, emb[i:i + 1])[0] for i in range(len(ids) - 3, len(ids))]
+    for a, b in zip(got, ref_logits):
+        assert torch.allclose(a, b, atol=1e-4)
+    st.reset(object())  # a new conversation takes the cache: the old one cannot continue
+    with pytest.raises(RuntimeError):
+        st.forward(owner, emb[:1])
+    # a whole session on the static path says the same as on the normal path
+    p = th.prompts
+    wav = np.random.default_rng(0).standard_normal(24000).astype(np.float32) * 0.05
+    texts = []
+    for static in (None, StaticThinker(th.model, agent.layer_idx, True, 512, agent.device, th.dtype)):
+        agent.static = static
+        session = agent.new_session(tools=None)
+        texts.append([e["text"] for e in session.respond(wav) if e["type"] == "assistant_text"])
+    agent.static = None
+    assert texts[0] == texts[1] and p is not None

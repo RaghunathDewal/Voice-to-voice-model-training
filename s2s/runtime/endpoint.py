@@ -2,6 +2,7 @@
 
 Rules (per 80 ms frame):
   * nothing happens until `min_speech_ms` of speech has been heard
+  * after `quick_silence_ms` of silence, end the turn if the EOT head is sure (p >= quick_eot_threshold)
   * after `min_silence_ms` of silence, end the turn if the EOT head agrees (p >= threshold)
   * after `max_silence_ms` of silence, end the turn regardless
 
@@ -63,13 +64,15 @@ class Endpointer:
     def __init__(self, frame_ms: float = 80.0, energy_threshold_db: float = -45.0, min_speech_ms: float = 240,
                  min_silence_ms: float = 240, max_silence_ms: float = 800, eot_threshold: float = 0.5,
                  vad: str = "energy", vad_threshold: float = 0.5, sample_rate: int = 24000,
-                 min_level_db: float = -65.0):
+                 min_level_db: float = -65.0, quick_silence_ms: float = 0.0, quick_eot_threshold: float = 1.01):
         self.frame_ms = frame_ms
         self.energy_threshold_db = energy_threshold_db
         self.min_speech_ms = min_speech_ms
         self.min_silence_ms = min_silence_ms
         self.max_silence_ms = max_silence_ms
         self.eot_threshold = eot_threshold
+        self.quick_silence_ms = quick_silence_ms or min_silence_ms  # 0: no quick rule
+        self.quick_eot_threshold = quick_eot_threshold
         self.vad_threshold = vad_threshold
         self.min_level_db = min_level_db  # silero: frames quieter than this are silence (digital silence, mic off)
         self.vad = None
@@ -88,7 +91,14 @@ class Endpointer:
         return cls(frame_ms=frame_ms, energy_threshold_db=cfg.energy_threshold_db, min_speech_ms=cfg.min_speech_ms,
                    min_silence_ms=cfg.min_silence_ms, max_silence_ms=cfg.max_silence_ms,
                    eot_threshold=cfg.eot_threshold, vad=str(cfg.get("vad", "energy")),
-                   vad_threshold=float(cfg.get("vad_threshold", 0.5)), sample_rate=sample_rate)
+                   vad_threshold=float(cfg.get("vad_threshold", 0.5)), sample_rate=sample_rate,
+                   quick_silence_ms=float(cfg.get("quick_silence_ms") or 0.0),
+                   quick_eot_threshold=float(cfg.get("quick_eot_threshold") or 1.01))
+
+    @property
+    def eot_check_ms(self) -> float:
+        """Silence after which the EOT head starts being asked."""
+        return min(self.quick_silence_ms, self.min_silence_ms)
 
     @property
     def vad_name(self) -> str:
@@ -131,6 +141,9 @@ class Endpointer:
             return False
         if self.silence_ms >= self.max_silence_ms:
             self.reason = "max_silence"
+            return True
+        if self.silence_ms >= self.quick_silence_ms and eot_prob >= self.quick_eot_threshold:
+            self.reason = "eot_quick"
             return True
         if self.silence_ms >= self.min_silence_ms and eot_prob >= self.eot_threshold:
             self.reason = "eot_head"

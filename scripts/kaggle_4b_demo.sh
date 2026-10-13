@@ -16,6 +16,8 @@
 #   TALKER=best            the talker checkpoint with the lowest eval loss (step 1000) instead of the final one
 #   PROMPT=/path/file.txt  your own system prompt (property facts, booking); default: the built-in hotel demo
 #   TOOLS=order_product,create_issue   only these tools (default: all built-in hotel tools); TOOLS=none: no tools
+#   GRAPHS=0               turn off the CUDA-graph reply step (on by default: recorded and checked at startup,
+#                          the log shows "[graphs] ... one reply token X ms (was Y ms)")
 #   EXTRA_SETS="runtime.emit_every_frames=1"   more config overrides (space-separated key=value)
 #   TTS=kokoro             speak with Kokoro-82M (own Python environment, on GPU 1) instead of our talker:
 #                          fast on a T4 and cannot babble; TTS_VOICE=af_heart|af_bella|am_michael|bf_emma|...
@@ -79,6 +81,7 @@ EOF
 SETS=()   # one --set with every override (a second --set would replace the first)
 [ "$NGPU" -gt 1 ] && SETS+=(runtime.encoder_device=cuda:1)
 [ -n "$THINKER" ] && SETS+=("thinker.model=checkpoints/$THINKER")
+[ "${GRAPHS:-1}" = 1 ] && SETS+=(runtime.cuda_graphs=true)  # reply step from a CUDA graph (checked, falls back)
 for kv in ${EXTRA_SETS:-}; do SETS+=("$kv"); done
 TTS=${TTS:-talker}
 TTS_DEV=$([ "$NGPU" -gt 1 ] && echo cuda:1 || echo cuda:0)

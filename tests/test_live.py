@@ -119,3 +119,19 @@ def test_silero_turn_in_a_noisy_room_ends_after_the_speech():
     voiced = _speech_frames(Endpointer(frame_ms=80, vad="silero", sample_rate=SR), speech) * HOP / SR
     # the whole spoken part plus pre-roll and the closing silence, not the 2 s of noise after it
     assert voiced <= sec < voiced + 1.5, (sec, voiced)
+
+
+def test_endpoint_quick_rule_ends_early_only_when_the_eot_head_is_sure():
+    loud, quiet = np.full(1920, 0.3, np.float32), np.zeros(1920, np.float32)
+
+    def silence_until_end(eot):
+        ep = Endpointer(frame_ms=80, energy_threshold_db=-45, min_speech_ms=240, min_silence_ms=320, max_silence_ms=1000,
+                        eot_threshold=0.5, quick_silence_ms=160, quick_eot_threshold=0.8)
+        for _ in range(5):
+            assert not ep.update(loud, 0.0)
+        for k in range(1, 20):
+            if ep.update(quiet, eot):
+                return k * 80, ep.reason
+    assert silence_until_end(0.9) == (160, "eot_quick")
+    assert silence_until_end(0.6) == (320, "eot_head")
+    assert silence_until_end(0.1) == (1040, "max_silence")

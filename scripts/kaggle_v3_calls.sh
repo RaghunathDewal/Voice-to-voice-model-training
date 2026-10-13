@@ -13,7 +13,7 @@
 #            os.environ["HF_TOKEN"] = UserSecretsClient().get_secret("HF_TOKEN")
 #   Cell 3:  !cd /tmp/repo && bash scripts/kaggle_v3_calls.sh
 # Options (before `bash`): ADAPTER=speech_llm_v3 (or speech_llm_4b_v2 with CFG=configs/qwen4b.yaml for the
-# earlier adapter), TTS_VOICE=af_heart, NO_TOOLS=1.
+# earlier adapter), TTS_VOICE=af_heart, NO_TOOLS=1, GRAPHS=0 (no CUDA-graph reply step).
 # Results: /kaggle/working/v3_calls/summary.md (+ the PersonaPlex one in /kaggle/working/personaplex if it ran)
 set -euo pipefail
 
@@ -79,6 +79,7 @@ fi
 say ">>> $(cat /tmp/v3_label) on the calls (4B on GPU 0, listener + voice on GPU 1)"
 SETS=(runtime.tts_url=http://127.0.0.1:7791/tts)
 [ "$NGPU" -gt 1 ] && SETS+=(runtime.encoder_device=cuda:1)
+[ "${GRAPHS:-1}" = 1 ] && SETS+=(runtime.cuda_graphs=true)
 EXTRA=(); [ "${NO_TOOLS:-0}" = 1 ] && EXTRA+=(--no-tools)
 python -m s2s.eval.v3_calls --config "$CFG" --calls "$CALLS" --out-dir "$OUT/run" --speech-llm-dir "checkpoints/$ADAPTER" \
     --talker-dir checkpoints/talker_4b --label "$(cat /tmp/v3_label)" "${EXTRA[@]}" --set "${SETS[@]}" 2>&1 \

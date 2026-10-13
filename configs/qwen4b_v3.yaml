@@ -38,3 +38,5 @@ train_speech_llm:
 
 runtime:
   speech_llm_dir: checkpoints/speech_llm_v3
+  endpoint:
+    quick_silence_ms: 160   # v3's end-of-turn head is trained to fire early (95% right): answer after 160 ms when sure

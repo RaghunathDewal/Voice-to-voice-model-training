@@ -85,7 +85,7 @@ class LiveListener:
         silent = not ep.is_speech(frame)
         # the EOT head is only consulted once enough silence has passed (it costs a Mimi encode)
         eot = 0.0
-        if silent and ep.speech_ms >= ep.min_speech_ms and ep.silence_ms + ep.frame_ms >= ep.min_silence_ms:
+        if silent and ep.speech_ms >= ep.min_speech_ms and ep.silence_ms + ep.frame_ms >= ep.eot_check_ms:
             eot = self.eot_fn(np.concatenate(self.frames))
         if ep.update(frame, eot):
             return self._finish(ep.reason)
