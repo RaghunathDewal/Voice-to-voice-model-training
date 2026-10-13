@@ -69,8 +69,12 @@ def main() -> None:
     cfg = config_from_args(args)
     device = resolve_device(cfg.device)
     dtype = resolve_dtype(cfg.thinker.dtype, device)
-    thinker = Thinker(cfg.thinker.model, device, dtype, attn_implementation=cfg.thinker.attn_implementation)
+    lora = os.path.join(args.speech_llm_dir, "lora")  # a speech LoRA: used for the speech replies only
+    thinker = Thinker(cfg.thinker.model, device, dtype, lora_dir=lora if os.path.isdir(lora) else None,
+                      attn_implementation=cfg.thinker.attn_implementation)
     thinker.model.eval()
+    if os.path.isdir(lora):
+        print(f"speech replies with the LoRA in {lora}; typed-text replies and the judge with the original thinker")
     adapter = SpeechAdapter.load(os.path.join(args.speech_llm_dir, "adapter.pt")).to(device).eval()
     rows = [r for r in load_manifest(args.manifest) if r.get("text")][: args.max or None]
     enc = adapter.hparams.get("encoder", "mimi")
@@ -82,7 +86,7 @@ def main() -> None:
 
     def generate_text(user: str, sys_prompt: str, history=None, max_new: int = args.max_new, tools=None) -> str:
         ids = thinker.prompts.text_prompt_ids(sys_prompt, user, tools, history)
-        with torch.no_grad(), autocast_ctx(device, dtype):
+        with torch.no_grad(), autocast_ctx(device, dtype), thinker.base_only():  # typed text: the original 4B
             out = greedy_generate(thinker, thinker.embed(torch.tensor([ids], device=device)), max_new)
         return clean(tok.decode(out, skip_special_tokens=False))
 

@@ -29,6 +29,9 @@ POLISH_BATCH=${POLISH_BATCH:-4}        # PART=polish: batch x accumulation = 32 
 POLISH_ACCUM=${POLISH_ACCUM:-8}
 TEST_MIN=${TEST_MIN:-110}              # PART=polish: minutes kept for the test after training
 TEST_PAR=${TEST_PAR:-1}                # PART=polish: test sets run at the same time on each GPU
+POLISH_LORA=${POLISH_LORA:-0}          # PART=polish: 1 = also train a LoRA on the 4B so it learns to read the
+                                       # adapter's vectors (the KD teacher stays the original 4B)
+LORA_LR=${LORA_LR:-1e-4}
 REPO_DIR=$(cd "$(dirname "$0")/.." && pwd)
 WORK=${WORK:-/tmp/s2s_v3}
 OUT=${OUT:-$( [ -d /kaggle/working ] && echo /kaggle/working/v3_$PART || echo "$WORK/out_$PART")}
@@ -77,7 +80,8 @@ elif cmd == "ckpt":                     # download each listed checkpoint folder
     for name in args:
         if any(f.startswith(f"checkpoints/{name}/") for f in files):
             snapshot_download(ckpt, local_dir=".", allow_patterns=[f"checkpoints/{name}/*.pt", f"checkpoints/{name}/*.json",
-                                                                   f"checkpoints/{name}/*.yaml", f"checkpoints/{name}/DONE"])
+                                                                   f"checkpoints/{name}/*.yaml", f"checkpoints/{name}/DONE",
+                                                                   f"checkpoints/{name}/lora/*"])
             print(f"found {name}", flush=True)
 elif cmd == "v3tars":                   # names of the feature archives already uploaded
     print("\n".join(f for f in api.list_repo_files(data, repo_type="dataset") if f.startswith("v3/feat-")))
@@ -270,7 +274,8 @@ $(mix "$(q4 ami_ihm)" 0.04)$(mix "$(q4 ami_sdm)" 0.04)$(mix "$(q4 mls_train)" 0.
                 train_speech_llm.max_steps=20000 train_speech_llm.max_minutes="$MIN" train_speech_llm.batch_size="$POLISH_BATCH" \
                 train_speech_llm.grad_accum="$POLISH_ACCUM" train_speech_llm.num_workers=4 train_speech_llm.log_every=10 \
                 train_speech_llm.eval_every=250 train_speech_llm.eval_batches=10 train_speech_llm.save_every=250 \
-                seed=$(( 1233 + attempt )); then ok=1; break; fi
+                train_speech_llm.train_lora=$( [ "$POLISH_LORA" = 1 ] && echo true || echo false ) \
+                train_speech_llm.lora_lr="$LORA_LR" seed=$(( 1233 + attempt )); then ok=1; break; fi
             say "polish stopped with an error (attempt $attempt, see $OUT/logs/polish_$attempt.log); restarting in 60 s"
             pkill -f s2s.train.speech_llm 2>/dev/null || true; sleep 60
         done

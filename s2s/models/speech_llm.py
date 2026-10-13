@@ -80,7 +80,8 @@ def teacher_logits(thinker: Thinker, teacher: list[list[int]], target: list[list
         mask[i, : len(x)] = 1
         if t:
             labels[i, len(x) - len(t): len(x)] = torch.tensor(t, device=device)
-    logits, _, _ = target_logits(thinker, thinker.embed(ids).to(thinker.dtype), mask, labels)
+    with thinker.base_only():  # the teacher is the original thinker, even when a LoRA is being trained
+        logits, _, _ = target_logits(thinker, thinker.embed(ids).to(thinker.dtype), mask, labels)
     return logits
 
 

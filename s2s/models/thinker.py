@@ -166,6 +166,15 @@ class Thinker:
         idx = sorted({max(1, min(self.num_layers, int(round(f * self.num_layers)))) for f in fractions})
         return idx
 
+    def base_only(self):
+        """Context manager: run the original model with any LoRA switched off (no-op without LoRA).
+        Used for the KD teacher and the typed-text reference, so a speech LoRA never moves the target."""
+        import contextlib
+
+        if hasattr(self.model, "disable_adapter") and hasattr(self.model, "peft_config"):
+            return self.model.disable_adapter()
+        return contextlib.nullcontext()
+
     def enable_gradient_checkpointing(self) -> None:
         m = self.model
         m.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
