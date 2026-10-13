@@ -107,6 +107,13 @@ class VoiceAgent:
             # runtime.encoder_device: put the listener on another GPU (e.g. cuda:1 on Kaggle's 2x T4 next to a 4B thinker)
             enc_dev = rt.get("encoder_device")
             self.input_encoder = build_encoder(self.encoder_spec, resolve_device(enc_dev) if enc_dev else self.device)
+        # runtime.tts_url: speak with an external TTS server (e.g. Qwen3-TTS) instead of the talker
+        self.tts = None
+        if rt.get("tts_url"):
+            from s2s.runtime.external_tts import ExternalTTS
+
+            self.tts = ExternalTTS(str(rt.tts_url))
+            print(f"[agent] voice: external TTS at {rt.tts_url} (the talker is not used)")
         # only Mimi is causal: its frames never change, so they can be prefilled while the user speaks
         self.incremental_input = self.input_encoder is None
         print(f"[agent] input encoder: {self.encoder_spec}")
@@ -219,6 +226,7 @@ class VoiceSession:
         dev = a.device
         for round_idx in range(int(rt.max_tool_rounds) + 1):
             stream: TalkerStream | None = None
+            phrases = None  # external TTS (a.tts): the reply text in phrases
             decoder = StreamingDecoder(a.codec, int(rt.decode_context_frames))
             pending: list[torch.Tensor] = []
             spoken: list[int] = []
@@ -226,7 +234,15 @@ class VoiceSession:
             calls: list[dict] = []
             finished_by_eos = False
 
+            def tts_audio(chunks) -> Iterator[dict]:
+                for wav, rate in chunks:
+                    timer.mark("first_audio_out")
+                    yield {"type": "audio", "audio": wav, "sample_rate": rate}
+
             def drain(final: bool = False) -> Iterator[dict]:
+                if phrases is not None:
+                    yield from tts_audio(phrases.finish() if final else phrases.ready())
+                    return
                 if stream is None:
                     return
                 while stream.can_step():
@@ -264,6 +280,13 @@ class VoiceSession:
                     elif not speakable(piece):
                         spoken.append(tok)  # emoji / markdown: kept in the text, not spoken
                         yield {"type": "token", "text": piece}
+                    elif a.tts is not None:
+                        if phrases is None:
+                            phrases = a.tts.stream()
+                        spoken.append(tok)
+                        timer.mark("first_spoken_token")
+                        yield {"type": "token", "text": piece}
+                        phrases.push(piece)
                     else:
                         if stream is None:
                             stream = TalkerStream(talker, float(rt.talker_temperature), int(rt.talker_top_k),
@@ -279,6 +302,8 @@ class VoiceSession:
                 self._feed_ids([th.prompts.im_end_id])  # keep the cache aligned with the chat format
             if stream is not None:
                 stream.end_text()
+                yield from drain(final=True)
+            elif phrases is not None:
                 yield from drain(final=True)
             text = th.tokenizer.decode(spoken, skip_special_tokens=True).strip()
             self.history.append({"role": "assistant", "text": text, "tool_calls": calls})

@@ -182,6 +182,7 @@ train_duplex:               # full-duplex experiment (s2s/train/duplex.py); data
 
 runtime:
   encoder_device: null      # e.g. cuda:1: run the speech listener on a second GPU (Kaggle 2x T4 with a 4B thinker)
+  tts_url: null             # e.g. http://127.0.0.1:7790/tts: speak with an external TTS server (s2s/cli/qwen_tts_server.py)
   speech_llm_dir: checkpoints/speech_llm_tools   # adapter.pt + lora/
   talker_dir: checkpoints/talker
   max_new_tokens: 200

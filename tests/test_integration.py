@@ -380,3 +380,48 @@ def test_live_api_for_an_application_backend(agent, monkeypatch):
         ws.send_text(json.dumps({"type": "tool_response", "id": tc["id"], "response": {"order_id": 77}}))
         got, audio = until(ws, "turn_complete")
         assert audio > 0 and {"type": "output_transcription", "text": "Your towels are on the way."} in got
+
+
+def test_external_tts_speaks_the_reply_instead_of_the_talker(agent, monkeypatch):
+    """runtime.tts_url: the reply text goes to a TTS server in phrases; its audio (own sample rate) is emitted."""
+    import json as _json
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    import s2s.runtime.agent as agent_mod
+    from s2s.runtime.external_tts import ExternalTTS
+
+    spoken = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            spoken.append(_json.loads(self.rfile.read(int(self.headers["Content-Length"])))["text"])
+            pcm = (np.full(1600, 0.1) * 32767).astype("<i2").tobytes()
+            self.send_response(200)
+            self.send_header("X-Sample-Rate", "16000")
+            self.send_header("Content-Length", str(len(pcm)))
+            self.end_headers()
+            self.wfile.write(pcm)
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    monkeypatch.setattr(agent, "tts", ExternalTTS(f"http://127.0.0.1:{srv.server_address[1]}/tts"))
+    p = agent.thinker.prompts
+    call = '\n{"name": "order_product", "arguments": {"product": "towel", "quantity": 2}}\n'
+    script = (p.ids("Sure, one moment.") + [p.tool_call_start_id] + p.ids(call) + [p.tool_call_end_id, p.im_end_id]
+              + p.ids("Two towels are on the way. Anything else?") + [p.im_end_id])
+    monkeypatch.setattr(agent_mod, "sample_logits", lambda *a, **k: script.pop(0) if script else p.im_end_id)
+    res = make_reservation()
+    session = agent.new_session(context=reservation_context(res), tools=HOTEL_TOOLS, backend=HotelBackend(res))
+    try:
+        events = list(session.respond(np.random.default_rng(0).standard_normal(24000).astype(np.float32) * 0.05))
+    finally:
+        srv.shutdown()
+    audio = [e for e in events if e["type"] == "audio"]
+    assert spoken == ["Sure, one moment.", "Two towels are on the way.", "Anything else?"]
+    assert len(audio) == 3 and all(e["sample_rate"] == 16000 and len(e["audio"]) == 1600 for e in audio)
+    timings = next(e["ms"] for e in events if e["type"] == "timings")
+    assert "first_audio_out" in timings and "tool_call" in timings
