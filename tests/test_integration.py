@@ -154,7 +154,8 @@ def agent(tiny_models, tmp_path, cpu):
     save_json(str(talker_dir / "meta.json"), {"thinker": tiny_models["qwen"], "layer_idx": layers})
     cfg = load_config(os.path.join(ROOT, "configs", "default.yaml"), [
         f"codec.model={tiny_models['mimi']}", f"thinker.model={tiny_models['qwen']}", "device=cpu",
-        "runtime.endpoint.vad=energy"])  # synthetic tones stand in for speech here; Silero rightly ignores them
+        "runtime.endpoint.vad=energy",  # synthetic tones stand in for speech here; Silero rightly ignores them
+        "runtime.spec_lookup=false"])  # tests script the thinker's choices; the prompt-lookup test turns it on
     from s2s.runtime.agent import VoiceAgent
 
     return VoiceAgent(cfg, str(speech_dir), str(talker_dir))
@@ -526,3 +527,42 @@ def test_a_turn_with_no_heard_words_gets_no_reply_and_is_forgotten(agent, monkey
         else:
             assert static.n == before
     agent.static = None
+
+
+def test_prompt_lookup_gives_the_same_reply_in_fewer_thinker_passes(agent, monkeypatch):
+    """runtime.spec_lookup: (1) the real (tiny) thinker says exactly the same with and without it; (2) a reply
+    that copies the prompt's facts is produced in fewer thinker passes than tokens."""
+    import s2s.runtime.agent as agent_mod
+
+    wav = np.random.default_rng(1).standard_normal(24000).astype(np.float32) * 0.05
+    prompt = "You are a hotel concierge. The Wi-Fi password is sunset2026 and checkout is at 11 AM."
+    replies = []
+    for on in (False, True):
+        monkeypatch.setitem(agent.cfg.runtime, "spec_lookup", on)
+        session = agent.new_session(system_prompt=prompt, tools=None)
+        events = list(session.respond(wav))
+        replies.append(([e["text"] for e in events if e["type"] == "assistant_text"],
+                        next(e["ms"] for e in events if e["type"] == "timings")))
+    assert replies[0][0] == replies[1][0]
+    assert replies[0][1]["reply_tokens"] == replies[0][1]["thinker_passes"]  # off: one pass per token
+
+    # a thinker whose (greedy) reply copies the prompt: guessed tokens are checked against it
+    th = agent.thinker
+    script = th.prompts.ids("The Wi-Fi password is sunset2026 and checkout is at 11 AM.") + [th.prompts.im_end_id]
+    want = list(script)
+
+    def next_choice(*a, **k):
+        return script.pop(0) if script else th.prompts.im_end_id
+
+    monkeypatch.setattr(agent_mod, "sample_logits", next_choice)
+    monkeypatch.setattr(agent_mod.VoiceSession, "_verify",
+                        lambda self, logits, guess, temp: (lambda c: (c == guess, c))(next_choice()))
+    monkeypatch.setitem(agent.cfg.runtime, "spec_lookup", True)
+    session = agent.new_session(system_prompt=prompt, tools=None)
+    events = list(session.respond(wav))
+    text = next(e["text"] for e in events if e["type"] == "assistant_text")
+    ms = next(e["ms"] for e in events if e["type"] == "timings")
+    assert text == th.tokenizer.decode(want[:-1]).strip()
+    assert ms["reply_tokens"] == len(want) - 1 and ms["thinker_passes"] < ms["reply_tokens"] / 2
+    # the memory holds exactly the reply (rejected guesses were taken back out)
+    assert session.text_ids[-len(want):] == want and session.n_tokens == session.past.get_seq_length()

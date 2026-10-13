@@ -59,17 +59,21 @@ class StaticThinker:
             raise RuntimeError(f"the conversation is longer than runtime.graph_max_tokens={self.max_tokens}")
 
     # ------------------------------------------------------------------ forward
-    def _run(self, embeds: torch.Tensor, positions: torch.Tensor):
+    def _run(self, embeds: torch.Tensor, positions: torch.Tensor, all_positions: bool = False):
         return self.model(inputs_embeds=embeds, past_key_values=self.cache, cache_position=positions, use_cache=True,
-                          output_hidden_states=self.need_hidden, logits_to_keep=1)
+                          output_hidden_states=self.need_hidden, logits_to_keep=0 if all_positions else 1)
 
-    def _outputs(self, out) -> tuple[torch.Tensor, torch.Tensor | None]:
+    def _outputs(self, out, all_positions: bool = False) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if all_positions:
+            hidden = torch.stack([out.hidden_states[j][0] for j in self.hidden_idx], 1) if self.need_hidden else None
+            return out.logits[0], hidden
         hidden = torch.stack([out.hidden_states[j][0, -1] for j in self.hidden_idx], 0) if self.need_hidden else None
         return out.logits[0, -1], hidden
 
     @torch.no_grad()
-    def forward(self, owner, embeds: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """embeds [n, H] -> (logits at the last position [V], selected hidden states [n_sel, H] or None)."""
+    def forward(self, owner, embeds: torch.Tensor, all_positions: bool = False) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """embeds [n, H] -> (logits at the last position [V], selected hidden states [n_sel, H] or None);
+        all_positions: logits [n, V], hidden [n, n_sel, H]."""
         n = int(embeds.shape[0])
         self._check(owner, n)
         if n == 1 and self.graph is not None:
@@ -78,11 +82,15 @@ class StaticThinker:
             self.graph.replay()
             self.n += 1
             hidden = torch.stack([h[0, -1] for h in self.out_hidden], 0) if self.need_hidden else None
-            return self.out_logits[0, -1].clone(), (hidden.clone() if hidden is not None else None)
+            logits = self.out_logits[0, -1].clone()
+            hidden = hidden.clone() if hidden is not None else None
+            if all_positions:
+                return logits[None], (hidden[None] if hidden is not None else None)
+            return logits, hidden
         positions = torch.arange(self.n, self.n + n, device=self.device)
-        out = self._run(embeds[None].to(self.dtype), positions)
+        out = self._run(embeds[None].to(self.dtype), positions, all_positions)
         self.n += n
-        return self._outputs(out)
+        return self._outputs(out, all_positions)
 
     # ------------------------------------------------------------------ recording
     @torch.no_grad()

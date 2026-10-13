@@ -183,6 +183,11 @@ train_duplex:               # full-duplex experiment (s2s/train/duplex.py); data
 runtime:
   encoder_device: null      # e.g. cuda:1: run the speech listener on a second GPU (Kaggle 2x T4 with a 4B thinker)
   tts_url: null             # e.g. http://127.0.0.1:7790/tts: speak with an external TTS server (s2s/cli/qwen_tts_server.py)
+  spec_lookup: true         # speculative decoding by prompt lookup: guess the next tokens from earlier text (the
+                            # prompt's facts, the conversation), check them in one pass; exact (same reply)
+  spec_tokens: 6            # tokens guessed per pass
+  spec_ngram_max: 3         # match the last 3 (else 2) tokens
+  spec_ngram_min: 2
   skip_empty_turns: true    # no reply when the listener heard no words (noise passed the voice detector)
   cuda_graphs: false        # replay the thinker's reply step from a CUDA (HIP on AMD) graph; checked at startup, falls back
   graph_max_tokens: 6144    # with cuda_graphs: fixed KV cache size (system prompt + whole conversation)

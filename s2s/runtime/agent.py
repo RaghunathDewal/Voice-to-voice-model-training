@@ -177,6 +177,9 @@ class VoiceSession:
         self.history: list[dict] = []
         self.past = None
         self.n_tokens = 0
+        self.text_ids: list[int] = []  # token ids fed (prompt, turn markers, replies, tool results) ...
+        self.text_pos: list[int] = []  # ... and their positions in the thinker's memory
+        self.spec_tokens = self.spec_passes = 0  # reply tokens / thinker passes (prompt lookup's gain)
         self.first_turn = True
         prompts = agent.thinker.prompts
         self.prefix_ids, self.first_close_ids = prompts.prompt_parts(system, tools, None)
@@ -189,17 +192,21 @@ class VoiceSession:
 
     # ------------------------------------------------------------- thinker io
     @torch.no_grad()
-    def _feed_embeds(self, embeds: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """embeds [n, H] -> (logits at last position [V], selected hidden states [n_sel, H]; None when the
-        CUDA-graph path runs with an external TTS, which does not need them)."""
+    def _feed_embeds(self, embeds: torch.Tensor, all_positions: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+        """embeds [n, H] -> (logits at the last position [V], selected hidden states [n_sel, H]); with
+        all_positions: logits [n, V] and hidden states [n, n_sel, H]. Hidden states are None when the CUDA-graph
+        path runs with an external TTS, which does not need them."""
         if self.a.static is not None:
             self.n_tokens += embeds.shape[0]
-            return self.a.static.forward(self, embeds)
+            return self.a.static.forward(self, embeds, all_positions=all_positions)
         th = self.a.thinker
         out = th.model(inputs_embeds=embeds[None].to(th.dtype), past_key_values=self.past, use_cache=True,
-                       output_hidden_states=True, logits_to_keep=1)
+                       output_hidden_states=True, logits_to_keep=0 if all_positions else 1)
         self.past = out.past_key_values
         self.n_tokens += embeds.shape[0]
+        if all_positions:
+            hidden = torch.stack([out.hidden_states[j][0] for j in self.a.layer_idx], dim=1)
+            return out.logits[0], hidden
         hidden = torch.stack([out.hidden_states[j][0, -1] for j in self.a.layer_idx], dim=0)
         return out.logits[0, -1], hidden
 
@@ -210,9 +217,48 @@ class VoiceSession:
         elif self.past is not None and hasattr(self.past, "crop"):
             self.past.crop(n_tokens)
         self.n_tokens = n_tokens
+        while self.text_pos and self.text_pos[-1] >= n_tokens:
+            self.text_pos.pop()
+            self.text_ids.pop()
 
-    def _feed_ids(self, ids: list[int]):
-        return self._feed_embeds(self.a.thinker.embed(torch.tensor(ids, device=self.a.device)))
+    def _feed_ids(self, ids: list[int], all_positions: bool = False):
+        start = self.n_tokens
+        out = self._feed_embeds(self.a.thinker.embed(torch.tensor(ids, device=self.a.device)), all_positions)
+        self.text_ids.extend(ids)  # the text in the thinker's memory, for prompt lookup (speech is not text)
+        self.text_pos.extend(range(start, start + len(ids)))
+        return out
+
+    def _lookup_draft(self, tok: int, budget: int) -> list[int]:
+        """Guess the tokens after `tok`: find the latest earlier place where the last 3 (else 2) tokens appear
+        in the memory's text and copy what followed there."""
+        k = min(int(self.rt.get("spec_tokens", 6)), budget)
+        if k <= 0:
+            return []
+        ids = self.text_ids + [tok]
+        n_max, n_min = int(self.rt.get("spec_ngram_max", 3)), int(self.rt.get("spec_ngram_min", 2))
+        for n in range(n_max, n_min - 1, -1):
+            if len(ids) <= n:
+                continue
+            pat = ids[-n:]
+            for start in range(len(ids) - n - 1, -1, -1):
+                if ids[start] == pat[0] and ids[start:start + n] == pat:
+                    cont = ids[start + n: start + n + k]
+                    if cont:
+                        return cont
+        return []
+
+    def _verify(self, logits: torch.Tensor, guess: int, temp: float) -> tuple[bool, int]:
+        """Keep a guessed token only as often as the thinker would have chosen it (exact: greedy keeps it when
+        it is the top token; sampling keeps it with its probability, else draws from the rest)."""
+        if temp <= 0:
+            top = int(logits.argmax())
+            return top == guess, top
+        probs = torch.softmax(logits.float() / temp, dim=-1)
+        u = torch.rand(1, generator=self.generator, device=probs.device) if self.generator is not None else torch.rand(1)
+        if float(u) < float(probs[guess]):
+            return True, guess
+        probs[guess] = 0.0
+        return False, int(torch.multinomial(probs / probs.sum(), 1, generator=self.generator))
 
     # --------------------------------------------------------------- turns
     def stream_input(self) -> "StreamingTurn":
@@ -264,6 +310,15 @@ class VoiceSession:
     def _generate(self, logits: torch.Tensor, hidden: torch.Tensor, timer: Timer,
                   forced: list[int] | None = None) -> Iterator[dict]:
         """`forced`: speak exactly these reply tokens instead of sampling (kept in the KV cache like any reply)."""
+        tok0, pass0 = self.spec_tokens, self.spec_passes
+        try:
+            yield from self._rounds(logits, hidden, timer, forced)
+        finally:  # counts, not ms: reply tokens per thinker pass shows the prompt-lookup gain
+            timer.marks["reply_tokens"] = self.spec_tokens - tok0
+            timer.marks["thinker_passes"] = self.spec_passes - pass0
+
+    def _rounds(self, logits: torch.Tensor, hidden: torch.Tensor, timer: Timer,
+                forced: list[int] | None = None) -> Iterator[dict]:
         a, rt = self.a, self.rt
         th, talker = a.thinker, a.talker
         dev = a.device
@@ -298,15 +353,9 @@ class VoiceSession:
                 if final and pending:
                     yield self._emit(decoder, pending, timer)
 
-            for _ in range(int(rt.max_new_tokens)):
-                if forced is not None:
-                    tok = forced.pop(0) if forced else th.prompts.im_end_id
-                else:
-                    tok = sample_logits(logits, float(rt.temperature), 0, self.generator)
-                timer.mark("first_token")
-                if tok in th.eos_ids:
-                    finished_by_eos = True
-                    break
+            def emit_token(tok: int, h) -> Iterator[dict]:
+                """One reply token: tool-call JSON is collected, speakable text goes to the voice."""
+                nonlocal tool_buf, phrases, stream
                 if tok == th.prompts.tool_call_start_id:
                     tool_buf = []
                 elif tok == th.prompts.tool_call_end_id:
@@ -337,10 +386,58 @@ class VoiceSession:
                         spoken.append(tok)
                         timer.mark("first_spoken_token")
                         yield {"type": "token", "text": piece}
-                        item = talker.fuse(th.embed(torch.tensor([tok], device=dev)).float(), hidden[None].float())
+                        item = talker.fuse(th.embed(torch.tensor([tok], device=dev)).float(), h[None].float())
                         stream.push_text(item)
-                logits, hidden = self._feed_ids([tok])
+
+            # speculative decoding by prompt lookup (runtime.spec_lookup): the next tokens are guessed from
+            # where the text so far already appears earlier (the prompt's facts, the conversation) and checked
+            # in the same pass as the current token; only what the thinker itself would have chosen is kept
+            use_spec = forced is None and bool(rt.get("spec_lookup", False))
+            max_new, n_gen, next_tok = int(rt.max_new_tokens), 0, None
+            temp = float(rt.temperature)
+            while n_gen < max_new:
+                if next_tok is not None:
+                    tok, next_tok = next_tok, None
+                elif forced is not None:
+                    tok = forced.pop(0) if forced else th.prompts.im_end_id
+                else:
+                    tok = sample_logits(logits, temp, 0, self.generator)
+                timer.mark("first_token")
+                if tok in th.eos_ids:
+                    finished_by_eos = True
+                    break
+                yield from emit_token(tok, hidden)
+                n_gen += 1
+                draft = self._lookup_draft(tok, max_new - n_gen) if use_spec else []
+                self.spec_passes += 1
+                self.spec_tokens += 1
+                if not draft:
+                    logits, hidden = self._feed_ids([tok])
+                    yield from drain()
+                    continue
+                all_logits, all_hidden = self._feed_ids([tok] + draft, all_positions=True)
+                n_ok = 0
+                for i, d in enumerate(draft):  # position i predicts the token after ([tok] + draft)[i]
+                    ok, alt = self._verify(all_logits[i], d, temp)
+                    if not ok:
+                        next_tok = alt  # the thinker's own choice at the first wrong guess (no extra pass)
+                        break
+                    if d in th.eos_ids:
+                        finished_by_eos = True
+                        break
+                    yield from emit_token(d, all_hidden[i] if all_hidden is not None else None)
+                    n_ok += 1
+                    n_gen += 1
+                    self.spec_tokens += 1
+                    if n_gen >= max_new:
+                        break
+                if n_ok < len(draft):
+                    self._rollback(self.n_tokens - (len(draft) - n_ok))
+                logits = all_logits[n_ok]
+                hidden = all_hidden[n_ok] if all_hidden is not None else None
                 yield from drain()
+                if finished_by_eos:
+                    break
             if finished_by_eos:
                 self._feed_ids([th.prompts.im_end_id])  # keep the cache aligned with the chat format
             if stream is not None:
