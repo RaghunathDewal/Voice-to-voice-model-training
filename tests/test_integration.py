@@ -425,3 +425,9 @@ def test_external_tts_speaks_the_reply_instead_of_the_talker(agent, monkeypatch)
     assert len(audio) == 3 and all(e["sample_rate"] == 16000 and len(e["audio"]) == 1600 for e in audio)
     timings = next(e["ms"] for e in events if e["type"] == "timings")
     assert "first_audio_out" in timings and "tool_call" in timings
+
+
+def test_warm_up_runs_a_throwaway_turn_and_keeps_the_tts(agent):
+    agent.tts = sentinel = object()
+    agent.warm_up(tokens=2)
+    assert agent.tts is sentinel

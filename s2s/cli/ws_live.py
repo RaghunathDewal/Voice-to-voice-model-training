@@ -373,6 +373,7 @@ def main() -> None:
         from s2s.runtime.agent import VoiceAgent
 
         agent = VoiceAgent(cfg, args.speech_llm_dir, args.talker_dir)
+        agent.warm_up()
     make_backend = None
     if args.mock_results:
         from s2s.runtime.lfm_agent import CannedBackend

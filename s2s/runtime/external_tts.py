@@ -20,7 +20,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 import numpy as np
 
 STRONG = ".!?"
-WEAK = ",;:—"
+WEAK = ",;:—-"
 _MARKUP = re.compile(r"[*_#`~|<>\[\]{}]")
 # a "." after these is not the end of a sentence
 ABBREV = {"st", "dr", "mr", "mrs", "ms", "no", "ave", "rd", "blvd", "apt", "ste", "jr", "sr", "vs", "etc", "approx",
@@ -72,8 +72,8 @@ class PhraseStream:
             if last in ABBREV or (len(last) == 1 and last.isalpha()):
                 end = ""  # "St." / "Dr." / an initial: not a pause
         strong, weak = bool(end) and end in STRONG, bool(end) and end in WEAK  # ("" in "abc" is True)
-        if self.sent == 0:  # the first phrase: short, at the first pause, so speech starts early
-            return (n >= 2 and strong) or (n >= self.tts.first_words and weak) or n >= 12
+        if self.sent == 0:  # the first phrase: short, at the first pause (even one word: "Absolutely!"), so speech starts early
+            return strong or (n >= self.tts.first_words and weak) or n >= 12
         return (n >= self.tts.min_words and strong) or (n >= 2 * self.tts.min_words and weak) or n >= self.tts.max_words
 
     def _submit(self) -> None:

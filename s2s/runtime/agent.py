@@ -20,6 +20,7 @@ prefilled once and reused for every turn), talker cache, Mimi decoder window.
 from __future__ import annotations
 
 import os
+import time
 from typing import Iterator
 
 import numpy as np
@@ -132,6 +133,24 @@ class VoiceAgent:
         """End-of-turn probability at the last frame of a (partial) 24 kHz utterance."""
         out = self.adapter(self.encode_input([wav])[0][None].to(self.device))
         return float(torch.sigmoid(out["eot_logits"][0, -1]))
+
+    def warm_up(self, tokens: int = 4) -> None:
+        """One throwaway spoken turn at startup (listener, adapter, end-of-turn head, prefill, a few reply tokens),
+        so the first real turn does not pay the GPU's first-use cost (kernel selection / allocation, ~1-1.5 s
+        on a T4)."""
+        t0 = time.time()
+        wav = (np.random.default_rng(0).standard_normal(self.codec.sample_rate * 2) * 0.01).astype(np.float32)
+        self.eot_probability(wav)
+        tts, self.tts = self.tts, None  # the TTS server warms itself
+        try:
+            n = 0
+            for ev in self.new_session().respond(wav):
+                n += ev.get("type") == "token"
+                if n >= tokens:
+                    break
+        finally:
+            self.tts = tts
+        print(f"[agent] warm-up turn {time.time() - t0:.1f}s", flush=True)
 
     def new_session(self, system_prompt: str | None = None, context: str | None = None,
                     tools: list | None = None, backend=None) -> "VoiceSession":
