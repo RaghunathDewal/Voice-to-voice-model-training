@@ -11,6 +11,7 @@
 #   Cell 3:  !cd /tmp/repo && bash scripts/kaggle_4b_demo.sh
 # Options (put before `bash`):
 #   MODEL=v3               the latest adapter v3 checkpoint (Nemotron listener -> adapter v3 + speech LoRA -> 4B), Kokoro voice
+#   MODEL=v3h              the hybrid v3 (speech + the listener's transcript), once PART=hybrid has trained it
 #   MODEL=0.6b             the earlier compact system instead: Parakeet -> speech_llm_pk4 -> fine-tuned Qwen3-0.6B
 #                          (thinker_merged_v3) -> talker_v3 -> Mimi (faster, less expressive)
 #   TALKER=best            the talker checkpoint with the lowest eval loss (step 1000) instead of the final one
@@ -32,7 +33,9 @@ set -euo pipefail
 HF_USER=${HF_USER:-ThunderBlade7773}
 export CKPT_REPO=$HF_USER/s2s-checkpoints
 MODEL=${MODEL:-4b}
-if [ "$MODEL" = v3 ]; then  # the latest adapter v3 upload (Nemotron listener, speech LoRA); Kokoro voice by default
+if [ "$MODEL" = v3h ]; then  # hybrid: speech vectors + the listener's own transcript (PART=hybrid of kaggle_v3.sh)
+    ADAPTER=${ADAPTER:-speech_llm_v3h}; TALKER_DIR=talker_4b; THINKER=""; CFG=configs/qwen4b_v3h.yaml; TTS=${TTS:-kokoro}
+elif [ "$MODEL" = v3 ]; then  # the latest adapter v3 upload (Nemotron listener, speech LoRA); Kokoro voice by default
     ADAPTER=${ADAPTER:-speech_llm_v3}; TALKER_DIR=talker_4b; THINKER=""; CFG=configs/qwen4b_v3.yaml; TTS=${TTS:-kokoro}
 elif [ "$MODEL" = 0.6b ]; then
     ADAPTER=${ADAPTER:-speech_llm_pk4}; TALKER_DIR=talker_v3; THINKER=thinker_merged_v3; CFG=configs/small.yaml
@@ -56,7 +59,7 @@ say ">>> setup"
 pip install -q --no-deps -e .
 pip install -q peft accelerate soundfile librosa huggingface_hub fastapi uvicorn websockets silero-vad
 python -c "from transformers import ParakeetForCTC" 2>/dev/null || pip install -q -U "transformers>=4.57"
-if [ "$MODEL" = v3 ]; then  # the Nemotron listener needs a newer transformers
+if [ "$MODEL" = v3 ] || [ "$MODEL" = v3h ]; then  # the Nemotron listener needs a newer transformers
     python -c "from transformers import AutoModelForRNNT" 2>/dev/null || pip install -q -U "transformers>=5.13"
 fi
 NGPU=$(python -c "import torch; print(torch.cuda.device_count())")
