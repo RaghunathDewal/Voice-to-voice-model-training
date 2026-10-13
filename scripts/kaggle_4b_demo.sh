@@ -76,6 +76,9 @@ SETS=()   # one --set with every override (a second --set would replace the firs
 for kv in ${EXTRA_SETS:-}; do SETS+=("$kv"); done
 TTS=${TTS:-talker}
 TTS_DEV=$([ "$NGPU" -gt 1 ] && echo cuda:1 || echo cuda:0)
+if [ "$TTS" = kokoro ] || [ "$TTS" = qwen ]; then  # a server left from an earlier (stopped) run holds the port
+    pkill -f "s2s/cli/(kokoro|qwen)_tts_server.py" 2>/dev/null && sleep 3 || true
+fi
 if [ "$TTS" = kokoro ]; then
     say ">>> Kokoro-82M TTS in its own environment"
     apt-get -qq install -y espeak-ng > /dev/null 2>&1 || true
@@ -106,7 +109,7 @@ if [ "$TTS" = kokoro ] || [ "$TTS" = qwen ]; then
         sleep 5
     done
     curl -sf http://127.0.0.1:$TTS_PORT/health || { tail -30 "$WORK/tts.log"; say "the TTS server did not start"; exit 1; }
-    echo; grep "\[tts\]" "$WORK/tts.log" | tail -3
+    echo; grep "\[tts\]" "$WORK/tts.log" | tail -3 || true
     SETS+=(runtime.tts_url=http://127.0.0.1:$TTS_PORT/tts)
 fi
 EXTRA=()
