@@ -9,8 +9,8 @@
 #                        -> checkpoints/speech_llm_v3a
 #   PART=polish  (~8 h)  stage B: KD to the 4B reading the text + answers / repeat / unclear / multi-turn / tools
 #                        -> checkpoints/speech_llm_v3, then the public speech-vs-text test (same as the baseline)
-#   PART=data V4=1 (~6-8 h) v4 data: ~310 h more accented / spontaneous English (Common Voice accents, VoxPopuli,
-#                        Emilia-YODAS talk shows, YODAS-Granary YouTube), features + the 4B's answers -> HF
+#   PART=data V4=1 (~2-3 h) v4 data: ~105 h of what Gate 1 lacked: accents (Common Voice, more per accent) and
+#                        spontaneous conversation (Emilia-YODAS talk shows), features + the 4B's answers -> HF
 #   PART=v4      (~11 h) from the final v3: align on the bigger mix (speech_llm_v4a, ALIGN_MIN), then polish
 #                        (speech_llm_v4, with v3's speech LoRA), then the Gate 1 test (results logs/v4_gate1)
 #   PART=hybrid  (~10 h) hybrid input: the listener's own transcript is added after the speech (Gate 1 was amber:
@@ -141,13 +141,12 @@ if [ "$PART" = data ]; then
         "slurp_train|slurp|train|--max-utts $(n 15000)|$(n 8000)"
         "slurp_dev|slurp|devel|--max-utts $(n 400)|0"
     )
-    V4_SETS="cv_accents vox_en emilia_en yodas_en"
-    if [ "${V4:-0}" = 1 ]; then  # v4: accented / spontaneous English, all allowing commercial use
+    V4_SETS="cv_accents emilia_en"
+    if [ "${V4:-0}" = 1 ]; then  # v4: only the two gaps Gate 1 showed (accents, spontaneous talk), ~2-3 h session
+        # (voxpopuli_en / yodas_en presets exist too: slower to fetch, less on target; add them here if wanted)
         SETS+=(
-            "cv_accents|commonvoice|train|--max-hours $(n 100) --max-per-accent 2 --seed 7 --min-words 3|$(n 8000)"
-            "vox_en|voxpopuli_en|train|--max-hours $(n 60) --max-per-accent 0.5 --min-words 4|$(n 4000)"
-            "emilia_en|emilia_en|train|--max-hours $(n 100) --max-per-accent 1 --min-words 4|$(n 8000)"
-            "yodas_en|yodas_en|train|--max-hours $(n 50) --max-per-accent 0.3 --min-words 4|$(n 4000)"
+            "cv_accents|commonvoice|train|--max-hours $(n 45) --max-per-accent 1 --seed 7 --min-words 3|$(n 5000)"
+            "emilia_en|emilia_en|train|--max-hours $(n 60) --max-per-accent 0.6 --min-words 4|$(n 5000)"
         )
     fi
     step restore hf v3manifests   # a rerun skips everything an earlier data session already uploaded
@@ -280,10 +279,10 @@ if [ "$PART" = polish ] || [ "$PART" = hybrid ] || [ "$PART" = v4 ]; then
         [ -f $M/emilia_en_nm.jsonl ] || { say "no v4 data on Hugging Face: run PART=data V4=1 first"; exit 1; }
         nmf() { echo "$M/${1}_nm.jsonl"; }  # align needs only the text: every row (not only the answered ones)
         if [ "$TEST_ONLY" != 1 ] && [ ! -f checkpoints/speech_llm_v4a/DONE ]; then
-            ATRAIN="[$(mix "$(nmf cv_train)" 0.05)$(mix "$(nmf cv_india)" 0.05)$(mix "$(nmf cv_accents)" 0.14)\
-$(mix "$(nmf vox_en)" 0.09)$(mix "$(nmf emilia_en)" 0.15)$(mix "$(nmf yodas_en)" 0.08)$(mix "$(nmf peoples_train)" 0.05)\
+            ATRAIN="[$(mix "$(nmf cv_train)" 0.05)$(mix "$(nmf cv_india)" 0.05)$(mix "$(nmf cv_accents)" 0.20)\
+$(mix "$(nmf emilia_en)" 0.24)$(mix "$(nmf peoples_train)" 0.05)\
 $(mix "$(nmf peoples_dirty)" 0.03)$(mix "$(nmf ami_ihm)" 0.03)$(mix "$(nmf ami_sdm)" 0.03)$(mix "$(nmf mls_train)" 0.04)\
-$(mix "$(nmf spokenwoz_train)" 0.10)$(mix "$(nmf slurp_train)" 0.08)$(mix "$(nmf hotel5_train)" 0.06)$(mix $M/unclear_nm.jsonl 0.02)]"
+$(mix "$(nmf spokenwoz_train)" 0.12)$(mix "$(nmf slurp_train)" 0.08)$(mix "$(nmf hotel5_train)" 0.06)$(mix $M/unclear_nm.jsonl 0.02)]"
             ATRAIN=${ATRAIN/%, ]/]}
             ( while sleep 1200; do [ -f checkpoints/speech_llm_v4a/adapter.pt ] && hf push checkpoints/speech_llm_v4a checkpoints/speech_llm_v4a; done ) \
                 > "$OUT/logs/sync_align.log" 2>&1 &
@@ -346,9 +345,9 @@ $(mix "$(nmf spokenwoz_train)" 0.10)$(mix "$(nmf slurp_train)" 0.08)$(mix "$(nmf
         UNCLEAR=$M/unclear_nm.jsonl
     fi
     if [ "$PART" = v4 ]; then
-        TRAIN="[$(mix "$(q4 hotel5_train)" 0.20)$(mix "$(q4 spokenwoz_train)" 0.12)$(mix "$(q4 slurp_train)" 0.10)\
-$(mix "$(q4 cv_train)" 0.04)$(mix "$(q4 cv_india)" 0.04)$(mix "$(q4 cv_accents)" 0.10)$(mix "$(q4 vox_en)" 0.07)\
-$(mix "$(q4 emilia_en)" 0.12)$(mix "$(q4 yodas_en)" 0.06)$(mix "$(q4 peoples_train)" 0.04)$(mix "$(q4 peoples_dirty)" 0.02)\
+        TRAIN="[$(mix "$(q4 hotel5_train)" 0.20)$(mix "$(q4 spokenwoz_train)" 0.14)$(mix "$(q4 slurp_train)" 0.10)\
+$(mix "$(q4 cv_train)" 0.04)$(mix "$(q4 cv_india)" 0.04)$(mix "$(q4 cv_accents)" 0.14)\
+$(mix "$(q4 emilia_en)" 0.19)$(mix "$(q4 peoples_train)" 0.04)$(mix "$(q4 peoples_dirty)" 0.02)\
 $(mix "$(q4 ami_ihm)" 0.02)$(mix "$(q4 ami_sdm)" 0.02)$(mix "$(q4 mls_train)" 0.02)$(mix $UNCLEAR 0.03)]"
     else
     TRAIN="[$(mix "$(q4 hotel5_train)" 0.24)$(mix "$(q4 spokenwoz_train)" 0.16)$(mix "$(q4 slurp_train)" 0.12)\
