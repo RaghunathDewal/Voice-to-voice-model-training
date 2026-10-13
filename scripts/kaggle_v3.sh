@@ -38,8 +38,9 @@ M=data/manifests
 : "${HF_TOKEN:?HF_TOKEN is not set (Kaggle: Add-ons > Secrets)}"
 export HF_TOKEN CKPT_REPO DATA_REPO WORK PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=false TQDM_MININTERVAL=60
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-NGPU=$(nvidia-smi -L 2>/dev/null | wc -l)
-[ "$NGPU" -ge 1 ] || NGPU=1
+NGPU=$( { timeout 20 nvidia-smi -L 2>/dev/null || true; } | grep -c "^GPU" || true)  # NVIDIA
+[ "${NGPU:-0}" -ge 1 ] || NGPU=$(timeout 120 python -c "import torch; print(torch.cuda.device_count())" 2>/dev/null || true)  # AMD
+[ "${NGPU:-0}" -ge 1 ] 2>/dev/null || NGPU=1
 mkdir -p "$WORK"/{data,checkpoints,tmp} "$OUT/logs"
 cd "$REPO_DIR"
 ln -sfn "$WORK/data" data
