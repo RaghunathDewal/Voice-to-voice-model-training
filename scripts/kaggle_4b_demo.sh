@@ -16,9 +16,13 @@
 #   PROMPT=/path/file.txt  your own system prompt (property facts, booking); default: the built-in hotel demo
 #   TOOLS=order_product,create_issue   only these tools (default: all built-in hotel tools); TOOLS=none: no tools
 #   EXTRA_SETS="runtime.emit_every_frames=1"   more config overrides (space-separated key=value)
+#   TTS=kokoro             speak with Kokoro-82M (own Python environment, on GPU 1) instead of our talker:
+#                          fast on a T4 and cannot babble; TTS_VOICE=af_heart|af_bella|am_michael|bf_emma|...
+#                          TTS_SPEED=1.0
 #   TTS=qwen               speak with Qwen3-TTS (0.6B CustomVoice, its own Python environment, on GPU 1)
 #                          instead of our talker; TTS_SPEAKER=Ryan|Aiden|Vivian|Serena|... TTS_LANGUAGE=English
 #                          TTS_MODEL=Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice (bigger, slower)
+#                          Qwen3-TTS is slow on a T4: use it on L4 / L40S / A100-class GPUs
 # Applications (e.g. a Gemini-Live-style bridge server) connect to wss://<link>/live: s2s/cli/live_api.py.
 set -euo pipefail
 
@@ -70,25 +74,40 @@ SETS=()   # one --set with every override (a second --set would replace the firs
 [ "$NGPU" -gt 1 ] && SETS+=(runtime.encoder_device=cuda:1)
 [ -n "$THINKER" ] && SETS+=("thinker.model=checkpoints/$THINKER")
 for kv in ${EXTRA_SETS:-}; do SETS+=("$kv"); done
-if [ "${TTS:-talker}" = qwen ]; then
+TTS=${TTS:-talker}
+TTS_DEV=$([ "$NGPU" -gt 1 ] && echo cuda:1 || echo cuda:0)
+if [ "$TTS" = kokoro ]; then
+    say ">>> Kokoro-82M TTS in its own environment"
+    apt-get -qq install -y espeak-ng > /dev/null 2>&1 || true
+    pip install -q uv
+    [ -x /tmp/ktts/bin/python ] || uv venv -q -p 3.12 --seed /tmp/ktts
+    /tmp/ktts/bin/python -c "import kokoro" 2>/dev/null || {
+        uv pip install -p /tmp/ktts/bin/python -q torch --index-url https://download.pytorch.org/whl/cu126
+        uv pip install -p /tmp/ktts/bin/python -q "kokoro>=0.9.4" "misaki[en]" soundfile numpy; }
+    TTS_PORT=7791 TTS_SERVER=kokoro_tts_server.py
+    nohup /tmp/ktts/bin/python s2s/cli/kokoro_tts_server.py --device "$TTS_DEV" --port $TTS_PORT \
+        --voice "${TTS_VOICE:-af_heart}" --speed "${TTS_SPEED:-1.0}" > "$WORK/tts.log" 2>&1 &
+elif [ "$TTS" = qwen ]; then
     say ">>> Qwen3-TTS in its own environment (qwen-tts pins its own transformers)"
     apt-get -qq install -y sox > /dev/null 2>&1 || true
     pip install -q uv
     [ -x /tmp/qtts/bin/python ] || uv venv -q -p 3.12 --seed /tmp/qtts
     /tmp/qtts/bin/python -c "import qwen_tts" 2>/dev/null || uv pip install -p /tmp/qtts/bin/python -q qwen-tts
-    TTS_DEV=$([ "$NGPU" -gt 1 ] && echo cuda:1 || echo cuda:0)
-    nohup /tmp/qtts/bin/python s2s/cli/qwen_tts_server.py --device "$TTS_DEV" --port 7790 \
+    TTS_PORT=7790 TTS_SERVER=qwen_tts_server.py
+    nohup /tmp/qtts/bin/python s2s/cli/qwen_tts_server.py --device "$TTS_DEV" --port $TTS_PORT \
         --model "${TTS_MODEL:-Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice}" --speaker "${TTS_SPEAKER:-Ryan}" \
         --language "${TTS_LANGUAGE:-English}" > "$WORK/tts.log" 2>&1 &
-    say "    loading Qwen3-TTS on $TTS_DEV (log: $WORK/tts.log) ..."
+fi
+if [ "$TTS" = kokoro ] || [ "$TTS" = qwen ]; then
+    say "    loading the $TTS server on $TTS_DEV (log: $WORK/tts.log) ..."
     for i in $(seq 1 180); do
-        curl -sf http://127.0.0.1:7790/health > /dev/null 2>&1 && break
-        if ! pgrep -f qwen_tts_server.py > /dev/null; then tail -30 "$WORK/tts.log"; say "the TTS server stopped"; exit 1; fi
+        curl -sf http://127.0.0.1:$TTS_PORT/health > /dev/null 2>&1 && break
+        if ! pgrep -f "$TTS_SERVER" > /dev/null; then tail -30 "$WORK/tts.log"; say "the TTS server stopped"; exit 1; fi
         sleep 5
     done
-    curl -sf http://127.0.0.1:7790/health || { tail -30 "$WORK/tts.log"; say "the TTS server did not start"; exit 1; }
+    curl -sf http://127.0.0.1:$TTS_PORT/health || { tail -30 "$WORK/tts.log"; say "the TTS server did not start"; exit 1; }
     echo; grep "\[tts\]" "$WORK/tts.log" | tail -3
-    SETS+=(runtime.tts_url=http://127.0.0.1:7790/tts)
+    SETS+=(runtime.tts_url=http://127.0.0.1:$TTS_PORT/tts)
 fi
 EXTRA=()
 [ ${#SETS[@]} -gt 0 ] && EXTRA+=(--set "${SETS[@]}")

@@ -8,6 +8,10 @@ POST /tts {"text": "...", "speaker"?: "...", "language"?: "...", "instruct"?: ".
     -> raw int16 mono PCM, sample rate in the X-Sample-Rate header
 GET  /health -> {"ok": true, "model": ..., "speaker": ..., "sample_rate": ..., "dtype": ...}
 
+Guards: generation is capped at ~2.5x the text's expected spoken length, and a phrase that still comes out far
+too long (a runaway) is regenerated once, then cut. On a T4 this model is slow (no bf16 / flash-attention):
+use it on L4 / L40S / A100-class GPUs; on a T4 use kokoro_tts_server.py.
+
 dtype auto: bf16 where the GPU supports it, else fp16; if fp16 produces non-finite or silent audio on the
 warm-up sentence (possible on a T4), the model is reloaded in fp32.
 """
@@ -15,31 +19,14 @@ warm-up sentence (possible on a T4), the model is reloaded in fp32.
 from __future__ import annotations
 
 import argparse
-import json
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import numpy as np
 import torch
+from tts_http import expected_seconds, fade_out, serve, trim_silence
 
-
-def trim_silence(wav: np.ndarray, sr: int, head_s: float = 0.08, tail_s: float = 0.15) -> np.ndarray:
-    """Cut the model's leading / trailing silence (it pads each phrase by ~0.5-1.3 s), keeping a short natural
-    pause, so phrases spoken back to back do not leave long gaps."""
-    if len(wav) == 0:
-        return wav
-    hop = max(1, sr // 100)  # 10 ms frames
-    n = len(wav) // hop
-    if n == 0:
-        return wav
-    rms = np.sqrt(np.mean(wav[: n * hop].reshape(n, hop) ** 2, axis=1))
-    voiced = np.nonzero(rms > max(1e-3, 0.03 * float(rms.max())))[0]
-    if len(voiced) == 0:
-        return wav
-    start = max(0, voiced[0] * hop - int(head_s * sr))
-    end = min(len(wav), (voiced[-1] + 1) * hop + int(tail_s * sr))
-    return wav[start:end]
+CODEC_HZ = 12.5  # Qwen3-TTS-12Hz: speech tokens per second of audio
 
 
 def load(model_id: str, device: str, dtype: torch.dtype):
@@ -67,14 +54,31 @@ def main() -> None:
     lock = threading.Lock()
     state = {}
 
-    def synth(text: str, speaker: str | None = None, language: str | None = None, instruct: str | None = None):
-        kw = dict(text=text, language=language or args.language, speaker=speaker or args.speaker)
-        if instruct or args.instruct:
-            kw["instruct"] = instruct or args.instruct
-        with lock, torch.inference_mode():
-            wavs, sr = state["model"].generate_custom_voice(**kw)
-        wav = np.asarray(wavs[0], dtype=np.float32).reshape(-1)
-        return (wav if args.keep_silence else trim_silence(wav, int(sr))), int(sr)
+    def generate(kw: dict, max_new: int):
+        try:
+            return state["model"].generate_custom_voice(**kw, max_new_tokens=max_new)
+        except TypeError:  # an older qwen-tts without generate kwargs: no cap (the length check below still applies)
+            return state["model"].generate_custom_voice(**kw)
+
+    def synth(text: str, req: dict | None = None):
+        """An autoregressive TTS can run on past the text (babble / "crying"): the generation is capped at
+        ~2.5x the expected length, and audio far longer than the text needs is regenerated once, then cut."""
+        req = req or {}
+        kw = dict(text=text, language=req.get("language") or args.language, speaker=req.get("speaker") or args.speaker)
+        if req.get("instruct") or args.instruct:
+            kw["instruct"] = req.get("instruct") or args.instruct
+        limit = 2.5 * expected_seconds(text) + 1.0
+        for attempt in range(2):
+            with lock, torch.inference_mode():
+                wavs, sr = generate(kw, int(CODEC_HZ * limit) + 4)
+            wav = np.asarray(wavs[0], dtype=np.float32).reshape(-1)
+            sr = int(sr)
+            wav = wav if args.keep_silence else trim_silence(wav, sr)
+            if len(wav) <= limit * sr:
+                return wav, sr
+            print(f"[tts] runaway: {len(wav) / sr:.1f}s for {text[:50]!r} (limit {limit:.1f}s)"
+                  + (", regenerating" if attempt == 0 else ", cut"), flush=True)
+        return fade_out(wav[: int(limit * sr)], sr), sr
 
     def warm(dt) -> bool:
         state["model"], state["dtype"] = load(args.model, args.device, dt), str(dt).replace("torch.", "")
@@ -93,48 +97,8 @@ def main() -> None:
         if not warm(torch.float32):
             raise SystemExit("[tts] the model produces no usable audio")
 
-    class Handler(BaseHTTPRequestHandler):
-        def log_message(self, *a):  # quiet
-            pass
-
-        def _send(self, code: int, body: bytes, ctype: str, extra: dict | None = None):
-            self.send_response(code)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(len(body)))
-            for k, v in (extra or {}).items():
-                self.send_header(k, str(v))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def do_GET(self):
-            if self.path.startswith("/health"):
-                info = {"ok": True, "model": args.model, "speaker": args.speaker, "sample_rate": state["sr"],
-                        "dtype": state["dtype"]}
-                self._send(200, json.dumps(info).encode(), "application/json")
-            else:
-                self._send(404, b"not found", "text/plain")
-
-        def do_POST(self):
-            if not self.path.startswith("/tts"):
-                self._send(404, b"not found", "text/plain")
-                return
-            try:
-                req = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
-                text = str(req.get("text", "")).strip()
-                if not text:
-                    self._send(400, b"empty text", "text/plain")
-                    return
-                t0 = time.time()
-                wav, sr = synth(text, req.get("speaker"), req.get("language"), req.get("instruct"))
-                pcm = (np.clip(wav, -1, 1) * 32767).astype("<i2").tobytes()
-                took = time.time() - t0
-                print(f"[tts] {took * 1000:.0f} ms for {len(wav) / sr:.2f}s: {text[:70]!r}", flush=True)
-                self._send(200, pcm, "application/octet-stream", {"X-Sample-Rate": sr, "X-Synth-Ms": round(took * 1000)})
-            except Exception as e:  # noqa: BLE001 - report, keep serving
-                self._send(500, repr(e).encode(), "text/plain")
-
-    print(f"[tts] serving on http://{args.host}:{args.port}/tts", flush=True)
-    ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()
+    serve(synth, lambda: {"model": args.model, "speaker": args.speaker, "sample_rate": state["sr"], "dtype": state["dtype"]},
+          args.host, args.port)
 
 
 if __name__ == "__main__":
