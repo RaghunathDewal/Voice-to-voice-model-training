@@ -47,7 +47,8 @@ def sample(logits: torch.Tensor, temperature: float, top_k: int, gen: torch.Gene
 
 class DuplexSession:
     def __init__(self, model: DuplexModel, tokenizer, system: str, tools: list | None, backend=None,
-                 audio_temperature: float = 0.6, audio_top_k: int = 30, seed: int = 0, max_tool_tokens: int = 160):
+                 audio_temperature: float = 0.6, audio_top_k: int = 30, seed: int = 0, max_tool_tokens: int = 160,
+                 graphs: bool = False, graph_max_tokens: int = 4096):
         self.m, self.tok, self.backend = model, tokenizer, backend
         self.device = model.in_scale.device
         self.backbone, self.lm_head, _ = unwrap_llm(model.llm)
@@ -65,13 +66,48 @@ class DuplexSession:
         self.tool_log: list[dict] = []
         self.t = 0
         self.timing = {"llm": 0.0, "depth": 0.0, "frames": 0}
+        self.g = None
+        self.g = self._graph(graph_max_tokens) if graphs else None
+        if self.g is not None:
+            self.g.reset()
         self._run(self._embed(prefix_ids(tokenizer, system, tools)))
+
+    def _graph(self, max_tokens: int):
+        """The frame CUDA graph (runtime/duplex_graph.py), recorded once per model and reused by later sessions
+        (one call at a time). None when it cannot be used."""
+        from s2s.runtime.duplex_graph import DuplexGraph
+
+        key = (max_tokens, self.temp, self.top_k)
+        g = getattr(self.m, "_duplex_graph", None)
+        if g is not None and g[0] == key:
+            return g[1]
+        g = DuplexGraph(self.m, max_tokens, self.temp, self.top_k)
+        prefix = self._embed(prefix_ids(self.tok, "You are a hotel concierge.", None))
+
+        def reference(vec, prev_text, prev_col):  # the normal path (dynamic cache, KV-cached depth), greedy
+            self.cache = None
+            self._run(prefix)
+            x = self.m.frame_inputs(vec[None].float(), torch.tensor([prev_text], device=self.device), prev_col[None])
+            h = self._run(x.float())
+            text_id = int(self.m.text_logits(h[None])[0].argmax())
+            temp, self.temp = self.temp, 0.0
+            try:
+                col = self._depth_sample(h, text_id)
+            finally:
+                self.temp, self.cache = temp, None
+            return text_id, col, h
+
+        ok = g.capture(prefix, reference)
+        self.m._duplex_graph = (key, g if ok else None)
+        return g if ok else None
 
     @torch.no_grad()
     def _run(self, x: torch.Tensor) -> torch.Tensor:
         """Feed positions x [N, H]; returns the last hidden state [H] (in the LLM's dtype)."""
         from transformers import DynamicCache
 
+        if self.g is not None:
+            return self.g.run(x)
         if self.cache is None:
             self.cache = DynamicCache()
         out = self.backbone(inputs_embeds=x[None].to(self.llm_dtype), past_key_values=self.cache, use_cache=True)
@@ -99,6 +135,13 @@ class DuplexSession:
     def step(self, guest_vec: torch.Tensor) -> dict:
         """One 80 ms frame. Returns {"text": id, "frame": [K] codes of a finished frame or None, "tool": ...}."""
         m = self.m
+        if self.g is not None:
+            t0 = time.perf_counter()
+            text_t, col, _ = self.g.frame(guest_vec, self.prev_text, self.prev_col, self.gen)
+            text_id = int(text_t)  # the one CPU sync per frame
+            self.timing["llm"] += time.perf_counter() - t0
+            self.timing["frames"] += 1
+            return self._after(text_id, col)
         x = m.frame_inputs(guest_vec[None].to(self.device).float(), torch.tensor([self.prev_text], device=self.device),
                            self.prev_col[None]).float()
         t0 = time.perf_counter()
@@ -109,6 +152,10 @@ class DuplexSession:
         self.timing["llm"] += t1 - t0
         self.timing["depth"] += time.perf_counter() - t1
         self.timing["frames"] += 1
+        return self._after(text_id, col)
+
+    def _after(self, text_id: int, col: torch.Tensor) -> dict:
+        m = self.m
         if self.t < m.delay:
             col[1:] = -1
         self.grid.append(col)

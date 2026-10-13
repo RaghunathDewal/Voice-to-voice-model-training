@@ -669,3 +669,38 @@ def test_hybrid_input_puts_the_listener_transcript_after_the_speech(agent, monke
     res = _json.loads((tmp_path / "out" / "h.json").read_text())
     assert res["summary"]["hybrid"] and res["summary"]["listener_wer"] == 0.0
     assert res["rows"][0]["listener_text"] == "what time is checkout"
+
+
+def test_duplex_graph_frame_matches_normal_path(tiny_models, cpu):
+    """The CUDA-graph frame (static cache, depth without a KV cache, Gumbel sampling) gives the same greedy text
+    token and codes as the normal session step (here run eagerly: no GPU to record on)."""
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    from s2s.data.duplex import PAD_TOKEN, prefix_ids
+    from s2s.models.duplex import DuplexModel
+    from s2s.runtime.duplex import DuplexSession
+    from s2s.runtime.duplex_graph import DuplexGraph
+
+    torch.manual_seed(0)
+    tok = AutoTokenizer.from_pretrained(tiny_models["qwen"])
+    llm = AutoModelForCausalLM.from_pretrained(tiny_models["qwen"], dtype=torch.float32)
+    m = DuplexModel(llm, feat_dim=16, pad_id=tok.convert_tokens_to_ids(PAD_TOKEN), num_codebooks=4, card=64,
+                    depth_d_model=32, depth_layers=2, depth_heads=4).eval()
+    sess = DuplexSession(m, tok, "You are a concierge.", None, audio_temperature=0.0)
+    g = DuplexGraph(m, 256, temperature=0.0, top_k=0)
+    assert not g.capture(sess._embed([1, 2]), None)  # CPU: no graph, the frame runs eagerly
+    g.run(sess._embed(prefix_ids(tok, "You are a concierge.", None)))
+    feats = torch.randn(6, 16)
+    for t in range(6):
+        prev_text, prev_col = sess.prev_text, sess.prev_col.clone()
+        out = sess.step(feats[t])
+        text, col, _ = g.frame(feats[t], prev_text, prev_col, None, greedy=True)
+        assert int(text) == out["text"]
+        ref = sess.grid[-1].masked_fill(sess.grid[-1] < 0, -1)
+        assert torch.equal(col[ref >= 0], ref[ref >= 0])
+    # sampling: Gumbel noise over the top-k picks only top-k codes
+    gs = DuplexGraph(m, 256, temperature=0.8, top_k=5)
+    gs.run(sess._embed([1, 2, 3]))
+    gen = torch.Generator().manual_seed(1)
+    _, col, h = gs.frame(feats[0], m.pad_id, torch.full((4,), 64), gen)
+    assert col.min() >= 0 and col.max() < 64 and gs.noise.abs().sum() > 0

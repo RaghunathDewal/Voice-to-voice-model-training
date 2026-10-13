@@ -52,6 +52,9 @@ def main() -> None:
     p.add_argument("--port", type=int, default=7861)
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--tunnel", action="store_true")
+    p.add_argument("--graphs", type=int, default=1, help="1 = the whole 80 ms frame from one CUDA graph "
+                   "(falls back to the normal path if it cannot be recorded)")
+    p.add_argument("--graph-max-tokens", type=int, default=4096, help="prompt + frames per call (~4.5 min)")
     p.add_argument("--save-dir", default=None, help="write each call as a stereo wav (left = you, right = agent)")
     args = p.parse_args()
 
@@ -65,6 +68,9 @@ def main() -> None:
     encoder = build_encoder(args.encoder, resolve_device(enc_dev))
     pad_id = model.pad_id
     print(f"duplex model on {device}, listener on {enc_dev}", flush=True)
+    if args.graphs:  # record the frame graph now (the page's default sampling), not at the first call
+        DuplexSession(model, tok, "You are a hotel concierge.", None, None, 0.6, 30, graphs=True,
+                      graph_max_tokens=args.graph_max_tokens)
     page = open(os.path.join(STATIC, "duplex.html"), encoding="utf-8").read()
     gpu = threading.Lock()   # one call at a time on the GPU
     busy = {"on": False}
@@ -98,7 +104,8 @@ def main() -> None:
             ctx = _Ctx(random.Random(seed))
             tools = list(ctx.tools.values()) or None
             with gpu:
-                sess = DuplexSession(model, tok, ctx.system, tools, GenericBackend(tools), temp, top_k, seed=seed)
+                sess = DuplexSession(model, tok, ctx.system, tools, GenericBackend(tools), temp, top_k, seed=seed,
+                                     graphs=bool(args.graphs), graph_max_tokens=args.graph_max_tokens)
             dec = StreamingDecoder(codec)
             listener = StreamingListener(encoder)
             await sock.send_text(json.dumps({

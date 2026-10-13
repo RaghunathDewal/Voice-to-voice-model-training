@@ -8,6 +8,8 @@
 #   Cell 2:  import os; from kaggle_secrets import UserSecretsClient
 #            os.environ["HF_TOKEN"] = UserSecretsClient().get_secret("HF_TOKEN")
 #   Cell 3:  !cd /tmp/repo && bash scripts/kaggle_duplex_demo.sh
+# SPEED=1: only the speed test (normal path vs the whole frame from one CUDA graph, ~5 min), no demo.
+# GRAPHS=0: demo without the CUDA graph (default 1; it falls back by itself if it cannot be recorded).
 # Each call is saved as a stereo wav (left = you, right = agent) in $SAVE_DIR.
 # The page shows "compute / real time": it must stay below 1.0, otherwise the agent falls behind
 # (then use a faster GPU, e.g. RTX 4090 / L40S / MI300X; the same script runs there).
@@ -39,6 +41,11 @@ snapshot_download(os.environ["CKPT_REPO"], local_dir=".", allow_patterns=["check
 assert os.path.exists("checkpoints/duplex/duplex.pt"), "checkpoints/duplex not found on Hugging Face"
 EOF
 
+if [ "${SPEED:-0}" = 1 ]; then
+    say ">>> speed test: ms per 80 ms frame, normal path vs CUDA graph"
+    python -m s2s.eval.duplex_speed --ckpt checkpoints/duplex 2>&1 | grep -v -e "Warning" -e "warn("
+    exit 0
+fi
 say ">>> starting (first start downloads Qwen3-0.6B, Nemotron and Mimi; wait for the trycloudflare.com link)"
 say "    open the link in Chrome, put on headphones, press Start call and talk; the agent greets you first"
-python -m s2s.cli.duplex_live --ckpt checkpoints/duplex --tunnel --save-dir "$SAVE_DIR"
+python -m s2s.cli.duplex_live --ckpt checkpoints/duplex --tunnel --save-dir "$SAVE_DIR" --graphs "${GRAPHS:-1}"

@@ -116,6 +116,8 @@ def main() -> None:
     p.add_argument("--audio-temperature", type=float, default=0.6)
     p.add_argument("--audio-top-k", type=int, default=30)
     p.add_argument("--device", default="auto")
+    p.add_argument("--graphs", action="store_true", help="the 80 ms frame from one CUDA graph")
+    p.add_argument("--graph-max-tokens", type=int, default=4096)
     args = p.parse_args()
     device = resolve_device(args.device)
     os.makedirs(args.out, exist_ok=True)
@@ -141,7 +143,8 @@ def main() -> None:
         g24 = np.concatenate([g24, np.zeros(int(4 * SR), np.float32)])  # time to answer after you stop
         feats = enc.encode([resample(g24, SR, 16000)])[0]
         tools = list(ctx.tools.values()) or None
-        sess = DuplexSession(model, tok, ctx.system, tools, GenericBackend(tools), args.audio_temperature, args.audio_top_k)
+        sess = DuplexSession(model, tok, ctx.system, tools, GenericBackend(tools), args.audio_temperature, args.audio_top_k,
+                             graphs=args.graphs, graph_max_tokens=args.graph_max_tokens)
         out = run_offline(sess, feats, codec)
         agent = out["audio"]
         n = max(len(g24), len(agent))
@@ -162,7 +165,8 @@ def main() -> None:
             timeline = json.load(f)
         tools = r.get("tools")
         sess = DuplexSession(model, tok, r["system"], tools, GenericBackend(tools), args.audio_temperature,
-                             args.audio_top_k, seed=hash(r["id"]) % 10000)
+                             args.audio_top_k, seed=hash(r["id"]) % 10000,
+                             graphs=args.graphs, graph_max_tokens=args.graph_max_tokens)
         out = run_offline(sess, feats, codec)
         agent = out["audio"]
         rtfs.append(out["rtf"])
