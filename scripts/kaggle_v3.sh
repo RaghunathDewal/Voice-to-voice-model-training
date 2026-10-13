@@ -29,6 +29,8 @@ POLISH_BATCH=${POLISH_BATCH:-4}        # PART=polish: batch x accumulation = 32 
 POLISH_ACCUM=${POLISH_ACCUM:-8}
 TEST_MIN=${TEST_MIN:-110}              # PART=polish: minutes kept for the test after training
 TEST_PAR=${TEST_PAR:-1}                # PART=polish: test sets run at the same time on each GPU
+TEST_ONLY=${TEST_ONLY:-0}              # PART=polish: 1 = only the Gate 1 test, on the latest speech_llm_v3 on Hugging Face
+                                       # (no training, nothing uploaded but the results, under logs/v3_gate1_step<N>)
 POLISH_LORA=${POLISH_LORA:-0}          # PART=polish: 1 = also train a LoRA on the 4B so it learns to read the
                                        # adapter's vectors (the KD teacher stays the original 4B)
 LORA_LR=${LORA_LR:-1e-4}
@@ -260,7 +262,11 @@ if [ "$PART" = polish ]; then
 $(mix "$(q4 cv_train)" 0.14)$(mix "$(q4 cv_india)" 0.05)$(mix "$(q4 peoples_train)" 0.07)$(mix "$(q4 peoples_dirty)" 0.04)\
 $(mix "$(q4 ami_ihm)" 0.04)$(mix "$(q4 ami_sdm)" 0.04)$(mix "$(q4 mls_train)" 0.05)$(mix $M/unclear_nm.jsonl 0.05)]"
     TRAIN=${TRAIN/%, ]/]}
-    if [ ! -f checkpoints/speech_llm_v3/DONE ]; then
+    if [ "$TEST_ONLY" = 1 ]; then
+        [ -f checkpoints/speech_llm_v3/adapter.pt ] || { say "no speech_llm_v3 on Hugging Face to test"; exit 1; }
+        STEP=$(python -c "import json; print(json.load(open('checkpoints/speech_llm_v3/state.json')).get('step', 'x'))" 2>/dev/null || echo x)
+        say "TEST_ONLY=1: Gate 1 on speech_llm_v3 step $STEP (no training, the checkpoint is not uploaded)"
+    elif [ ! -f checkpoints/speech_llm_v3/DONE ]; then
         ( while sleep 1200; do [ -f checkpoints/speech_llm_v3/adapter.pt ] && hf push checkpoints/speech_llm_v3 checkpoints/speech_llm_v3; done ) \
             > "$OUT/logs/sync.log" 2>&1 &
         SYNC=$!
@@ -305,6 +311,6 @@ $(mix "$(q4 ami_ihm)" 0.04)$(mix "$(q4 ami_sdm)" 0.04)$(mix "$(q4 mls_train)" 0.
         grep -h "^\[" "$OUT"/logs/test_*.log || true
     }
     step public_test public_test
-    hf push "$OUT" "logs/v3_polish" || true
+    if [ "$TEST_ONLY" = 1 ]; then hf push "$OUT" "logs/v3_gate1_step$STEP" || true; else hf push "$OUT" "logs/v3_polish" || true; fi
     say "PART polish DONE: checkpoints/speech_llm_v3; results in $OUT"
 fi

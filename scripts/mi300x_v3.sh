@@ -23,13 +23,18 @@
 #             checkpoint to HF every 20 min (a new droplet continues from it)
 #   test      the Gate 1 speech-vs-text test on the same clips as the Nemotron baseline       ~40 min
 # Result: checkpoints/speech_llm_v3 and logs/v3_polish (summaries) on Hugging Face.
+#
+# GATE1=1: only the Gate 1 test, on the latest speech_llm_v3 on Hugging Face (e.g. while Kaggle still trains):
+#   GATE1=1 bash scripts/mi300x_v3.sh start      setup + download + test, ~45-60 min; results in logs/v3_gate1_step<N>
+#   nothing is trained and the checkpoint is never uploaded (the Kaggle run's checkpoint stays as it is)
 # Defaults: ~6.5 h with BRAIN=1, ~3.5 h with BRAIN=0 (polish only, base 4B).
 set -euo pipefail
 
 HF_USER=${HF_USER:-ThunderBlade7773}
 export CKPT_REPO=$HF_USER/s2s-checkpoints
-BRAIN=${BRAIN:-1}                        # 1: hotel-tune the 4B before polish (see above)
-MAX_HOURS=${MAX_HOURS:-$( [ "$BRAIN" = 1 ] && echo 8 || echo 5 )}  # with DO_TOKEN: the droplet is deleted after this
+GATE1=${GATE1:-0}                        # 1: only the Gate 1 test of the latest checkpoint (see above)
+BRAIN=${BRAIN:-$( [ "$GATE1" = 1 ] && echo 0 || echo 1 )}  # 1: hotel-tune the 4B before polish (see above)
+MAX_HOURS=${MAX_HOURS:-$( [ "$GATE1" = 1 ] && echo 2 || { [ "$BRAIN" = 1 ] && echo 8 || echo 5; } )}  # with DO_TOKEN: the droplet is deleted after this
 TRAIN_MIN=${TRAIN_MIN:-150}              # polish training minutes
 TEST_MIN=${TEST_MIN:-45}
 BRAIN_MIN=${BRAIN_MIN:-60}               # hotel LoRA: training stops after this (the last save is used)
@@ -48,7 +53,7 @@ case "${1:-}" in
         if [ -f "$WORK/run.pid" ] && kill -0 "$(cat "$WORK/run.pid")" 2>/dev/null; then
             echo "already running (pid $(cat "$WORK/run.pid")): bash $0 log"; exit 0
         fi
-        HF_TOKEN="$HF_TOKEN" DO_TOKEN="${DO_TOKEN:-}" setsid nohup bash "$0" run >> "$LOG" 2>&1 < /dev/null &
+        HF_TOKEN="$HF_TOKEN" DO_TOKEN="${DO_TOKEN:-}" GATE1="$GATE1" BRAIN="$BRAIN" setsid nohup bash "$0" run >> "$LOG" 2>&1 < /dev/null &
         echo $! > "$WORK/run.pid"
         echo "started in the background (pid $!). Log: $LOG"
         echo "Ctrl-C below only stops VIEWING the log; the run keeps going. Later: bash $0 log"
@@ -101,11 +106,11 @@ cleanup() {
     local code=$?
     kill "${TIMER_PID:-0}" 2>/dev/null || true
     if [ $code -eq 0 ]; then say "===== ALL DONE"; else say "===== FAILED (exit $code): see the lines above"; fi
-    [ -x "$VENV/bin/python" ] && "$VENV/bin/python" - "$LOG" <<'EOF' || true
+    [ -x "$VENV/bin/python" ] && "$VENV/bin/python" - "$LOG" "$( [ "$GATE1" = 1 ] && echo v3_gate1 || echo v3_polish )" <<'EOF' || true
 import os, sys
 from huggingface_hub import HfApi
-HfApi().upload_file(path_or_fileobj=sys.argv[1], path_in_repo="logs/v3_polish/mi300x_run.log",
-                    repo_id=os.environ["CKPT_REPO"], commit_message="mi300x v3 polish: run log")
+HfApi().upload_file(path_or_fileobj=sys.argv[1], path_in_repo=f"logs/{sys.argv[2]}/mi300x_run.log",
+                    repo_id=os.environ["CKPT_REPO"], commit_message=f"mi300x {sys.argv[2]}: run log")
 EOF
     destroy
 }
@@ -148,6 +153,12 @@ EOF
 
 POLISH_CFG="--config configs/qwen4b_v3.yaml"
 ANS=q4
+if [ "$GATE1" = 1 ]; then
+    say ">>> Gate 1 only: the latest speech_llm_v3 on Hugging Face (no training, no checkpoint upload)"
+    PART=polish TEST_ONLY=1 WORK="$WORK" OUT="$WORK/out_gate1" BUDGET_MIN=$(( 25 + TEST_MIN )) TEST_MIN="$TEST_MIN" \
+        TEST_PAR=3 CFG="$POLISH_CFG" ANS="$ANS" bash scripts/kaggle_v3.sh
+    exit 0
+fi
 if [ "$BRAIN" = 1 ]; then
     CFG="--config configs/qwen4b_v3.yaml"
     BASE=Qwen/Qwen3-4B-Instruct-2507
