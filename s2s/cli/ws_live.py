@@ -250,6 +250,8 @@ def build_app(agent: VoiceAgent | None, system_prompt: str | None = None, tools:
                     wav_out = ev["audio"] if rate == out_sr else resample(ev["audio"], rate, out_sr)
                     await ws.send_bytes(pcm16(wav_out))
                     play_end = max(play_end, loop.time() + 0.15) + len(wav_out) / out_sr  # + client jitter buffer
+                elif t == "user_transcript" and ev.get("ignored"):
+                    await say("(noise, no words heard: no reply)")
                 elif t == "user_transcript":
                     info["ctc"] = ev["text"]
                     await say(f"USER (ctc): {ev['text']}")

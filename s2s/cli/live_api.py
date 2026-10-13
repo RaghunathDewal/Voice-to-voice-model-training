@@ -165,6 +165,8 @@ def add_live_api(app: FastAPI, agent, gpu_lock: threading.Lock, token: str | Non
                         wav = ev["audio"] if rate == out_sr else resample(ev["audio"], rate, out_sr)
                         await send((np.clip(wav, -1, 1) * 32767).astype("<i2").tobytes())
                         play_end = max(play_end, loop.time() + 0.15) + len(wav) / out_sr
+                    elif t == "user_transcript" and ev.get("ignored"):
+                        print("[live] noise, no words heard: no reply", flush=True)
                     elif t == "user_transcript" and kind == "audio":
                         text = ev.get("asr") or ev["text"]
                         await send({"type": "input_transcription", "text": text,

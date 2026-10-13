@@ -45,6 +45,12 @@ class StaticThinker:
         self.cache.reset()
         self.n, self.owner = 0, owner
 
+    def crop(self, owner, n: int) -> None:
+        """Forget positions from n on (later steps overwrite them; the causal mask never looks past the current
+        position, so what is left there is never read)."""
+        self._check(owner, 0)
+        self.n = min(self.n, int(n))
+
     def _check(self, owner, n: int) -> None:
         if owner is not self.owner:
             raise RuntimeError("runtime.cuda_graphs: another conversation has taken the thinker cache "

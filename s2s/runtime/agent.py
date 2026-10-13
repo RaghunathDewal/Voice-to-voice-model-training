@@ -203,6 +203,14 @@ class VoiceSession:
         hidden = torch.stack([out.hidden_states[j][0, -1] for j in self.a.layer_idx], dim=0)
         return out.logits[0, -1], hidden
 
+    def _rollback(self, n_tokens: int) -> None:
+        """Forget everything fed after the first `n_tokens` positions (an ignored turn)."""
+        if self.a.static is not None:
+            self.a.static.crop(self, n_tokens)
+        elif self.past is not None and hasattr(self.past, "crop"):
+            self.past.crop(n_tokens)
+        self.n_tokens = n_tokens
+
     def _feed_ids(self, ids: list[int]):
         return self._feed_embeds(self.a.thinker.embed(torch.tensor(ids, device=self.a.device)))
 
@@ -394,6 +402,7 @@ class StreamingTurn:
         self.endpointer = Endpointer.from_config(a.cfg.runtime.endpoint, 1000.0 / self.codec.frame_rate,
                                                  self.codec.sample_rate)
         self.ended = False
+        self.start_tokens = session.n_tokens  # to undo the turn if no words are heard
         with torch.no_grad():
             session._open_turn()
 
@@ -467,6 +476,15 @@ class StreamingTurn:
                 asr, asr_conf = a.input_encoder.transcribe_with_confidence([self.latents])[0]
         else:
             transcript = ""
+        if a.cfg.runtime.get("skip_empty_turns", True) and not (asr or transcript).strip():
+            # a breath, click or background noise passed the voice detector but no word was heard: no reply,
+            # and the turn is taken back out of the thinker's memory
+            self.s._rollback(self.start_tokens)
+            yield {"type": "user_transcript", "text": "", "asr": asr, "asr_confidence": asr_conf, "unclear": False,
+                   "ignored": True, "endpoint_reason": self.endpointer.reason}
+            yield {"type": "timings", "ms": dict(self.timer.marks)}
+            yield {"type": "done"}
+            return
         self.s.history.append({"role": "user", "text": asr or transcript})
         # confidence gate: when the audio was not understood, ask again instead of guessing (no tool calls)
         min_conf = float(a.cfg.runtime.get("asr_min_confidence", 0.0))

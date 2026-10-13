@@ -503,3 +503,26 @@ def test_static_cache_thinker_matches_the_normal_path(agent):
         texts.append([e["text"] for e in session.respond(wav) if e["type"] == "assistant_text"])
     agent.static = None
     assert texts[0] == texts[1] and p is not None
+
+
+def test_a_turn_with_no_heard_words_gets_no_reply_and_is_forgotten(agent, monkeypatch):
+    """Noise that passed the voice detector: the adapter hears no words -> no reply, the thinker's memory is
+    rolled back to before the turn (normal and fixed-size cache)."""
+    import s2s.runtime.agent as agent_mod
+    from s2s.runtime.cuda_graph import StaticThinker
+
+    monkeypatch.setattr(agent_mod, "ctc_greedy_decode", lambda ids: "")
+    th = agent.thinker
+    wav = np.random.default_rng(0).standard_normal(24000).astype(np.float32) * 0.05
+    for static in (None, StaticThinker(th.model, agent.layer_idx, True, 512, agent.device, th.dtype)):
+        agent.static = static
+        session = agent.new_session(tools=None)
+        before = session.n_tokens
+        events = list(session.respond(wav))
+        assert [e["type"] for e in events] == ["user_transcript", "timings", "done"] and events[0]["ignored"]
+        assert session.n_tokens == before and session.first_turn and not session.history
+        if static is None:
+            assert session.past.get_seq_length() == before
+        else:
+            assert static.n == before
+    agent.static = None
