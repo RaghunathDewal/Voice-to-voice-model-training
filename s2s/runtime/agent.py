@@ -372,6 +372,8 @@ class VoiceSession:
                     elif not speakable(piece):
                         spoken.append(tok)  # emoji / markdown: kept in the text, not spoken
                         yield {"type": "token", "text": piece}
+                        if phrases is not None and not piece.strip():
+                            phrases.push(piece)  # a bare space (Qwen writes " 2" as " " + "2"): "at 3 PM", not "at3"
                     elif a.tts is not None:
                         if phrases is None:
                             phrases = a.tts.stream(quick_start=round_idx == 0)

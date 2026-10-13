@@ -566,3 +566,47 @@ def test_prompt_lookup_gives_the_same_reply_in_fewer_thinker_passes(agent, monke
     assert ms["reply_tokens"] == len(want) - 1 and ms["thinker_passes"] < ms["reply_tokens"] / 2
     # the memory holds exactly the reply (rejected guesses were taken back out)
     assert session.text_ids[-len(want):] == want and session.n_tokens == session.past.get_seq_length()
+
+
+def test_speech_text_keeps_spaces_before_numbers_and_says_times_naturally(agent, monkeypatch):
+    """Qwen writes " 3" as " " + "3": the bare space must reach the voice ("at 3 PM", not "at3"); "3:00 PM" is
+    said "3 PM"; a phrase never ends right after a number ("3:00 | PM")."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    import s2s.runtime.agent as agent_mod
+    from s2s.runtime.external_tts import ExternalTTS, clean_for_speech
+
+    assert clean_for_speech("Check-in is at 3:00 PM.") == "Check-in is at 3 PM."
+    assert clean_for_speech("Checkout 11:00 a.m. on Friday, gym 7:30pm, quiet hours 22:00.") == \
+        "Checkout 11 AM on Friday, gym 7:30 PM, quiet hours 22 o'clock."
+    spoken = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            import json as _json
+
+            spoken.append(_json.loads(self.rfile.read(int(self.headers["Content-Length"])))["text"])
+            pcm = np.zeros(160, "<i2").tobytes()
+            self.send_response(200)
+            self.send_header("X-Sample-Rate", "16000")
+            self.send_header("Content-Length", str(len(pcm)))
+            self.end_headers()
+            self.wfile.write(pcm)
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    monkeypatch.setattr(agent, "tts", ExternalTTS(f"http://127.0.0.1:{srv.server_address[1]}/tts"))
+    p = agent.thinker.prompts
+    script = p.ids("Your check-in is scheduled for 3:00 PM on December 24, 2026.") + [p.im_end_id]
+    monkeypatch.setattr(agent_mod, "sample_logits", lambda *a, **k: script.pop(0) if script else p.im_end_id)
+    session = agent.new_session(tools=None)
+    try:
+        list(session.respond(np.random.default_rng(0).standard_normal(24000).astype(np.float32) * 0.05))
+    finally:
+        srv.shutdown()
+    assert " ".join(spoken) == "Your check-in is scheduled for 3 PM on December 24, 2026."
+    assert not any(x.rstrip().endswith(("3", "3:00")) for x in spoken[:-1])

@@ -26,9 +26,24 @@ ABBREV = {"st", "dr", "mr", "mrs", "ms", "no", "ave", "rd", "blvd", "apt", "ste"
           "dept", "est", "fig", "ft", "inc", "ltd", "co", "mt", "a.m", "p.m", "e.g", "i.e", "u.s"}
 
 
+_FULL_HOUR_AMPM = re.compile(r"\b(\d{1,2}):00\s*([AaPp])\.?\s*[Mm]\b(\.?)")
+_FULL_HOUR = re.compile(r"\b(\d{1,2}):00\b(?!\s*[AaPp]\.?\s*[Mm])")
+_AMPM = re.compile(r"\b(\d{1,2}(?::\d{2})?)\s*([AaPp])\.?\s*[Mm]\b(\.?)")
+
+
 def clean_for_speech(text: str) -> str:
-    """Markdown / bracket characters are not spoken; whitespace collapsed."""
-    return re.sub(r"\s+", " ", _MARKUP.sub(" ", text)).strip()
+    """Markdown / bracket characters are not spoken; times said the way people say them ("3:00 PM" -> "3 PM",
+    "11:00" -> "11 o'clock", "3:30pm" -> "3:30 PM"); whitespace collapsed."""
+    def ampm(m: re.Match) -> str:  # "p.m." -> "PM"; its final dot is kept when it also ends the sentence
+        after = m.string[m.end():].lstrip()
+        dot = "." if m.group(3) and (not after or after[0].isupper()) else ""
+        return f"{m.group(1)} {m.group(2).upper()}M{dot}"
+
+    text = _MARKUP.sub(" ", text)
+    text = _FULL_HOUR_AMPM.sub(ampm, text)
+    text = _FULL_HOUR.sub(r"\1 o'clock", text)
+    text = _AMPM.sub(ampm, text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 class ExternalTTS:
@@ -75,10 +90,13 @@ class PhraseStream:
             if last in ABBREV or (len(last) == 1 and last.isalpha()):
                 end = ""  # "St." / "Dr." / an initial: not a pause
         strong, weak = bool(end) and end in STRONG, bool(end) and end in WEAK  # ("" in "abc" is True)
+        # never cut right after a number on word count alone: "3:00 | PM", "December 24 | , 2026"
+        mid_number = n > 0 and self.buf.rstrip()[-1:].isdigit()
         if self.sent == 0 and self.quick_start:  # the first phrase: short, so speech starts early: the first pause (even one word:
             # "Absolutely!", "I'm sorry,"), or a few words when no pause comes ("Your unit is located at | 5103 ...")
-            return strong or (n >= self.tts.first_words and weak) or n >= self.tts.first_max_words
-        return (n >= self.tts.min_words and strong) or (n >= 2 * self.tts.min_words and weak) or n >= self.tts.max_words
+            return strong or (n >= self.tts.first_words and weak) or (n >= self.tts.first_max_words and not mid_number)
+        return ((n >= self.tts.min_words and strong) or (n >= 2 * self.tts.min_words and weak)
+                or (n >= self.tts.max_words and not mid_number))
 
     def _submit(self) -> None:
         text = clean_for_speech(self.buf)
