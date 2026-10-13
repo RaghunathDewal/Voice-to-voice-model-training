@@ -10,6 +10,7 @@
 #            os.environ["HF_TOKEN"] = UserSecretsClient().get_secret("HF_TOKEN")
 #   Cell 3:  !cd /tmp/repo && bash scripts/kaggle_4b_demo.sh
 # Options (put before `bash`):
+#   MODEL=v3               the latest adapter v3 checkpoint (Nemotron listener -> adapter v3 + speech LoRA -> 4B), Kokoro voice
 #   MODEL=0.6b             the earlier compact system instead: Parakeet -> speech_llm_pk4 -> fine-tuned Qwen3-0.6B
 #                          (thinker_merged_v3) -> talker_v3 -> Mimi (faster, less expressive)
 #   TALKER=best            the talker checkpoint with the lowest eval loss (step 1000) instead of the final one
@@ -29,7 +30,9 @@ set -euo pipefail
 HF_USER=${HF_USER:-ThunderBlade7773}
 export CKPT_REPO=$HF_USER/s2s-checkpoints
 MODEL=${MODEL:-4b}
-if [ "$MODEL" = 0.6b ]; then
+if [ "$MODEL" = v3 ]; then  # the latest adapter v3 upload (Nemotron listener, speech LoRA); Kokoro voice by default
+    ADAPTER=${ADAPTER:-speech_llm_v3}; TALKER_DIR=talker_4b; THINKER=""; CFG=configs/qwen4b_v3.yaml; TTS=${TTS:-kokoro}
+elif [ "$MODEL" = 0.6b ]; then
     ADAPTER=${ADAPTER:-speech_llm_pk4}; TALKER_DIR=talker_v3; THINKER=thinker_merged_v3; CFG=configs/small.yaml
 else
     ADAPTER=${ADAPTER:-speech_llm_4b_v2}; TALKER_DIR=talker_4b; THINKER=""; CFG=configs/qwen4b.yaml
@@ -51,6 +54,9 @@ say ">>> setup"
 pip install -q --no-deps -e .
 pip install -q peft accelerate soundfile librosa huggingface_hub fastapi uvicorn websockets silero-vad
 python -c "from transformers import ParakeetForCTC" 2>/dev/null || pip install -q -U "transformers>=4.57"
+if [ "$MODEL" = v3 ]; then  # the Nemotron listener needs a newer transformers
+    python -c "from transformers import AutoModelForRNNT" 2>/dev/null || pip install -q -U "transformers>=5.13"
+fi
 NGPU=$(python -c "import torch; print(torch.cuda.device_count())")
 python -c "import torch; [print(i, torch.cuda.get_device_name(i)) for i in range(torch.cuda.device_count())]"
 
@@ -59,7 +65,7 @@ python - <<'EOF'
 import os, shutil
 from huggingface_hub import snapshot_download
 repo, adapter, talker, tdir, thinker = (os.environ[k] for k in ("CKPT_REPO", "ADAPTER", "TALKER", "TALKER_DIR", "THINKER"))
-pats = [f"checkpoints/{adapter}/*.pt", f"checkpoints/{adapter}/*.yaml", f"checkpoints/{adapter}/*.json",
+pats = [f"checkpoints/{adapter}/*.pt", f"checkpoints/{adapter}/*.yaml", f"checkpoints/{adapter}/*.json", f"checkpoints/{adapter}/lora/*",
         f"checkpoints/{tdir}/*.pt", f"checkpoints/{tdir}/*.json", f"checkpoints/{tdir}/*.yaml", f"checkpoints/{tdir}/last/*"]
 if thinker:
     pats.append(f"checkpoints/{thinker}/*")

@@ -431,3 +431,37 @@ def test_warm_up_runs_a_throwaway_turn_and_keeps_the_tts(agent):
     agent.tts = sentinel = object()
     agent.warm_up(tokens=2)
     assert agent.tts is sentinel
+
+
+def test_v3_calls_places_the_reply_after_the_detected_end_of_turn(agent, monkeypatch, tmp_path):
+    """s2s.eval.v3_calls: a recorded call is fed as live; the reply lands after the detected end of the turn."""
+    import json as _json
+    import sys
+
+    import soundfile as sf
+
+    import s2s.runtime.agent as agent_mod
+    from s2s.eval import v3_calls
+
+    sr = 24000
+    t = np.arange(sr) / sr
+    wav = np.concatenate([np.zeros(sr // 2), 0.3 * np.sin(2 * np.pi * 220 * t), np.zeros(int(sr * 3.5))]).astype(np.float32)
+    sf.write(tmp_path / "c.wav", wav, sr)
+    calls = [{"id": "c", "wav": str(tmp_path / "c.wav"), "prompt": "You work for a hotel.",
+              "turns": [{"text": "what time is checkout", "start": 0.5, "end": 1.5, "keywords": ["11"]}]}]
+    (tmp_path / "calls.json").write_text(_json.dumps(calls))
+    p = agent.thinker.prompts
+    script = p.ids("Checkout is at 11.") + [p.im_end_id]
+    monkeypatch.setattr(agent_mod, "sample_logits", lambda *a, **k: script.pop(0) if script else p.im_end_id)
+    monkeypatch.setattr(agent_mod, "VoiceAgent", lambda *a, **k: agent)
+    monkeypatch.setattr(agent, "warm_up", lambda: None)
+    monkeypatch.setattr(sys, "argv", ["v3_calls", "--config", os.path.join(ROOT, "configs", "default.yaml"),
+                                      "--calls", str(tmp_path / "calls.json"), "--out-dir", str(tmp_path / "out")])
+    v3_calls.main()
+    run = _json.loads((tmp_path / "out" / "c.json").read_text())
+    said = [x for x in run["text"] if x != "PAD"]
+    assert len(said) == 1 and "Checkout is at 11." in said[0]
+    start = run["text"].index(said[0]) * run["frame_s"]
+    assert 1.5 < start < 4.0 and run["turns"][0]["end_detected_s"] > 1.5
+    out, _ = sf.read(tmp_path / "out" / "c.wav")
+    assert np.abs(out[: int(1.5 * sr)]).max() == 0 and np.abs(out).max() > 0

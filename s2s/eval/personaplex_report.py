@@ -44,6 +44,7 @@ def main() -> None:
     p.add_argument("--calls", required=True)
     p.add_argument("--run-dir", required=True)
     p.add_argument("--out", required=True)
+    p.add_argument("--title", default="PersonaPlex-7B on hotel calls")
     p.add_argument("--whisper", default="openai/whisper-large-v3-turbo")
     args = p.parse_args()
     import torch
@@ -89,8 +90,14 @@ def main() -> None:
             turns_out.append({"call": call["id"], "guest": t["text"], "agent_text": words, "agent_heard": heard,
                               "delay_s": delay, "talked_over": over, "correct": ok if t.get("keywords") else None})
 
-    L = ["# PersonaPlex-7B on hotel calls", ""]
-    if speed:
+    L = [f"# {args.title}", ""]
+    if speed and speed[0].get("kind") == "turn":  # our turn-based agent (s2s/eval/v3_calls.py)
+        fa = [s["first_audio_ms_p50"] for s in speed if s.get("first_audio_ms_p50") is not None]
+        L += [f"GPU: {speed[0]['gpu']} | voice: {speed[0]['tts']}" + (f" | {speed[0]['label']}" if speed[0].get("label") else ""), "",
+              "## Speed", "", f"- compute from the detected end of turn to the first audio: median **{np.median(fa):.0f} ms**, "
+              f"worst {max(s['first_audio_ms_max'] for s in speed if s.get('first_audio_ms_max') is not None):.0f} ms"
+              if fa else "- no audio produced", "- the reply delay below adds the end-of-turn wait (silence detection) to it", ""]
+    elif speed:
         s0 = speed[0]
         p50 = float(np.median([s["frame_ms_p50"] for s in speed]))
         p95 = float(np.median([s["frame_ms_p95"] for s in speed]))
@@ -116,6 +123,7 @@ def main() -> None:
             L.append(f"| {t['call']} | {t['guest']} | {t['agent_text'][:160]} | {t['agent_heard'][:160]} | {d} | {c} |")
     L += ["", "Listen to `<call>_mix.wav` (left ear: guest, right ear: agent) for naturalness, interruptions and voice "
           "quality: the numbers cannot judge those.", "",
+          *([] if speed and speed[0].get("kind") == "turn" else [
           "## Production checklist (from the model card / code, not measured here)", "",
           "- tool / function calling: none (it only speaks); reservations, bookings and lookups would need a "
           "separate system listening to its text",
@@ -123,7 +131,7 @@ def main() -> None:
           "- language: English only",
           "- hardware: tested by NVIDIA on A100 80 GB / H100; one conversation per model instance in their server "
           "(serving many callers needs batching work or one GPU per few calls)",
-          "- licence: NVIDIA Open Model License (commercial use allowed) + CC-BY-4.0 (Moshi base)"]
+          "- licence: NVIDIA Open Model License (commercial use allowed) + CC-BY-4.0 (Moshi base)"])]
     open(args.out, "w").write("\n".join(L) + "\n")
     with open(os.path.splitext(args.out)[0] + ".json", "w") as f:
         json.dump({"turns": turns_out, "speed": speed}, f, indent=1)
