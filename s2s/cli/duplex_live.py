@@ -55,6 +55,10 @@ def main() -> None:
     p.add_argument("--graphs", type=int, default=1, help="1 = the whole 80 ms frame from one CUDA graph "
                    "(falls back to the normal path if it cannot be recorded)")
     p.add_argument("--graph-max-tokens", type=int, default=4096, help="prompt + frames per call (~4.5 min)")
+    p.add_argument("--speech-gate", type=int, default=1, help="1 = the model hears digital silence outside speech "
+                   "(Silero VAD): room noise no longer starts phantom turns")
+    p.add_argument("--guest-text", type=int, default=1, help="1 = show what the guest said (Nemotron's own "
+                   "transcript of the same listener vectors; display only, the model never reads it)")
     p.add_argument("--save-dir", default=None, help="write each call as a stereo wav (left = you, right = agent)")
     args = p.parse_args()
 
@@ -67,6 +71,17 @@ def main() -> None:
     codec = MimiCodec(cfg.codec.model, device, num_codebooks=int(cfg.codec.num_codebooks))
     encoder = build_encoder(args.encoder, resolve_device(enc_dev))
     pad_id = model.pad_id
+    gate = None
+    if args.speech_gate:
+        from s2s.runtime.speech_gate import SpeechGate
+
+        gate = SpeechGate()
+        print(f"speech gate on ({gate.name} VAD)", flush=True)
+    transcriber = None
+    if args.guest_text and args.encoder.startswith("nemotron:"):
+        from s2s.models.nemotron_text import NemotronTranscriber
+
+        transcriber = NemotronTranscriber.load(args.encoder.split(":", 1)[1].split("@")[0], resolve_device(enc_dev))
     print(f"duplex model on {device}, listener on {enc_dev}", flush=True)
     if args.graphs:  # record the frame graph now (the page's default sampling), not at the first call
         DuplexSession(model, tok, "You are a hotel concierge.", None, None, 0.6, 30, graphs=True,
@@ -108,6 +123,8 @@ def main() -> None:
                                      graphs=bool(args.graphs), graph_max_tokens=args.graph_max_tokens)
             dec = StreamingDecoder(codec)
             listener = StreamingListener(encoder)
+            if gate is not None:
+                gate.reset()
             await sock.send_text(json.dumps({
                 "type": "session", "property": ctx.prop, "system": ctx.system,
                 "tools": [t["function"]["name"] for t in tools or []], "temperature": temp, "top_k": top_k}))
@@ -125,6 +142,31 @@ def main() -> None:
         enc_lock = threading.Lock()
         timing = {"listener": 0.0, "chunks": 0, "decode": 0.0, "decoded": 0}
         encoding = {"busy": False}
+        guest = {"frames": [], "ended": 0, "last": 0.0, "sent": ""}
+
+        def transcribe():
+            with enc_lock:
+                return transcriber([torch.stack(guest["frames"])])[0] if guest["frames"] else ""
+
+        async def guest_text():
+            """The guest's words so far (every ~1 s while they speak) and the final line when the gate closes."""
+            if transcriber is None:
+                return
+            if gate is not None and not gate.active and gate.ended == guest["ended"]:
+                guest["frames"] = guest["frames"][-25:]  # nobody speaking: keep only the last 2 s
+            ended = gate is not None and gate.ended > guest["ended"]
+            speaking = gate is None or gate.active
+            if not ended and not (speaking and time.time() - guest["last"] > 1.0):
+                return
+            guest["last"] = time.time()
+            text = await asyncio.to_thread(transcribe)
+            if ended:
+                guest["ended"], guest["frames"] = gate.ended, []
+            elif gate is None and len(guest["frames"]) > 150:  # no gate: start a new line every 12 s
+                guest["frames"], ended = [], True
+            if text and (text != guest["sent"] or ended):
+                await sock.send_text(json.dumps({"type": "guest", "t": text, "final": ended}))
+            guest["sent"] = "" if ended else text
 
         def encode():
             with enc_lock:
@@ -138,6 +180,8 @@ def main() -> None:
             try:
                 for f in await asyncio.to_thread(encode):
                     frames.put_nowait(f)
+                    guest["frames"].append(f)
+                await guest_text()
             finally:
                 encoding["busy"] = False
 
@@ -148,9 +192,9 @@ def main() -> None:
                     raise WebSocketDisconnect()
                 if msg.get("bytes"):
                     x16 = resample(np.frombuffer(msg["bytes"], dtype="<i2").astype(np.float32) / 32768.0, sr, 16000)
-                    listener.push(x16)
+                    listener.push(gate.push(x16) if gate is not None else x16)
                     if args.save_dir:
-                        mic_rec.append(x16)
+                        mic_rec.append(x16)  # the recording keeps the real microphone
                     if not encoding["busy"] and listener.ready() - listener.done >= 2:
                         encoding["busy"] = True
                         asyncio.create_task(run_encode())

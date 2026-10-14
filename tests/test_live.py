@@ -135,3 +135,25 @@ def test_endpoint_quick_rule_ends_early_only_when_the_eot_head_is_sure():
     assert silence_until_end(0.9) == (160, "eot_quick")
     assert silence_until_end(0.6) == (320, "eot_head")
     assert silence_until_end(0.1) == (1040, "max_silence")
+
+
+def test_speech_gate_silences_outside_speech():
+    """Loudness fallback (no Silero): noise-free silence stays zero, a loud burst passes with its first window
+    kept by the look-ahead, short pauses stay open (hang-over), and the end of the segment is counted."""
+    import numpy as np
+
+    from s2s.runtime.speech_gate import WINDOW, SpeechGate
+
+    g = SpeechGate(hangover_ms=128, lookahead_ms=64)
+    g.vad = None  # loudness rule, deterministic
+    g.reset()
+    rng = np.random.default_rng(0)
+    quiet = 0.001 * rng.standard_normal(WINDOW * 20).astype(np.float32)        # room hiss, about -60 dB
+    loud = 0.3 * rng.standard_normal(WINDOW * 10).astype(np.float32)           # "speech"
+    out = g.push(np.concatenate([quiet, loud, quiet[: WINDOW * 2], loud, quiet]))
+    assert g.ended == 1 and not g.active
+    first = 20 * WINDOW
+    assert not out[: first - 2 * WINDOW].any()                                   # hiss before speech -> silence
+    assert np.array_equal(out[first: first + 10 * WINDOW], loud)                 # speech passes untouched
+    assert out[first + 10 * WINDOW: first + 12 * WINDOW].any()                   # 64 ms pause inside: kept
+    assert not out[-6 * WINDOW:].any()                                           # after the hang-over: silence

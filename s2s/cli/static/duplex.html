@@ -43,6 +43,7 @@ pre { white-space: pre-wrap; font-size: 12px; max-height: 260px; overflow: auto;
 #chat { min-height: 360px; max-height: 62vh; overflow: auto; display: flex; flex-direction: column; gap: 8px; }
 .msg { padding: 9px 12px; border-radius: 10px; background: var(--agent); max-width: 92%; }
 .msg small { display: block; color: var(--muted); font-size: 11px; margin-bottom: 2px; }
+.guest { align-self: flex-end; background: transparent; border: 1px solid var(--line); }
 .tool { background: var(--tool); border: 1px solid var(--tool-line); font-size: 13px; }
 .tool code { font-size: 12px; word-break: break-word; }
 .hint { color: var(--muted); font-size: 13px; }
@@ -102,6 +103,12 @@ function agentText(t) {
   lastText = now;
   cur.querySelector('span').textContent += t; $('#chat').scrollTop = 1e9;
 }
+let guestCur = null;
+function guestText(t, final) {
+  if (!guestCur) { cur = null; guestCur = addMsg('guest', '<small>guest (what the listener heard)</small><span></span>'); }
+  guestCur.querySelector('span').textContent = t; $('#chat').scrollTop = 1e9;
+  if (final) guestCur = null;
+}
 function playChunk(pcm) {
   const f = new Float32Array(pcm.length); for (let i = 0; i < pcm.length; i++) f[i] = pcm[i] / 32768;
   const buf = ctx.createBuffer(1, f.length, 24000); buf.copyToChannel(f, 0);
@@ -145,11 +152,12 @@ async function start() {
     if (typeof ev.data !== 'string') { playChunk(new Int16Array(ev.data)); return; }
     const m = JSON.parse(ev.data);
     if (m.type === 'session') {
-      $('#chat').innerHTML = ''; cur = null;
+      $('#chat').innerHTML = ''; cur = null; guestCur = null;
       $('#prop').textContent = m.property; $('#sys').textContent = m.system;
       $('#tools').innerHTML = (m.tools.length ? m.tools : ['no tools']).map(t => `<span class="pill">${esc(t)}</span>`).join('');
       addMsg('', `<small>new call · temperature ${m.temperature}, top-k ${m.top_k}</small>Waiting for the agent to greet you…`);
     } else if (m.type === 'text') agentText(m.t);
+    else if (m.type === 'guest') guestText(m.t, m.final);
     else if (m.type === 'tool') { cur = null; addMsg('tool', `<small>tool call</small><code>${esc(JSON.stringify(m.call))}</code><br><small>result</small><code>${esc(JSON.stringify(m.result))}</code>`); }
     else if (m.type === 'stats') {
       $('#lag').textContent = m.lag_ms + ' ms'; $('#lag').className = m.lag_ms > 400 ? 'lagbad' : '';
