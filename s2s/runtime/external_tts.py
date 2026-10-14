@@ -5,7 +5,8 @@ or after a few words, so speech starts while the thinker is still writing; later
 and its audio is handed out as soon as it is ready, so the thinker keeps generating meanwhile.
 
 Server protocol (s2s/cli/qwen_tts_server.py): POST <url> {"text": "..."} -> raw int16 mono PCM, with the
-sample rate in the X-Sample-Rate header.
+sample rate in the X-Sample-Rate header. Several servers (a comma-separated url list): each phrase goes to the
+one with the fewest phrases in progress (a Kokoro pool for many calls at once, s2s/cli/batch_live.py).
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ from __future__ import annotations
 import collections
 import json
 import re
+import threading
 import urllib.request
 from concurrent.futures import Future, ThreadPoolExecutor
 
@@ -49,17 +51,27 @@ def clean_for_speech(text: str) -> str:
 class ExternalTTS:
     def __init__(self, url: str, first_words: int = 2, first_max_words: int = 5, min_words: int = 6,
                  max_words: int = 28, timeout: float = 60.0):
-        self.url = url
+        self.urls = [u.strip() for u in str(url).split(",") if u.strip()]
+        self.url = self.urls[0]
+        self.busy = {u: 0 for u in self.urls}
+        self._lock = threading.Lock()
         self.first_words, self.first_max_words = first_words, first_max_words
         self.min_words, self.max_words = min_words, max_words
         self.timeout = timeout
 
     def synth(self, text: str) -> tuple[np.ndarray, int]:
-        req = urllib.request.Request(self.url, data=json.dumps({"text": text}).encode(),
-                                     headers={"Content-Type": "application/json"}, method="POST")
-        with urllib.request.urlopen(req, timeout=self.timeout) as r:
-            sr = int(r.headers.get("X-Sample-Rate", 24000))
-            pcm = r.read()
+        with self._lock:  # the least busy server
+            url = min(self.urls, key=lambda u: self.busy[u])
+            self.busy[url] += 1
+        try:
+            req = urllib.request.Request(url, data=json.dumps({"text": text}).encode(),
+                                         headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                sr = int(r.headers.get("X-Sample-Rate", 24000))
+                pcm = r.read()
+        finally:
+            with self._lock:
+                self.busy[url] -= 1
         return np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0, sr
 
     def stream(self, quick_start: bool = True) -> "PhraseStream":

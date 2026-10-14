@@ -846,3 +846,144 @@ def test_batch_load_test_runs_end_to_end(tiny_models, tmp_path, monkeypatch):
     assert all(lv["n_errors"] == 0 for lv in res["levels"]), res["levels"]
     assert res["levels"][1]["turns"] == 6
     assert (out / "summary.md").exists()
+
+
+def _tiny_nemotron():
+    """A small random-weight Nemotron streaming encoder with the real processor (needs the hub processor files)."""
+    import types
+
+    from transformers import AutoConfig, AutoProcessor
+    from transformers.models.nemotron_asr_streaming.modeling_nemotron_asr_streaming import (
+        NemotronAsrStreamingEncoder,
+    )
+
+    name = "nvidia/nemotron-speech-streaming-en-0.6b"
+    try:
+        proc = AutoProcessor.from_pretrained(name)
+        cfg = AutoConfig.from_pretrained(name).encoder_config
+    except OSError as e:
+        pytest.skip(f"Nemotron processor unavailable: {e}")
+    cfg = type(cfg)(**{**cfg.to_dict(), "hidden_size": 64, "num_hidden_layers": 2, "num_attention_heads": 2, "num_key_value_heads": 2,
+                       "intermediate_size": 128, "subsampling_conv_channels": 16})
+    torch.manual_seed(0)
+    enc = NemotronAsrStreamingEncoder(cfg).eval()
+    return types.SimpleNamespace(enc=enc, proc=proc, device=torch.device("cpu"), dtype=torch.float32)
+
+
+def test_batched_listener_matches_single_streams():
+    """Calls that start at different times, with different chunk sizes pushed, encoded together: every call gets
+    the same vectors as its own StreamingListener (filling and full sliding windows, first chunks together)."""
+    import numpy as np
+
+    from s2s.models.batched_listener import BatchedListener
+    from s2s.models.streaming_listener import StreamingListener
+
+    nem = _tiny_nemotron()
+    bl = BatchedListener(nem, lookahead=1)
+    rng = np.random.default_rng(0)
+    n_calls, seconds = 4, 9
+    audio = [rng.standard_normal(16000 * seconds).astype(np.float32) * 0.1 for _ in range(n_calls)]
+    starts = [0, 0, 6400, 41600]                    # two start together, two later (one in another chunk phase)
+    batched = [bl.new_stream() for _ in range(n_calls)]
+    got = [[] for _ in range(n_calls)]
+    step = 2560                                     # 160 ms pushes, like the live server
+    for t in range(0, 16000 * seconds + max(starts), step):
+        live = []
+        for i in range(n_calls):
+            a, b = t - starts[i], t - starts[i] + step
+            if b <= 0 or a >= len(audio[i]):
+                continue
+            batched[i].push(audio[i][max(0, a):b])
+            live.append(i)
+        res = bl.step([batched[i] for i in live])
+        for i in live:
+            got[i].extend(res[id(batched[i])])
+    assert bl.stats["max_batch"] >= 3
+    for i in range(n_calls):
+        ref = StreamingListener(nem, lookahead=1)
+        ref.push(audio[i])
+        exp = ref.new_frames()
+        assert len(got[i]) == len(exp) > 100
+        assert torch.allclose(torch.stack(got[i]), torch.stack(exp), atol=1e-4), i
+
+
+def test_batch_live_serves_several_guests(tiny_models, tmp_path, monkeypatch):
+    """The whole batched pipeline over the real /live protocol (CPU, tiny models, a stub voice): three guests at
+    once speak (loud noise, then silence), each turn is detected, heard by the batched listener, answered by the
+    batched thinker and spoken; every guest gets audio and turn_complete, twice."""
+    import argparse
+    import json
+    import threading
+
+    import numpy as np
+    from fastapi.testclient import TestClient
+
+    import s2s.models.encoders as encoders
+    from s2s.cli import batch_live
+    from s2s.models.adapter import SpeechAdapter
+    from s2s.models.thinker import Thinker
+    from s2s.runtime.external_tts import ExternalTTS
+
+    nem = _tiny_nemotron()
+    nem.lookahead = 1
+    monkeypatch.setattr(encoders, "build_encoder", lambda spec, dev: nem)
+    monkeypatch.setattr(ExternalTTS, "synth", lambda self, text: (np.full(2400, 0.1, np.float32), 24000))
+    monkeypatch.setattr(batch_live.Pipeline, "transcript", lambda self, lat: "hello there")
+    th = Thinker(tiny_models["qwen"], torch.device("cpu"), torch.float32)
+    ckpt = tmp_path / "speech_llm"
+    ckpt.mkdir()
+    SpeechAdapter(latent_dim=64, llm_dim=th.hidden_size, d_model=32, n_layers=1, n_heads=4,
+                  encoder="nemotron:tiny@1").save(str(ckpt / "adapter.pt"))
+    args = argparse.Namespace(
+        config="configs/qwen4b_v3.yaml", speech_llm_dir=str(ckpt), tts_url="http://a/tts,http://b/tts", max_calls=4,
+        max_tokens=2048, prefill_budget=64, device="cpu", encoder_device=None,
+        set=[f"thinker.model={tiny_models['qwen']}", "thinker.dtype=float32", "runtime.endpoint.vad=energy",
+             "runtime.max_new_tokens=12", "runtime.temperature=1.5"])  # a random tiny model: sample real characters
+    import s2s.runtime.agent as agent_mod
+
+    monkeypatch.setattr(agent_mod, "speakable", lambda piece: True)
+    pipe = batch_live.Pipeline(args)
+    client = TestClient(batch_live.build_app(pipe))
+    rng = np.random.default_rng(0)
+    speech = (np.clip(rng.standard_normal(16000) * 0.3, -1, 1) * 32767).astype("<i2").tobytes()
+    silence = bytes(2 * 16000 * 2)
+    results, errors = {}, []
+
+    def guest(i):
+        try:
+            with client.websocket_connect("/live") as ws:
+                ws.send_text(json.dumps({"type": "setup", "system_prompt": f"Hotel {i} concierge.", "tools": []}))
+                assert json.loads(ws.receive_text())["type"] == "setup_complete"
+                got = []
+                for _ in range(2):
+                    pcm = speech + silence
+                    for off in range(0, len(pcm), 3200):
+                        ws.send_bytes(pcm[off: off + 3200])
+                    audio, msgs = 0, []
+                    while True:
+                        m = ws.receive()
+                        if m.get("bytes"):
+                            audio += len(m["bytes"])
+                            continue
+                        msgs.append(json.loads(m["text"]))
+                        if msgs[-1]["type"] in ("turn_complete", "error"):
+                            break
+                    got.append((audio, [x["type"] for x in msgs], msgs[-1].get("timings_ms")))
+                results[i] = got
+        except Exception as e:  # noqa: BLE001
+            errors.append(repr(e))
+
+    threads = [threading.Thread(target=guest, args=(i,)) for i in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(240)
+    pipe.stop = True
+    pipe.sched.shutdown()
+    assert not errors, errors
+    assert sorted(results) == [0, 1, 2]
+    for got in results.values():
+        for audio, types, timings in got:
+            assert audio > 0 and types[0] == "input_transcription" and types[-1] == "turn_complete", types
+            assert "first_token" in timings and "first_audio" in timings
+    assert pipe.listener.stats["max_batch"] >= 2 and pipe.stats["turns"] == 6

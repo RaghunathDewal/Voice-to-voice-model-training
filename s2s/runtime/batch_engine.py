@@ -206,7 +206,11 @@ class BatchScheduler(threading.Thread):
             block = False
             if kind == "stop":
                 return
-            if kind == "close":
+            if kind == "close":  # a call that hung up, maybe mid-reply: stop its work before its slot is reused
+                for lst in (self.prefilling, self.answering):
+                    if item in lst:
+                        lst.remove(item)
+                item.job = None
                 self.engine.release(item.slot)
             elif kind == "job":
                 self._start(item)
