@@ -18,6 +18,7 @@ state); if anything differs or fails, the session uses the normal path and says 
 
 from __future__ import annotations
 
+import os
 import time
 
 import torch
@@ -79,7 +80,8 @@ class DuplexGraph:
     # ------------------------------------------------------------------ the frame
     def _pick(self, logits: torch.Tensor, j: int) -> torch.Tensor:
         v, i = logits.float().topk(self.top_k)  # (recorded once: the temperature is baked into the graph)
-        return i[(v / max(self.temp, 1e-6) + self.noise[j]).argmax()]
+        k = (v / max(self.temp, 1e-6) + self.noise[j]).argmax()
+        return i.gather(0, k.view(1))[0]  # not i[k]: indexing with a GPU tensor reads it on the CPU (breaks capture)
 
     def _frame(self) -> None:
         m = self.m
@@ -150,8 +152,15 @@ class DuplexGraph:
             side = torch.cuda.Stream(self.device)
             side.wait_stream(torch.cuda.current_stream(self.device))
             with torch.cuda.stream(side):
-                for _ in range(3):
-                    self._frame()
+                self._frame()  # first run: lazy set-up may read the GPU
+                # any op that waits for the GPU (reads a value on the CPU) cannot be recorded: make it raise here,
+                # with its line, instead of a vague "capture invalidated" later
+                torch.cuda.set_sync_debug_mode("error")
+                try:
+                    for _ in range(2):
+                        self._frame()
+                finally:
+                    torch.cuda.set_sync_debug_mode("default")
             torch.cuda.current_stream(self.device).wait_stream(side)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
@@ -180,6 +189,11 @@ class DuplexGraph:
                   f"(LLM + text + 8 depth steps)", flush=True)
             return True
         except Exception as e:  # noqa: BLE001 - never break the session: fall back to the normal path
+            import traceback
+
+            where = " <- ".join(f"{os.path.basename(f.filename)}:{f.lineno} {f.name}"
+                                for f in reversed(traceback.extract_tb(e.__traceback__)[-4:]))
+            print(f"[duplex graphs] failed at {where}", flush=True)
             self.graph = None
             self.reset()
             print(f"[duplex graphs] graphs off ({type(e).__name__}: {e}); using the normal path", flush=True)
