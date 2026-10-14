@@ -704,3 +704,145 @@ def test_duplex_graph_frame_matches_normal_path(tiny_models, cpu):
     gen = torch.Generator().manual_seed(1)
     _, col, h = gs.frame(feats[0], m.pad_id, torch.full((4,), 64), gen)
     assert col.min() >= 0 and col.max() < 64 and gs.noise.abs().sum() > 0
+
+
+def _hf_greedy(model, embeds: torch.Tensor, steps: int) -> list[int]:
+    """Reference: the plain Hugging Face model with its own cache, one conversation, greedy."""
+    from transformers import DynamicCache
+
+    past = DynamicCache()
+    out = model(inputs_embeds=embeds[None], past_key_values=past, use_cache=True)
+    toks = []
+    for _ in range(steps):
+        tok = int(out.logits[0, -1].argmax())
+        toks.append(tok)
+        emb = model.get_input_embeddings()(torch.tensor([[tok]]))
+        out = model(inputs_embeds=emb, past_key_values=past, use_cache=True)
+    return toks
+
+
+def test_batched_thinker_matches_hf_model(tiny_models, cpu):
+    """Three conversations of different lengths in one slot cache, decoded together: same logits and greedy
+    tokens as each run alone through the HF model (rows never mix, positions per row)."""
+    from transformers import AutoModelForCausalLM
+
+    from s2s.runtime.batch_engine import BatchedThinker
+
+    torch.manual_seed(0)
+    model = AutoModelForCausalLM.from_pretrained(tiny_models["qwen"], dtype=torch.float32).eval()
+    emb = model.get_input_embeddings()
+    prompts = [torch.randint(0, 500, (n,)) for n in (7, 13, 4)]
+    eng = BatchedThinker(model, slots=4, max_tokens=64, device=cpu, dtype=torch.float32)
+    slots = [eng.alloc() for _ in prompts]
+    eng.release(slots[0])                       # a freed slot is reused: its old rows must not leak
+    slots[0] = eng.alloc()
+    first = []
+    for s, p in zip(slots, prompts):
+        with torch.no_grad():
+            logits = eng.forward([s], emb(p)[None])
+            ref = model(inputs_embeds=emb(p)[None]).logits[0, -1]
+        assert torch.allclose(logits[0], ref, atol=1e-4)
+        first.append(int(logits[0].argmax()))
+    got = [[t] for t in first]
+    toks = first
+    for _ in range(5):
+        with torch.no_grad():
+            logits = eng.forward(slots[::-1], emb(torch.tensor(toks[::-1]))[:, None])  # any row order
+        toks = logits.argmax(-1).tolist()[::-1]
+        for g, t in zip(got, toks):
+            g.append(t)
+    with torch.no_grad():
+        refs = [_hf_greedy(model, emb(p), 6) for p in prompts]
+    assert got == refs
+
+
+def test_batch_scheduler_serves_concurrent_calls(tiny_models, cpu):
+    """Calls submitted at once (text + speech pieces, several turns): every reply equals the same conversation
+    run alone, and decoding really was batched."""
+    import threading
+
+    from transformers import AutoModelForCausalLM
+
+    from s2s.models.adapter import SpeechAdapter
+    from s2s.runtime.batch_engine import BatchedThinker, BatchScheduler, Job
+
+    torch.manual_seed(0)
+    model = AutoModelForCausalLM.from_pretrained(tiny_models["qwen"], dtype=torch.float32).eval()
+    emb = model.get_input_embeddings()
+    hidden = model.config.hidden_size
+    adapter = SpeechAdapter(latent_dim=16, llm_dim=hidden, d_model=32, n_layers=1, n_heads=4).eval()
+    start, end = adapter.boundary_embeddings()
+
+    def embed(ids):
+        return emb(torch.tensor(ids))
+
+    eng = BatchedThinker(model, slots=6, max_tokens=256, device=cpu, dtype=torch.float32)
+    sched = BatchScheduler(eng, embed, adapter, (start.detach(), end.detach()), eos_ids=set(), im_end_id=None,
+                           prefill_budget=8)
+    sched.start()
+    calls = [([1, 2, 3, 4, 5], torch.randn(9, 16), [7, 8]), ([9, 10], torch.randn(5, 16), [11]),
+             ([12, 13, 14], torch.randn(12, 16), [15, 16, 17])]
+    results = {}
+    lock = threading.Lock()
+
+    def run(i, prefix, speech, close):
+        conv = sched.open()
+        done = threading.Event()
+        toks = []
+        job = Job(conv, [("ids", prefix), ("speech", speech), ("ids", close)], max_new=6,
+                  on_token=lambda t, now: toks.append(t), on_done=lambda st: done.set())
+        sched.submit(job)
+        assert done.wait(60)
+        with lock:
+            results[i] = toks
+
+    threads = [threading.Thread(target=run, args=(i, *c)) for i, c in enumerate(calls)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    sched.shutdown()
+    assert sched.error is None
+    with torch.no_grad():
+        for i, (prefix, speech, close) in enumerate(calls):
+            x = torch.cat([embed(prefix), start[None], adapter(speech[None])["embeds"][0], end[None], embed(close)])
+            assert results[i] == _hf_greedy(model, x, 6), i
+    assert sched.stats["max_batch"] >= 2
+
+
+def test_batch_load_test_runs_end_to_end(tiny_models, tmp_path, monkeypatch):
+    """The load-test driver on tiny models (CPU): simulated hotel calls with prompts, tools and stored speech
+    features; every turn answered, results and summary written."""
+    import json
+    import sys
+
+    import numpy as np
+
+    from s2s.data.hotel import HOTEL_TOOLS
+    from s2s.eval import batch_load_test
+    from s2s.models.adapter import SpeechAdapter
+    from s2s.models.thinker import Thinker
+
+    th = Thinker(tiny_models["qwen"], torch.device("cpu"), torch.float32)
+    ckpt = tmp_path / "speech_llm"
+    ckpt.mkdir()
+    SpeechAdapter(latent_dim=16, llm_dim=th.hidden_size, d_model=32, n_layers=1, n_heads=4).save(str(ckpt / "adapter.pt"))
+    rows = []
+    for i in range(4):
+        lat = tmp_path / f"lat{i}.npy"
+        np.save(lat, np.random.default_rng(i).standard_normal((6 + i, 16)).astype(np.float16))
+        rows.append({"latent": str(lat), "system": f"You are the concierge of hotel {i}.", "tools": HOTEL_TOOLS[:2]})
+    man = tmp_path / "rows.jsonl"
+    man.write_text("\n".join(json.dumps(r) for r in rows))
+    out = tmp_path / "out"
+    monkeypatch.setattr(sys, "argv", [
+        "batch_load_test", "--config", "configs/default.yaml", "--speech-llm-dir", str(ckpt), "--manifest", str(man),
+        "--levels", "1,3", "--turns", "2", "--max-new", "5", "--speech-speed", "0", "--stagger", "0",
+        "--max-tokens", "2048", "--device", "cpu", "--out", str(out),
+        "--set", f"thinker.model={tiny_models['qwen']}", "thinker.dtype=float32"])
+    batch_load_test.main()
+    res = json.loads((out / "results.json").read_text())
+    assert [lv["calls"] for lv in res["levels"]] == [1, 3]
+    assert all(lv["n_errors"] == 0 for lv in res["levels"]), res["levels"]
+    assert res["levels"][1]["turns"] == 6
+    assert (out / "summary.md").exists()
