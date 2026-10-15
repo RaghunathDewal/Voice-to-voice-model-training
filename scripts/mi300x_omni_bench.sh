@@ -120,6 +120,15 @@ if [ ! -x "$VENV/bin/python" ] || ! "$VENV/bin/python" -c "import soundfile, hug
     uv pip install -p "$VENV/bin/python" -q numpy soundfile huggingface_hub
 fi
 
+# the same spoken guest questions as the pipeline test (s2s/eval/load_test.py synthesises them with Kokoro once)
+CLIP_DIR=$HOME/.cache/s2s_load_test
+if ! ls "$CLIP_DIR"/q*.wav > /dev/null 2>&1; then
+    [ -x "$HOME/s2s-venv/bin/python" ] || { say "no guest clips in $CLIP_DIR: run scripts/mi300x_pipeline_test.sh once first"; exit 1; }
+    say ">>> synthesising the guest questions with Kokoro (pipeline test venv)"
+    "$HOME/s2s-venv/bin/python" -c "import os; from s2s.eval.load_test import synth_questions; synth_questions(os.path.expanduser('$CLIP_DIR'))"
+fi
+say "guest clips: $(ls "$CLIP_DIR"/q*.wav | wc -l) from $CLIP_DIR"
+
 say ">>> docker pull $OMNI_IMAGE"
 docker pull -q "$OMNI_IMAGE"
 
@@ -147,7 +156,7 @@ for M in $OMNI_MODELS; do
     say ">>> guests: levels $LEVELS, $TURNS turns each"
     # shellcheck disable=SC2086
     "$VENV/bin/python" s2s/eval/omni_bench.py --url "http://127.0.0.1:$PORT" --model "$M" --concurrency $LEVELS \
-        --turns "$TURNS" --max-tokens "$MAX_TOKENS" --out "$WORK/results/omni_$tag.json" || say "$M: client failed"
+        --clips "$CLIP_DIR"/q*.wav --turns "$TURNS" --max-tokens "$MAX_TOKENS" --out "$WORK/results/omni_$tag.json" || say "$M: client failed"
     docker logs "$NAME" > "$WORK/results/server_$tag.log" 2>&1 || true
     docker rm -f "$NAME" > /dev/null 2>&1 || true
 done
