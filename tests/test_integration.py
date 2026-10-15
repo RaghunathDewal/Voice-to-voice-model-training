@@ -907,7 +907,8 @@ def test_batched_listener_matches_single_streams():
         assert torch.allclose(torch.stack(got[i]), torch.stack(exp), atol=1e-4), i
 
 
-def test_batch_live_serves_several_guests(tiny_models, tmp_path, monkeypatch):
+@pytest.mark.parametrize("vad", ["energy", "silero"])
+def test_batch_live_serves_several_guests(tiny_models, tmp_path, monkeypatch, vad):
     """The whole batched pipeline over the real /live protocol (CPU, tiny models, a stub voice): three guests at
     once speak (loud noise, then silence), each turn is detected, heard by the batched listener, answered by the
     batched thinker and spoken; every guest gets audio and turn_complete, twice."""
@@ -937,7 +938,7 @@ def test_batch_live_serves_several_guests(tiny_models, tmp_path, monkeypatch):
     args = argparse.Namespace(
         config="configs/qwen4b_v3.yaml", speech_llm_dir=str(ckpt), tts_url="http://a/tts,http://b/tts", max_calls=4,
         max_tokens=2048, prefill_budget=64, device="cpu", encoder_device=None,
-        set=[f"thinker.model={tiny_models['qwen']}", "thinker.dtype=float32", "runtime.endpoint.vad=energy",
+        set=[f"thinker.model={tiny_models['qwen']}", "thinker.dtype=float32", f"runtime.endpoint.vad={vad}",
              "runtime.max_new_tokens=12", "runtime.temperature=1.5"])  # a random tiny model: sample real characters
     import s2s.runtime.agent as agent_mod
 
@@ -945,7 +946,16 @@ def test_batch_live_serves_several_guests(tiny_models, tmp_path, monkeypatch):
     pipe = batch_live.Pipeline(args)
     client = TestClient(batch_live.build_app(pipe))
     rng = np.random.default_rng(0)
-    speech = (np.clip(rng.standard_normal(16000) * 0.3, -1, 1) * 32767).astype("<i2").tobytes()
+    speech = np.clip(rng.standard_normal(16000) * 0.3, -1, 1)
+    if vad == "silero":  # the shared batched Silero: real speech (it rightly ignores noise)
+        pytest.importorskip("silero_vad")
+        import soundfile as sf
+
+        from s2s.audio import resample
+
+        w, sr = sf.read("demo/video/public/audio/guest_0.wav", dtype="float32")
+        speech = resample(w if w.ndim == 1 else w.mean(1), sr, 16000)
+    speech = (speech * 32767).astype("<i2").tobytes()
     silence = bytes(2 * 16000 * 2)
     results, errors = {}, []
 
@@ -985,5 +995,5 @@ def test_batch_live_serves_several_guests(tiny_models, tmp_path, monkeypatch):
     for got in results.values():
         for audio, types, timings in got:
             assert audio > 0 and types[0] == "input_transcription" and types[-1] == "turn_complete", types
-            assert "first_token" in timings and "first_audio" in timings
+            assert "first_token" in timings and "first_audio" in timings and "listener_lag" in timings
     assert pipe.listener.stats["max_batch"] >= 2 and pipe.stats["turns"] == 6

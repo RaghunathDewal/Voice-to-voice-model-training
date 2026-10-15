@@ -201,4 +201,15 @@ python -m s2s.eval.load_test --url ws://127.0.0.1:7860/live --concurrency $LEVEL
 curl -sf http://127.0.0.1:7860/health > "$WORK/results/server_stats_$MODEL.json" || true
 cp "$WORK/logs/server.log" "$WORK/results/server_$MODEL.log" 2>/dev/null || true
 python scripts/turn_timings.py "$WORK/logs/server.log" | tee "$WORK/results/turn_timings_$MODEL.txt" || true
+python - "$WORK/results/server_stats_$MODEL.json" <<'EOF2' | tee -a "$WORK/results/turn_timings_$MODEL.txt" || true
+import json, sys
+s = json.load(open(sys.argv[1])); sc, p = s["scheduler"], s["pipeline"]
+print(f"  4B decode: {1000 * sc['decode_s'] / max(1, sc['decode_steps']):.0f} ms per step, "
+      f"{sc['decode_rows'] / max(1, sc['decode_steps']):.1f} calls per step (max {sc['max_batch']}), "
+      f"prefill {sc['prefill_s']:.0f} s for {sc['prefill_tokens']} tokens")
+t = max(1, p["listener_ticks"])
+print(f"  listener thread: {1000 * (p['listener_s'] + p['vad_eot_s']) / t:.0f} ms per 40 ms tick on average "
+      f"(listener {1000 * p['listener_s'] / t:.0f}, VAD + end-of-turn {1000 * p['vad_eot_s'] / t:.0f}), "
+      f"max {1000 * p.get('tick_max_s', 0):.0f} ms, ticks over 80 ms: {p.get('ticks_over_80ms', '-')}")
+EOF2
 say "results: $WORK/results/pipeline_$MODEL.json, server stats: $WORK/results/server_stats_$MODEL.json"

@@ -9,7 +9,7 @@ import sys
 
 rows = [dict(re.findall(r"(\w+)=(-?\d+)", line)) for line in open(sys.argv[1]) if line.startswith("[turn]")]
 print(f"server side, {len(rows)} turns, ms from the end-of-turn decision (endpoint_wait: silence before it):")
-for key in ("endpoint_wait", "listener_wait", "first_token", "first_audio", "tts_first"):
+for key in ("listener_lag", "endpoint_wait", "listener_wait", "first_token", "first_audio", "tts_first"):
     v = sorted(int(r[key]) for r in rows if key in r)
     if v:
         print(f"  {key:14s} median {statistics.median(v):7.0f}   p95 {v[round(0.95 * (len(v) - 1))]:7.0f}")

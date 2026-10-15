@@ -48,7 +48,9 @@ class Call:
         self.inbox: collections.deque = collections.deque()       # 16 kHz float32 chunks from the socket
         self.pending: collections.deque = collections.deque()     # (k, 80 ms frame) waiting for its vector
         self.stream = pipe.listener.new_stream()
-        self.ep = Endpointer.from_config(pipe.cfg.runtime.endpoint, 80.0, 16000)
+        self.ep = Endpointer.from_config(pipe.cfg.runtime.endpoint, 80.0, 16000,
+                                         vad_stream=pipe.vad.stream() if pipe.vad is not None else None)
+        self.vad_k = -1                                            # last frame given to the batched VAD
         self.listening = False
         self.buf = np.zeros(0, np.float32)                         # audio not yet cut into 80 ms frames
         self.samples = 0                                           # 80 ms frames of audio seen so far
@@ -67,13 +69,13 @@ class Call:
     # ---------------------------------------------------------- listener thread
     def take_audio(self) -> None:
         while self.inbox:
-            x = self.inbox.popleft()
+            t_in, x = self.inbox.popleft()
             self.stream.push(x)  # the listener hears everything (its frame k = audio frame k)
             self.buf = np.concatenate([self.buf, x])
             while len(self.buf) >= HOP:
                 frame, self.buf = self.buf[:HOP], self.buf[HOP:]
                 if self.listening:
-                    self.pending.append((self.samples, frame))
+                    self.pending.append((self.samples, frame, t_in))
                 self.samples += 1
 
     def run_endpoint(self) -> None:
@@ -82,10 +84,20 @@ class Call:
         the head never sees the pause and the turn waits for max_silence)."""
         available = self.f0 + len(self.frames)
         while self.pending and self.pending[0][0] + 1 <= available and self.turn_end is None:
-            k, frame = self.pending.popleft()
-            self._frame(frame, k)
+            k, frame, t_in = self.pending.popleft()
+            self._frame(frame, k, t_in)
 
-    def _frame(self, frame: np.ndarray, k: int) -> None:
+    def vad_frames(self) -> list:
+        """Frames run_endpoint will look at next, for the batched VAD (each frame classified exactly once)."""
+        if self.turn_end is not None or self.ep.vad is None or not hasattr(self.ep.vad, "pre"):
+            return []
+        available = self.f0 + len(self.frames)
+        new = [(k, f) for k, f, _ in self.pending if self.vad_k < k < available]
+        if new:
+            self.vad_k = new[-1][0]
+        return [(self.ep.vad, f) for _, f in new]
+
+    def _frame(self, frame: np.ndarray, k: int, t_in: float = 0.0) -> None:
         ep = self.ep
         if self.turn_end is not None:
             return
@@ -101,7 +113,9 @@ class Call:
             eot = self.pipe.eot(self.vectors(self.turn_start, k + 1))
         if ep.update(frame, eot):
             self.turn_end, self.t_endpoint = k + 1, time.perf_counter()
-            self.end_info = {"reason": ep.reason, "endpoint_wait": int(ep.silence_ms), "eot_pct": int(eot * 100)}
+            self.end_info = {"reason": ep.reason, "endpoint_wait": int(ep.silence_ms), "eot_pct": int(eot * 100),
+                             # the server decided this long after that audio arrived: > ~100 ms = listener behind
+                             "listener_lag": round((self.t_endpoint - t_in) * 1000) if t_in else 0}
             return
         if ep.speech_ms < ep.min_speech_ms and ep.silence_ms >= ep.max_silence_ms:
             self.turn_start = None  # a click or a cough
@@ -173,10 +187,16 @@ class Pipeline:
                                     (start.detach(), end.detach()), eos_ids=self.th.eos_ids,
                                     im_end_id=self.th.im_end_id, prefill_budget=args.prefill_budget)
         self.sched.start()
+        self.vad = None
+        if str(cfg.runtime.endpoint.get("vad", "energy")) == "silero":
+            from s2s.runtime.endpoint import BatchedSileroVAD
+
+            self.vad = BatchedSileroVAD()  # one model, all calls' windows in one batch
         self.tts = ExternalTTS(args.tts_url)
         self.calls: list[Call] = []
         self.calls_lock = threading.Lock()
-        self.stats = {"listener_ticks": 0, "listener_s": 0.0, "vad_eot_s": 0.0, "turns": 0}
+        self.stats = {"listener_ticks": 0, "listener_s": 0.0, "vad_eot_s": 0.0, "turns": 0, "tick_max_s": 0.0,
+                      "ticks_over_80ms": 0}
         self.stop = False
         threading.Thread(target=self._listen_loop, daemon=True).start()
         print(f"[batch_live] {args.speech_llm_dir} on {device} (listener {enc_dev}), up to {args.max_calls} calls, "
@@ -205,14 +225,24 @@ class Pipeline:
                     c.take_audio()
             t1 = time.perf_counter()
             res = self.listener.step([c.stream for c in calls])
+            t2 = time.perf_counter()
+            items = []
             for c in calls:
                 with c.lock:
                     c.add_frames(res.get(id(c.stream), []))
+                    items += c.vad_frames()
+            if items:
+                self.vad.run(items)  # all calls' new frames through the voice detector at once
+            for c in calls:
+                with c.lock:
                     c.run_endpoint()
                     c.dispatch()
+            t3 = time.perf_counter()
             self.stats["listener_ticks"] += 1
-            self.stats["vad_eot_s"] += t1 - t0
-            self.stats["listener_s"] += time.perf_counter() - t1
+            self.stats["vad_eot_s"] += (t1 - t0) + (t3 - t2)
+            self.stats["listener_s"] += t2 - t1
+            self.stats["tick_max_s"] = max(self.stats["tick_max_s"], t3 - t0)
+            self.stats["ticks_over_80ms"] += t3 - t0 > 0.08
             time.sleep(max(0.0, 0.04 - (time.perf_counter() - t0)))
 
 
@@ -381,7 +411,8 @@ def build_app(pipe: Pipeline):
                     if call.conv is None:
                         continue
                     x = np.frombuffer(msg["bytes"], dtype="<i2").astype(np.float32) / 32768.0
-                    call.inbox.append(x if state["in_sr"] == 16000 else resample(x, state["in_sr"], 16000))
+                    call.inbox.append((time.perf_counter(),
+                                       x if state["in_sr"] == 16000 else resample(x, state["in_sr"], 16000)))
                     continue
                 try:
                     data = json.loads(msg.get("text") or "{}")
