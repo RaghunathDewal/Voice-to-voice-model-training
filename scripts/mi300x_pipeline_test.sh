@@ -163,6 +163,24 @@ for i in $(seq 0 $(( N_TTS - 1 ))); do
     [ "$i" = 0 ] && wait_tts "$port"   # the first one alone: it downloads the model and voices for the others
 done
 for i in $(seq 1 $(( N_TTS - 1 ))); do wait_tts $(( 7791 + i )); done
+start_tts() {  # start_tts [extra args]: all N_TTS servers again (the first alone), wait until they answer
+    pkill -f "kokoro_tts_server.py" 2>/dev/null || true; sleep 2
+    for i in $(seq 0 $(( N_TTS - 1 ))); do
+        port=$(( 7791 + i ))
+        nohup python s2s/cli/kokoro_tts_server.py --device cuda:0 --port "$port" "$@" > "$WORK/logs/tts_$port.log" 2>&1 &
+        [ "$i" = 0 ] && wait_tts "$port"
+    done
+    for i in $(seq 1 $(( N_TTS - 1 ))); do wait_tts $(( 7791 + i )); done
+}
+# phrase times on the first server, 6 new lengths (as in calls); prints the times and their median last
+P=$(python scripts/tts_probe.py http://127.0.0.1:7791/tts)
+say "Kokoro phrase times (ms, 6 new lengths; last = median): $P"
+if [ "${P##* }" -gt "${TTS_SLOW_MS:-400}" ]; then
+    say "Kokoro is slow on this GPU: restarting the voice servers with --no-cudnn (no MIOpen kernel search)"
+    start_tts --no-cudnn
+    P=$(python scripts/tts_probe.py http://127.0.0.1:7791/tts)
+    say "Kokoro phrase times with --no-cudnn (ms; last = median): $P"
+fi
 say "voice servers up"
 
 say ">>> batched /live server (adapter $MODEL, up to $MAX_CALLS calls)"
@@ -180,4 +198,5 @@ python -m s2s.eval.load_test --url ws://127.0.0.1:7860/live --concurrency $LEVEL
     --out "$WORK/results/pipeline_$MODEL.json" 2>&1 | grep -v -e "Warning" -e "warn("
 curl -sf http://127.0.0.1:7860/health > "$WORK/results/server_stats_$MODEL.json" || true
 cp "$WORK/logs/server.log" "$WORK/results/server_$MODEL.log" 2>/dev/null || true
+python scripts/turn_timings.py "$WORK/logs/server.log" | tee "$WORK/results/turn_timings_$MODEL.txt" || true
 say "results: $WORK/results/pipeline_$MODEL.json, server stats: $WORK/results/server_stats_$MODEL.json"

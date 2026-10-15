@@ -33,7 +33,11 @@ def main() -> None:
     p.add_argument("--keep-silence", action="store_true", help="do not trim the silence around each phrase")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=7791)
+    p.add_argument("--no-cudnn", action="store_true", help="plain PyTorch convolutions (AMD: skips MIOpen, whose "
+                   "kernel search for every new phrase length can take seconds)")
     args = p.parse_args()
+    if args.no_cudnn:
+        torch.backends.cudnn.enabled = False
 
     from kokoro import KModel, KPipeline
 

@@ -57,6 +57,7 @@ class Call:
         self.turn_start: int | None = None                         # frame index where the turn's speech starts
         self.turn_end: int | None = None                           # set at the end of turn, until dispatched
         self.t_endpoint = 0.0
+        self.end_info: dict = {}
         self.turns: asyncio.Queue = asyncio.Queue()
         self.conv = None
         self.first_turn = True
@@ -90,12 +91,14 @@ class Call:
             eot = self.pipe.eot(self.vectors(self.turn_start, k + 1))
         if ep.update(frame, eot):
             self.turn_end, self.t_endpoint = k + 1, time.perf_counter()
+            self.end_info = {"reason": ep.reason, "endpoint_wait": int(ep.silence_ms), "eot_pct": int(eot * 100)}
             return
         if ep.speech_ms < ep.min_speech_ms and ep.silence_ms >= ep.max_silence_ms:
             self.turn_start = None  # a click or a cough
             ep.reset()
         elif k + 1 - self.turn_start >= 30 * 12.5:
             self.turn_end, self.t_endpoint = k + 1, time.perf_counter()
+            self.end_info = {"reason": "max_length", "endpoint_wait": 0}
 
     def add_frames(self, frames: list[torch.Tensor]) -> None:
         self.frames.extend(frames)
@@ -114,9 +117,10 @@ class Call:
             return
         lat = self.vectors(self.turn_start, self.turn_end + 1)
         t_end = self.t_endpoint
+        info = {**self.end_info, "listener_wait": round((time.perf_counter() - t_end) * 1000)}
         self.turn_start = self.turn_end = None
         self.listening = False  # half duplex: until the reply has played
-        self.loop.call_soon_threadsafe(self.turns.put_nowait, ("audio", lat, t_end))
+        self.loop.call_soon_threadsafe(self.turns.put_nowait, ("audio", lat, t_end, info))
 
 
 class Pipeline:
@@ -235,6 +239,7 @@ def build_app(pipe: Pipeline):
             """One guest turn: reply tokens -> tool calls / phrases -> audio; tool rounds until a reply."""
             out_sr = state["out_sr"]
             play_end, t_ref = loop.time(), timings.pop("_t_end")
+            t_tts: dict = {}
             for round_idx in range(int(pipe.cfg.runtime.max_tool_rounds) + 1):
                 q: asyncio.Queue = asyncio.Queue()
                 pipe.sched.submit(Job(call.conv, pieces, max_new=int(pipe.cfg.runtime.max_new_tokens),
@@ -257,7 +262,10 @@ def build_app(pipe: Pipeline):
                         wav, rate = fut.result()
                         if rate != out_sr:
                             wav = resample(wav, rate, out_sr)
-                        timings.setdefault("first_audio", round((time.perf_counter() - t_ref) * 1000))
+                        if "first_audio" not in timings:
+                            timings["first_audio"] = round((time.perf_counter() - t_ref) * 1000)
+                            if t_tts.get("t"):
+                                timings["tts_first"] = round((time.perf_counter() - t_tts["t"]) * 1000)
                         await send((np.clip(wav, -1, 1) * 32767).astype("<i2").tobytes())
                         play_end = max(play_end, loop.time() + 0.15) + len(wav) / out_sr
 
@@ -283,6 +291,8 @@ def build_app(pipe: Pipeline):
                         spoken.append(tok)
                         if speakable(piece) or not piece.strip():
                             phrases.push(piece)
+                            if phrases.sent and "t" not in t_tts:
+                                t_tts["t"] = time.perf_counter()  # the first phrase went to the voice
                     await flush()
                 await flush(final=True)
                 phrases.pool.shutdown(wait=False)
@@ -307,12 +317,13 @@ def build_app(pipe: Pipeline):
                     results.append(res if isinstance(res, dict) else {"result": res})
                 pieces = [("ids", prompts.tool_response_ids(results))]
             await asyncio.sleep(max(0.0, play_end + 0.2 - loop.time()))  # let the reply play out
+            print("[turn] " + " ".join(f"{k}={v}" for k, v in timings.items()), flush=True)
             await send({"type": "turn_complete", "timings_ms": timings})
 
         async def turns_worker():
             while True:
-                kind, payload, t_end = await call.turns.get()
-                timings: dict = {"_t_end": t_end}
+                kind, payload, t_end, info = await call.turns.get()
+                timings: dict = {"_t_end": t_end, **info}
                 try:
                     if kind == "audio":
                         text = pipe.transcript(payload) if payload is not None else ""
@@ -370,7 +381,7 @@ def build_app(pipe: Pipeline):
                     await send({"type": "setup_complete"})
                 elif kind == "text" and call.conv is not None and str(data.get("text", "")).strip():
                     call.listening = False
-                    call.turns.put_nowait(("text", str(data["text"]), time.perf_counter()))
+                    call.turns.put_nowait(("text", str(data["text"]), time.perf_counter(), {"reason": "text"}))
                 elif kind == "tool_response":
                     fut = tool_waits.get(data.get("id")) or (next(iter(tool_waits.values())) if len(tool_waits) == 1 else None)
                     if fut is not None and not fut.done():
