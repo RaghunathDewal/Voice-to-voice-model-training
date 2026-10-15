@@ -755,6 +755,22 @@ def test_batched_thinker_matches_hf_model(tiny_models, cpu):
         refs = [_hf_greedy(model, emb(p), 6) for p in prompts]
     assert got == refs
 
+    # several prefills in one forward, rows right-padded: same logits as each alone, and the padding never leaks
+    eng2 = BatchedThinker(model, slots=4, max_tokens=64, device=cpu, dtype=torch.float32)
+    slots2 = [eng2.alloc() for _ in prompts]
+    x = torch.zeros(len(prompts), 13, emb.embedding_dim)
+    for j, p in enumerate(prompts):
+        x[j, : len(p)] = emb(p)
+    with torch.no_grad():
+        first2 = eng2.forward(slots2, x, n=[len(p) for p in prompts]).argmax(-1).tolist()
+        assert [eng2.lengths[s] for s in slots2] == [len(p) for p in prompts] and first2 == first
+        toks, got2 = first2, [[t] for t in first2]
+        for _ in range(5):
+            toks = eng2.forward(slots2, emb(torch.tensor(toks))[:, None]).argmax(-1).tolist()
+            for g, t in zip(got2, toks):
+                g.append(t)
+    assert got2 == refs
+
 
 def test_batch_scheduler_serves_concurrent_calls(tiny_models, cpu):
     """Calls submitted at once (text + speech pieces, several turns): every reply equals the same conversation

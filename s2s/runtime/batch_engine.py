@@ -76,9 +76,13 @@ class BatchedThinker:
 
     # ---------------------------------------------------------------- forward
     @torch.no_grad()
-    def forward(self, slots: list[int], x: torch.Tensor, all_positions: bool = False) -> torch.Tensor:
+    def forward(self, slots: list[int], x: torch.Tensor, all_positions: bool = False,
+                n: list[int] | None = None) -> torch.Tensor:
         """x [B, T, H] input embeddings, row b continuing conversation slots[b] at its current length.
-        Returns logits at the last position [B, V] (all positions: [B, T, V]). Rows are appended in place."""
+        Returns logits at the last position [B, V] (all positions: [B, T, V]). Rows are appended in place.
+        n: real length of each row (rows right-padded to T, e.g. several prefills at once): the logits are taken at
+        each row's last real position and its length grows by n[b]; the padding written past it is never attended
+        (keys <= own position) and is overwritten by the row's next tokens."""
         b, t, _ = x.shape
         for s in slots:
             if self.lengths[s] + t > self.max_tokens:
@@ -110,8 +114,10 @@ class BatchedThinker:
             o = self._attend(q, kb, vb, mask, at.scaling)
             x = x + at.o_proj(o.transpose(1, 2).reshape(b, t, self.hq * self.dim))
             x = x + layer.mlp(layer.post_attention_layernorm(x))
-        for s in slots:
-            self.lengths[s] += t
+        for j, s in enumerate(slots):
+            self.lengths[s] += t if n is None else n[j]
+        if n is not None and not all_positions:
+            x = x[torch.arange(b, device=x.device), torch.tensor(n, device=x.device) - 1][:, None]
         x = self.base.norm(x if all_positions else x[:, -1:])
         logits = self.model.lm_head(x)
         return logits if all_positions else logits[:, -1]
@@ -186,11 +192,17 @@ class BatchScheduler(threading.Thread):
 
     # ----------------------------------------------------------------- loop
     def run(self) -> None:
+        import contextlib
+
+        # its own GPU stream: the listener (another thread, its own stream) never queues behind 4B work
+        dev = torch.device(self.engine.device)
+        ctx = torch.cuda.stream(torch.cuda.Stream(dev)) if dev.type == "cuda" else contextlib.nullcontext()
         try:
-            while not self.stop_flag:
-                self._take(block=not (self.prefilling or self.answering))
-                self._prefill_step()
-                self._decode_step()
+            with ctx:
+                while not self.stop_flag:
+                    self._take(block=not (self.prefilling or self.answering))
+                    self._prefill_step()
+                    self._decode_step()
         except BaseException as e:  # noqa: BLE001 - report to the caller, never hang it
             self.error = e
             for c in self.prefilling + self.answering:
@@ -245,26 +257,41 @@ class BatchScheduler(threading.Thread):
 
     @torch.no_grad()
     def _prefill_step(self) -> None:
-        budget = self.prefill_budget
-        while self.prefilling and budget > 0:
-            conv = self.prefilling[0]
+        """Up to `prefill_budget` tokens of the waiting prefills in ONE forward (rows right-padded to the longest):
+        with many calls, turns start in bursts, and one forward per call costs the per-pass overhead each time."""
+        rows, budget = [], self.prefill_budget
+        for conv in self.prefilling:
             if conv.stats["queued_ms"] == 0.0:
                 conv.stats["queued_ms"] = (time.perf_counter() - conv.job.submitted) * 1000
-            t0 = time.perf_counter()
-            logits = None
+            left = 0 if conv.embeds is None else int(conv.embeds.shape[0])
+            n = min(budget, left)
+            if left and n <= 0:
+                break
+            rows.append((conv, n))
+            budget -= n
+        if not rows:
+            return
+        t0 = time.perf_counter()
+        logits = {}
+        fed = [(c, n) for c, n in rows if n]
+        if fed:
+            T = max(n for _, n in fed)
+            x = torch.zeros(len(fed), T, fed[0][0].embeds.shape[1], dtype=self.engine.dtype, device=self.engine.device)
+            for j, (c, n) in enumerate(fed):
+                x[j, :n] = c.embeds[:n]
+                c.embeds = c.embeds[n:]
+            out = self.engine.forward([c.slot for c, _ in fed], x, n=[n for _, n in fed])
+            logits = {id(c): out[j] for j, (c, _) in enumerate(fed)}
+            self.stats["prefill_tokens"] += sum(n for _, n in fed)
+        self.stats["prefill_s"] += time.perf_counter() - t0
+        for conv, _ in rows:
             if conv.embeds is not None and conv.embeds.shape[0]:
-                n = min(budget, conv.embeds.shape[0])
-                logits = self.engine.forward([conv.slot], conv.embeds[None, :n])[0]
-                conv.embeds = conv.embeds[n:]
-                budget -= n
-                self.stats["prefill_tokens"] += n
-            self.stats["prefill_s"] += time.perf_counter() - t0
-            if conv.embeds is not None and conv.embeds.shape[0]:
-                return  # the rest of this prefill next step: answering calls go first
-            self.prefilling.pop(0)
+                continue  # the rest of this prefill next step: answering calls go first
+            self.prefilling.remove(conv)
             conv.stats["prefill_ms"] = (time.perf_counter() - conv.job.submitted) * 1000
-            if conv.job.generate and logits is not None:
-                self._emit(conv, self._sample(logits[None], [conv.job.temperature])[0])
+            lg = logits.get(id(conv))
+            if conv.job.generate and lg is not None:
+                self._emit(conv, self._sample(lg[None], [conv.job.temperature])[0])
             else:
                 self._finish(conv, "fed")
 

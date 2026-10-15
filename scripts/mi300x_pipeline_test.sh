@@ -211,5 +211,8 @@ t = max(1, p["listener_ticks"])
 print(f"  listener thread: {1000 * (p['listener_s'] + p['vad_eot_s']) / t:.0f} ms per 40 ms tick on average "
       f"(listener {1000 * p['listener_s'] / t:.0f}, VAD + end-of-turn {1000 * p['vad_eot_s'] / t:.0f}), "
       f"max {1000 * p.get('tick_max_s', 0):.0f} ms, ticks over 80 ms: {p.get('ticks_over_80ms', '-')}")
+li = s["listener"]
+print(f"  listener passes: {li['passes']} ({li['passes'] / t:.1f} per tick), {li['chunks'] / max(1, li['passes']):.1f} "
+      f"chunks per pass (max {li['max_batch']})")
 EOF2
 say "results: $WORK/results/pipeline_$MODEL.json, server stats: $WORK/results/server_stats_$MODEL.json"

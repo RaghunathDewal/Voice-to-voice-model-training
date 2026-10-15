@@ -186,6 +186,8 @@ class Pipeline:
         self.sched = BatchScheduler(self.engine, lambda ids: emb(torch.tensor(ids, device=device)), self.adapter,
                                     (start.detach(), end.detach()), eos_ids=self.th.eos_ids,
                                     im_end_id=self.th.im_end_id, prefill_budget=args.prefill_budget)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)  # weights and caches ready before the worker threads use their own streams
         self.sched.start()
         self.vad = None
         if str(cfg.runtime.endpoint.get("vad", "energy")) == "silero":
@@ -216,6 +218,10 @@ class Pipeline:
         return ctc_greedy_decode(ids)
 
     def _listen_loop(self) -> None:
+        # its own high-priority GPU stream: listener passes and end-of-turn checks run alongside the 4B instead of
+        # queuing behind its prefill bursts (on the shared default stream one tick waited 17.9 s)
+        if self.device.type == "cuda":
+            torch.cuda.set_stream(torch.cuda.Stream(self.device, priority=-1))
         while not self.stop:
             t0 = time.perf_counter()
             with self.calls_lock:
