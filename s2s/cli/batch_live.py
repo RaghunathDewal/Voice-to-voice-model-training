@@ -46,6 +46,7 @@ class Call:
         self.pipe, self.loop = pipe, loop
         self.lock = threading.Lock()
         self.inbox: collections.deque = collections.deque()       # 16 kHz float32 chunks from the socket
+        self.pending: collections.deque = collections.deque()     # (k, 80 ms frame) waiting for its vector
         self.stream = pipe.listener.new_stream()
         self.ep = Endpointer.from_config(pipe.cfg.runtime.endpoint, 80.0, 16000)
         self.listening = False
@@ -72,8 +73,17 @@ class Call:
             while len(self.buf) >= HOP:
                 frame, self.buf = self.buf[:HOP], self.buf[HOP:]
                 if self.listening:
-                    self._frame(frame, self.samples)
+                    self.pending.append((self.samples, frame))
                 self.samples += 1
+
+    def run_endpoint(self) -> None:
+        """Voice activity + end-of-turn rule on the audio frames whose listener vectors exist already, so the
+        end-of-turn head sees the same silence as the voice detector (deciding on audio ahead of the vectors,
+        the head never sees the pause and the turn waits for max_silence)."""
+        available = self.f0 + len(self.frames)
+        while self.pending and self.pending[0][0] + 1 <= available and self.turn_end is None:
+            k, frame = self.pending.popleft()
+            self._frame(frame, k)
 
     def _frame(self, frame: np.ndarray, k: int) -> None:
         ep = self.ep
@@ -102,7 +112,12 @@ class Call:
 
     def add_frames(self, frames: list[torch.Tensor]) -> None:
         self.frames.extend(frames)
-        keep_from = self.turn_start if self.turn_start is not None else self.f0 + len(self.frames) - 8
+        if self.turn_start is not None:
+            keep_from = self.turn_start
+        elif self.pending:  # frames not yet through the end-of-turn rule: a turn may start there (with pre-roll)
+            keep_from = self.pending[0][0] - self.preroll
+        else:
+            keep_from = self.f0 + len(self.frames) - 8
         drop = max(0, keep_from - self.f0)
         if drop:
             self.frames, self.f0 = self.frames[drop:], self.f0 + drop
@@ -120,6 +135,7 @@ class Call:
         info = {**self.end_info, "listener_wait": round((time.perf_counter() - t_end) * 1000)}
         self.turn_start = self.turn_end = None
         self.listening = False  # half duplex: until the reply has played
+        self.pending.clear()
         self.loop.call_soon_threadsafe(self.turns.put_nowait, ("audio", lat, t_end, info))
 
 
@@ -192,6 +208,7 @@ class Pipeline:
             for c in calls:
                 with c.lock:
                     c.add_frames(res.get(id(c.stream), []))
+                    c.run_endpoint()
                     c.dispatch()
             self.stats["listener_ticks"] += 1
             self.stats["vad_eot_s"] += t1 - t0
@@ -340,6 +357,14 @@ def build_app(pipe: Pipeline):
                     await generate(pieces, timings)
                 except (WebSocketDisconnect, RuntimeError):
                     return
+                except Exception as e:  # noqa: BLE001 - never lose a call silently: report it and keep listening
+                    import traceback
+
+                    traceback.print_exc()
+                    try:
+                        await send({"type": "error", "message": repr(e)})
+                    except Exception:  # noqa: BLE001
+                        return
                 finally:
                     with call.lock:
                         call.ep.reset()
@@ -414,8 +439,14 @@ def main() -> None:
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=7860)
     p.add_argument("--set", nargs="*", default=[], help="config overrides, key=value")
+    p.add_argument("--cudnn", action="store_true", help="AMD: keep MIOpen convolutions (by default off: its kernel "
+                   "search for every new batch / length shape stalls the listener for seconds)")
     args = p.parse_args()
     import uvicorn
+
+    if torch.version.hip and not args.cudnn:
+        torch.backends.cudnn.enabled = False
+        print("[batch_live] AMD GPU: MIOpen off (plain PyTorch convolutions)", flush=True)
 
     pipe = Pipeline(args)
     uvicorn.run(build_app(pipe), host=args.host, port=args.port, log_level="warning", ws_max_size=2**24)

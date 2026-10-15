@@ -149,7 +149,9 @@ assert os.path.exists(f"checkpoints/{name}/adapter.pt"), f"{name} not found"
 print(f"{name}: downloaded", flush=True)
 EOF
 
-say ">>> $N_TTS Kokoro voice servers on the GPU"
+# AMD: Kokoro without MIOpen (its kernel search per phrase length made phrases take 0.5-4.7 s instead of ~0.2 s)
+KOKORO_ARGS=${KOKORO_ARGS:-$(python -c "import torch; print('--no-cudnn' if torch.version.hip else '')")}
+say ">>> $N_TTS Kokoro voice servers on the GPU ${KOKORO_ARGS}"
 pkill -f "kokoro_tts_server.py" 2>/dev/null || true
 URLS=""
 wait_tts() {
@@ -158,7 +160,7 @@ wait_tts() {
 }
 for i in $(seq 0 $(( N_TTS - 1 ))); do
     port=$(( 7791 + i ))
-    nohup python s2s/cli/kokoro_tts_server.py --device cuda:0 --port "$port" > "$WORK/logs/tts_$port.log" 2>&1 &
+    nohup python s2s/cli/kokoro_tts_server.py --device cuda:0 --port "$port" $KOKORO_ARGS > "$WORK/logs/tts_$port.log" 2>&1 &
     URLS="$URLS${URLS:+,}http://127.0.0.1:$port/tts"
     [ "$i" = 0 ] && wait_tts "$port"   # the first one alone: it downloads the model and voices for the others
 done
