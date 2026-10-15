@@ -127,6 +127,13 @@ if ! "$VENV/bin/python" -c "import kokoro, fastapi, uvicorn, websockets, silero_
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq espeak-ng >/dev/null 2>&1 || true
     uv pip install -p "$VENV/bin/python" -q "kokoro>=0.9.4" "misaki[en]" loguru fastapi uvicorn websockets silero-vad
 fi
+# Kokoro's English front-end needs spaCy's small model; installed once here (8 servers installing it at the same
+# time on first start race each other and break the install)
+if ! "$VENV/bin/python" -c "import en_core_web_sm" 2>/dev/null; then
+    say ">>> setup: spaCy English model for Kokoro"
+    uv pip install -p "$VENV/bin/python" -q --reinstall \
+        "en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl"
+fi
 export PATH="$VENV/bin:$PATH" PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=false
 python -c "import torch; assert torch.cuda.is_available(), 'no GPU visible'; print(torch.__version__, torch.cuda.get_device_name(0))"
 
@@ -145,16 +152,17 @@ EOF
 say ">>> $N_TTS Kokoro voice servers on the GPU"
 pkill -f "kokoro_tts_server.py" 2>/dev/null || true
 URLS=""
+wait_tts() {
+    for _ in $(seq 1 120); do curl -sf "http://127.0.0.1:$1/health" > /dev/null 2>&1 && return 0; sleep 5; done
+    tail -20 "$WORK/logs/tts_$1.log"; say "Kokoro on $1 did not start"; exit 1
+}
 for i in $(seq 0 $(( N_TTS - 1 ))); do
     port=$(( 7791 + i ))
     nohup python s2s/cli/kokoro_tts_server.py --device cuda:0 --port "$port" > "$WORK/logs/tts_$port.log" 2>&1 &
     URLS="$URLS${URLS:+,}http://127.0.0.1:$port/tts"
+    [ "$i" = 0 ] && wait_tts "$port"   # the first one alone: it downloads the model and voices for the others
 done
-for i in $(seq 0 $(( N_TTS - 1 ))); do
-    port=$(( 7791 + i ))
-    for _ in $(seq 1 120); do curl -sf "http://127.0.0.1:$port/health" > /dev/null 2>&1 && break; sleep 5; done
-    curl -sf "http://127.0.0.1:$port/health" > /dev/null || { tail -20 "$WORK/logs/tts_$port.log"; say "Kokoro on $port did not start"; exit 1; }
-done
+for i in $(seq 1 $(( N_TTS - 1 ))); do wait_tts $(( 7791 + i )); done
 say "voice servers up"
 
 say ">>> batched /live server (adapter $MODEL, up to $MAX_CALLS calls)"
