@@ -10,64 +10,31 @@ adapter:
   n_heads: 8
   max_frames: 400
 
-# Settings the run script (scripts/kaggle_v3.sh) also passes on the command line (--set) win over this file:
-# the data mix (train_manifests), output/start folders, and the time budget (max_minutes) change per run.
-# The exact settings of a finished run are saved next to its weights: checkpoints/<run>/config.yaml.
-
-train_align:                # STAGE A (s2s/train/align_adapter.py): the adapter alone, against the 4B's word-vector table
+train_align:
   output_dir: checkpoints/speech_llm_v3a
   init_output_from: checkpoints/speech_llm_4b_v2   # its output layers already speak to this 4B
-                            # v4: resume_from=checkpoints/speech_llm_v3 (the whole finished v3 adapter)
-  batch_size: 32            # clips per GPU per update: large, because the 4B is not loaded
-  lr: 1.0e-3                # v3: a mostly fresh adapter needs big steps. v4: 3e-4 (already trained, started from v3)
-  warmup_steps: 1000        # learning rate rises from 0 to full over these updates. v4: 500
-  max_steps: 200000         # only a CAP: the run is cut by the time budget below (v3 ran 14,875 updates, v4 6,292)
-  max_minutes: 0            # time budget; 0 = off. The script sets it (v4: 210 min); at steps 30 and 150 the
-                            # trainer shrinks max_steps to what fits, so the cosine schedule still ends low
-  weight_decay: 0.01        # mild pull of the weights toward zero (against memorising)
-  max_grad_norm: 1.0        # cap the size of any single update (guard against blow-ups)
-  eot_early_frames: 3       # learn to spot the end of the guest's sentence 240 ms early, so the reply starts sooner
-  eval_every: 2000          # check on the validation set every 2000 updates
-  eval_batches: 20          # batches used for that check
-  save_every: 2000          # save a checkpoint every 2000 updates
-  log_every: 100            # print the losses every 100 updates
-  num_workers: 4            # data-loading processes per GPU
+  batch_size: 32
+  lr: 1.0e-3
+  warmup_steps: 1000
+  max_steps: 200000
+  eot_early_frames: 3
+  eval_every: 2000
+  save_every: 2000
+  log_every: 100
+  num_workers: 4
 
-train_speech_llm:           # STAGE B (s2s/train/speech_llm.py): the full frozen 4B in the loop, adapter (+ LoRA) trained
+train_speech_llm:
   output_dir: checkpoints/speech_llm_v3
-  init_from: checkpoints/speech_llm_v3a   # start from the Stage A adapter. v4: speech_llm_v4a (+ v3's lora/)
-  train_lora: false         # v3: adapter only. v4: true (the script passes it), training the LoRA on the 4B
-                            # (r=16, alpha=32, dropout 0.05, all 7 projections: thinker.lora in default.yaml)
-  # --- batch: 4 clips x 8 accumulated = 32 per GPU per update (x 2 GPUs = 64 clips per update)
-  batch_size: 4             # what fits in a 16 GB T4 with the 4B loaded (it runs twice per clip: speech + teacher text)
-  grad_accum: 8             # add up 8 batches before each update: steady direction without more memory
-                            # (a big GPU: 16 x 2, the same 32 per GPU)
-  # --- length
-  max_steps: 20000          # only a CAP: cut by the time budget (v4 ran 483 updates in its 273 minutes)
-  max_minutes: 0            # time budget; 0 = off. The script sets it to the time left in the Kaggle session
-  # --- learning
+  init_from: checkpoints/speech_llm_v3a
+  train_lora: false
+  kd_weight: 1.0            # match the 4B reading the text (BLSP-KD)
+  ce_weight: 0.5            # targets are the 4B's own answers (DeSTA), so CE and KD agree
+  tok_weight: 1.0           # keep the word-level alignment from stage A (0.3 let one bad update knock it out)
+  eot_early_frames: 3
+  transcribe_prob: 0.35
   adapter_lr: 5.0e-5        # 2e-4 blew up at the end of warm-up (gradient 38,400, word loss 2 -> 159)
-  lora_lr: 1.0e-4           # LoRA step size (used when train_lora: true): gentle, keeps the 4B's language skill
-  warmup_steps: 300         # learning rate rises from 0 to full over 300 updates, then cosine decay to 10%
-  weight_decay: 0.01        # mild pull of the weights toward zero
-  # --- safety guards
-  max_grad_norm: 1.0        # cap the size of any single update
+  warmup_steps: 300
   skip_spike_factor: 10     # skip an update whose gradient is >10x the recent median
-  # --- what the model is scored on (how much each part counts; these do not stop training)
-  kd_weight: 1.0            # main goal: answer from speech the way the 4B answers from the typed text
-  ce_weight: 0.5            # also score the correct reply (half weight: it points the same way as kd)
-  tok_weight: 1.0           # keep what Stage A learned (lower let one bad update undo it)
-  eot_early_frames: 3       # learn to spot the end of the guest's sentence 240 ms early, so the reply starts sooner
-  # --- tasks and lengths
-  transcribe_prob: 0.35     # 35% of clips train "write what was said" instead of "answer the guest"
-  max_target_tokens: 160    # replies are cut to 160 tokens for training
-  max_trailing_frames: 8    # up to 8 frames (0.64 s) of silence kept after the speech, random per clip
-  # --- checking and saving (Stage B updates are slow, so often enough for a ~500-update run)
-  eval_every: 250           # check on the validation set every 250 updates
-  eval_batches: 10          # batches used for that check
-  save_every: 250           # save a checkpoint every 250 updates (a stopped session resumes from it)
-  log_every: 10             # print the losses every 10 updates
-  num_workers: 4            # data-loading processes per GPU
 
 runtime:
   speech_llm_dir: checkpoints/speech_llm_v3
