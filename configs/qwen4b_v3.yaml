@@ -26,10 +26,7 @@ train_align:                # STAGE A (s2s/train/align_adapter.py): the adapter 
                             # trainer shrinks max_steps to what fits, so the cosine schedule still ends low
   weight_decay: 0.01        # mild pull of the weights toward zero (against memorising)
   max_grad_norm: 1.0        # cap the size of any single update (guard against blow-ups)
-  tok_weight: 1.0           # loss 1: word alignment to the 4B's own word vectors (the main one)
-  ctc_weight: 0.3           # loss 2: spell the transcript (gives the server a confidence score)
-  eot_weight: 0.1           # loss 3: detect the end of the guest's turn
-  eot_early_frames: 3       # end-of-turn target starts 3 frames (240 ms) before the speech ends
+  eot_early_frames: 3       # learn to spot the end of the guest's sentence 240 ms early, so the reply starts sooner
   eval_every: 2000          # check on the validation set every 2000 updates
   eval_batches: 20          # batches used for that check
   save_every: 2000          # save a checkpoint every 2000 updates
@@ -56,13 +53,11 @@ train_speech_llm:           # STAGE B (s2s/train/speech_llm.py): the full frozen
   # --- safety guards
   max_grad_norm: 1.0        # cap the size of any single update
   skip_spike_factor: 10     # skip an update whose gradient is >10x the recent median
-  # --- losses
-  kd_weight: 1.0            # match the 4B reading the text (BLSP-KD)
-  ce_weight: 0.5            # targets are the 4B's own answers (DeSTA), so CE and KD agree
-  tok_weight: 1.0           # keep the word-level alignment from stage A (0.3 let one bad update knock it out)
-  ctc_weight: 0.3           # spell the transcript
-  eot_weight: 0.1           # end of turn
-  eot_early_frames: 3
+  # --- what the model is scored on (how much each part counts; these do not stop training)
+  kd_weight: 1.0            # main goal: answer from speech the way the 4B answers from the typed text
+  ce_weight: 0.5            # also score the correct reply (half weight: it points the same way as kd)
+  tok_weight: 1.0           # keep what Stage A learned (lower let one bad update undo it)
+  eot_early_frames: 3       # learn to spot the end of the guest's sentence 240 ms early, so the reply starts sooner
   # --- tasks and lengths
   transcribe_prob: 0.35     # 35% of clips train "write what was said" instead of "answer the guest"
   max_target_tokens: 160    # replies are cut to 160 tokens for training
