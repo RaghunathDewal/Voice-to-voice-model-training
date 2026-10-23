@@ -5,7 +5,7 @@
 #
 #  Kaggle: Add-ons -> Secrets -> HF_TOKEN (write token). Then, in a notebook (GPU T4 x2, Internet on):
 #     !git clone -q -b vision-qwen3vl https://github.com/RaghunathDewal/Voice-to-voice-model-training.git /tmp/repo
-#     !EVAL_DIR=/kaggle/input/<your-eval-dataset>/eval_data bash /tmp/repo/vision/run_kaggle.sh all
+#     !bash /tmp/repo/vision/run_kaggle.sh all      (eval set: fetched from HF, or EVAL_DIR=/kaggle/input/...)
 #  The cells, step by step: vision/README.md
 #  Phases: setup | data | train | eval | all
 #
@@ -44,7 +44,9 @@ LVIS_GROUPS=${LVIS_GROUPS:-"bedroom bathroom living kitchen building"}   # areas
 TOTAL_ROWS=${TOTAL_ROWS:-0}             # 0 = one counting row per image (+ grounding rows below)
 GROUND_SHARE=${GROUND_SHARE:-0.2}       # share of "locate every X" rows (boxes help counting)
 EXTRA=${EXTRA:-}                        # optional: your own rows, "path.jsonl:1.0 other.jsonl:1.0" (same format)
-EVAL_DIR=${EVAL_DIR:-}                  # folder with eval_frozen.json + images/ (HomeObjects VAL images)
+EVAL_DIR=${EVAL_DIR:-}                  # folder with eval_frozen.json + images/; empty = fetched from HF (below)
+EVAL_ZIP_REPO=${EVAL_ZIP_REPO:-$HF_USER/s2s-checkpoints}             # where your fine-tune zip with eval_data/ is
+EVAL_ZIP=${EVAL_ZIP:-Yesterday_Qwen3VL_FineTune_2026-10-21.zip}
 
 # ----------------------------------------------------------------------------------------- training settings
 EPOCHS=${EPOCHS:-1}                     # one pass over all images; the time budget may end it earlier
@@ -153,8 +155,24 @@ EOF
     say "checkpoints: $(ls -d "$OUT"/checkpoint-* | tr '\n' ' ')"
 }
 
+fetch_eval() {
+    # no EVAL_DIR given: download the zip from Hugging Face and use the eval_data/ folder inside it
+    [ -n "$EVAL_DIR" ] && return
+    mkdir -p /tmp/vl_eval
+    if [ -z "$(find /tmp/vl_eval -name eval_frozen.json | head -1)" ]; then
+        say ">>> eval set: $EVAL_ZIP from $EVAL_ZIP_REPO"
+        python -c "
+from huggingface_hub import hf_hub_download
+print(hf_hub_download('$EVAL_ZIP_REPO', '$EVAL_ZIP', local_dir='/tmp/vl_eval'))"
+        unzip -q -o "/tmp/vl_eval/$EVAL_ZIP" -d /tmp/vl_eval
+    fi
+    EVAL_DIR=$(dirname "$(find /tmp/vl_eval -name eval_frozen.json | head -1)")
+    say "EVAL_DIR=$EVAL_DIR ($(ls "$EVAL_DIR/images" | wc -l) images)"
+}
+
 evaluate() {
-    [ -n "$EVAL_DIR" ] || { echo "set EVAL_DIR=/kaggle/input/<dataset>/eval_data (eval_frozen.json + images/)"; exit 1; }
+    fetch_eval
+    [ -f "$EVAL_DIR/eval_frozen.json" ] || { echo "no eval_frozen.json in $EVAL_DIR"; exit 1; }
     ck=${ADAPTER:-$(latest_ckpt)}
     say ">>> eval: base vs $ck"
     python "$HERE/eval_counts.py" --eval-dir "$EVAL_DIR" --model "$MODEL" --adapter "$ck" --out "$WORK/eval_results.json"
@@ -169,7 +187,7 @@ case "${1:-}" in
     data) data ;;
     train) train ;;
     eval) hf_token; evaluate ;;
-    all) setup; data; train; [ -n "$EVAL_DIR" ] && evaluate || say "no EVAL_DIR: eval skipped" ;;
+    all) setup; data; train; hf_token; evaluate ;;
     *) sed -n 2,19p "$0"; exit 1 ;;
 esac
 say "done ($(( ($(date +%s) - SESSION_START) / 60 )) min since the session started)"

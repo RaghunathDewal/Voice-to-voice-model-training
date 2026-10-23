@@ -17,8 +17,9 @@ on Kaggle's free GPU T4 x2. One script, `run_kaggle.sh`, with the phases `setup`
 1. Notebook settings: **Accelerator GPU T4 x2**, **Internet on**.
 2. Add-ons -> Secrets -> **`HF_TOKEN`** (a token with WRITE access), switched on for this notebook.
    Checkpoints go to the private repo `ThunderBlade7773/qwen3vl-room-lora` (created on the first save).
-3. Upload your `eval_data` folder (`eval_frozen.json` + `images/`) as a Kaggle dataset and add it as an input.
-   It is HomeObjects **val** images, so it never overlaps the training images.
+3. Eval set: nothing to upload. The script downloads `Yesterday_Qwen3VL_FineTune_2026-10-21.zip` from
+   `ThunderBlade7773/s2s-checkpoints` and uses its `eval_data/` (79 HomeObjects **val** images, never in training).
+   To use another folder instead: `EVAL_DIR=/kaggle/input/...` in front of the eval command.
 
 ## Cells
 
@@ -27,9 +28,8 @@ on Kaggle's free GPU T4 x2. One script, `run_kaggle.sh`, with the phases `setup`
 import os
 from kaggle_secrets import UserSecretsClient
 os.environ["HF_TOKEN"] = UserSecretsClient().get_secret("HF_TOKEN")
-os.environ["EVAL_DIR"] = "/kaggle/input/<your-eval-dataset>/eval_data"   # change to your input's path
 !rm -rf /tmp/repo && git clone -q -b vision-qwen3vl https://github.com/RaghunathDewal/Voice-to-voice-model-training.git /tmp/repo
-print(os.listdir("/tmp/repo/vision"), os.listdir(os.environ["EVAL_DIR"])[:5])
+!ls /tmp/repo/vision
 ```
 
 **Cell 2: install (~5-10 min)**
