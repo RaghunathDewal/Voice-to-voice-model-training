@@ -19,6 +19,7 @@ import math
 import os
 import threading
 import time
+import warnings
 
 import torch
 import torch.distributed as dist
@@ -73,8 +74,10 @@ class TimeBudgetCallback(TrainerCallback):
         ratio = getattr(self.args, "warmup_ratio", 0) or (self.args.warmup_steps if 0 < self.args.warmup_steps < 1 else 0)
         warmup = math.ceil(ratio * total) if ratio else int(self.args.warmup_steps)
         sched = _cosine(self.trainer.optimizer, warmup, total)
-        for _ in range(state.global_step):
-            sched.step()
+        with warnings.catch_warnings():                  # fast-forward to the current update (resume)
+            warnings.simplefilter("ignore")
+            for _ in range(state.global_step):
+                sched.step()
         self.trainer.lr_scheduler = sched
         self.plan = {"total_steps": total, "warmup_steps": warmup}
         if _rank0():
@@ -133,6 +136,7 @@ class TimeBudgetCallback(TrainerCallback):
             api = HfApi()
             api.create_repo(self.repo, private=True, exist_ok=True)
             api.upload_folder(folder_path=ck, path_in_repo="last-checkpoint", repo_id=self.repo,
+                              ignore_patterns=["README.md"],   # its base_model is a local path: the Hub rejects it
                               delete_patterns=["*"], commit_message=f"checkpoint {os.path.basename(ck)}")
             cur = {f.lfs.sha256 for f in api.repo_info(self.repo, files_metadata=True).siblings if f.lfs}
             old = [f for f in api.list_lfs_files(self.repo) if f.file_oid not in cur]

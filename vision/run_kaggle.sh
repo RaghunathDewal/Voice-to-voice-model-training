@@ -32,6 +32,9 @@ export HF_CKPT_REPO=${HF_CKPT_REPO:-$HF_USER/qwen3vl-room-lora}   # private mode
 # image size: Qwen3-VL makes 1 token per 32x32 pixels. 768 tokens = ~0.79 MP (e.g. 1024x768). The SAME value is
 # used in training and in eval. 512 = ~30% faster (more images seen per hour), less detail on small objects.
 export IMAGE_MAX_TOKEN_NUM=${IMAGE_MAX_TOKEN_NUM:-768}
+# 4-bit base (QLoRA): QUANT=1. Off by default: on T4s (no native bf16) 4-bit ran ~165 s per update vs ~25-30 s
+# expected; the 4B in bf16 fits a 16 GB T4 with LoRA (~12 GB). Turn it on only on a GPU that runs out of memory.
+QUANT=${QUANT:-0}
 
 # ----------------------------------------------------------------------------------------- time
 SESSION_HOURS=${SESSION_HOURS:-10}      # what one Kaggle session may run (commit limit is 12 h; keep a margin)
@@ -141,14 +144,16 @@ EOF
     export TOTAL_HOURS=${TOTAL_HOURS:-$TRAIN_HOURS}
     rows=$(wc -l < "$DATA/sft/train.jsonl")
     say ">>> train: $rows rows, $NGPU GPU(s), image tokens $IMAGE_MAX_TOKEN_NUM, $TRAIN_HOURS h in this session" \
-        "(run planned for $TOTAL_HOURS h), checkpoints every $SAVE_STEPS updates -> ${HF_CKPT_REPO:-local only}"
+        "(run planned for $TOTAL_HOURS h), 4-bit=$QUANT, checkpoints every $SAVE_STEPS updates -> ${HF_CKPT_REPO:-local only}"
+    QUANT_ARGS=()
+    [ "$QUANT" = 1 ] && QUANT_ARGS=(--quant_method bnb --quant_bits 4 --bnb_4bit_compute_dtype bfloat16)
     NPROC_PER_NODE=$NGPU swift sft \
         --model "$MODEL" \
         --dataset "$DATA/sft/train.jsonl" \
         --val_dataset "$DATA/sft/val.jsonl" \
         --model_type qwen3_vl --tuner_type lora --use_hf true \
-        --quant_method bnb --quant_bits 4 \
-        --bnb_4bit_compute_dtype bfloat16 --torch_dtype bfloat16 \
+        --torch_dtype bfloat16 \
+        "${QUANT_ARGS[@]}" \
         --lora_rank "$LORA_RANK" --lora_alpha "$LORA_ALPHA" --target_modules all-linear \
         --freeze_vit true \
         --num_train_epochs "$EPOCHS" \
@@ -189,11 +194,12 @@ evaluate() {
     [ -n "$ck" ] || { echo "no checkpoint in $OUT"; exit 1; }
     say ">>> eval on $(wc -l < "$ES") images: base (GPU 0) and $ck (GPU 1) at the same time"
     G1=$([ "$NGPU" -gt 1 ] && echo 1 || echo 0)
-    CUDA_VISIBLE_DEVICES=0 python "$HERE/eval_counts.py" run --eval-set "$ES" --model "$MODEL" --tag base \
+    Q4=$([ "$QUANT" = 1 ] && echo --quant4 || true)
+    CUDA_VISIBLE_DEVICES=0 python "$HERE/eval_counts.py" run --eval-set "$ES" --model "$MODEL" --tag base $Q4 \
         --out "$WORK/pred_base.json" > "$WORK/eval_base.log" 2>&1 &
     P0=$!
     [ "$G1" = 0 ] && wait $P0                         # one GPU: one after the other
-    CUDA_VISIBLE_DEVICES=$G1 python "$HERE/eval_counts.py" run --eval-set "$ES" --model "$MODEL" --tag finetuned \
+    CUDA_VISIBLE_DEVICES=$G1 python "$HERE/eval_counts.py" run --eval-set "$ES" --model "$MODEL" --tag finetuned $Q4 \
         --adapter "$ck" --out "$WORK/pred_ft.json" 2>&1 | tee "$WORK/eval_ft.log" | grep -E "done|/[0-9]+$" || true
     wait $P0 || { tail -20 "$WORK/eval_base.log"; exit 1; }
     [ -f "$WORK/pred_ft.json" ] || { tail -20 "$WORK/eval_ft.log"; exit 1; }
