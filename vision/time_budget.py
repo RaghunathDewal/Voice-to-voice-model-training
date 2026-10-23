@@ -69,7 +69,9 @@ class TimeBudgetCallback(TrainerCallback):
     # ---------------------------------------------------------------- schedule
     def _set_total(self, state: TrainerState, total: int) -> None:
         total = max(state.global_step + 1, min(total, state.max_steps))
-        warmup = self.args.get_warmup_steps(total)
+        # warmup: ratio (swift --warmup_ratio, or a float warmup_steps < 1) of the total, else a step count
+        ratio = getattr(self.args, "warmup_ratio", 0) or (self.args.warmup_steps if 0 < self.args.warmup_steps < 1 else 0)
+        warmup = math.ceil(ratio * total) if ratio else int(self.args.warmup_steps)
         sched = _cosine(self.trainer.optimizer, warmup, total)
         for _ in range(state.global_step):
             sched.step()

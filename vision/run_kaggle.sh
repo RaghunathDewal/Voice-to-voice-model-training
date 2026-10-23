@@ -146,7 +146,7 @@ EOF
         --model "$MODEL" \
         --dataset "$DATA/sft/train.jsonl" \
         --val_dataset "$DATA/sft/val.jsonl" \
-        --train_type lora \
+        --model_type qwen3_vl --tuner_type lora --use_hf true \
         --quant_method bnb --quant_bits 4 \
         --bnb_4bit_compute_dtype bfloat16 --torch_dtype bfloat16 \
         --lora_rank "$LORA_RANK" --lora_alpha "$LORA_ALPHA" --target_modules all-linear \
