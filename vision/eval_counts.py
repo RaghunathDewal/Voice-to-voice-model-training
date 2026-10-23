@@ -5,7 +5,7 @@
     python eval_counts.py report pred_base.json pred_ft.json --out eval_results.json
 
 (run_kaggle.sh eval runs base on GPU 0 and finetuned on GPU 1 at the same time, then the report.)
-Same model loading as training (bf16, or 4-bit with --quant4), same prompt as training, same image size (IMAGE_MAX_TOKEN_NUM x 32 x 32 pixels, what
+Same model loading as training (DTYPE, or 4-bit with --quant4), same prompt as training, same image size (IMAGE_MAX_TOKEN_NUM x 32 x 32 pixels, what
 ms-swift used in training), greedy decoding. Per source (frozen / homeobjects_val / lvis / ...) and per class:
   acc        exact count right
   present    exact count right on images that HAVE the object
@@ -42,9 +42,10 @@ def run(a) -> None:
     from transformers import AutoProcessor, BitsAndBytesConfig, Qwen3VLForConditionalGeneration
 
     rows = [json.loads(l) for l in open(a.eval_set)]
+    dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16}[a.dtype]
     q = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True,
-                           bnb_4bit_compute_dtype=torch.bfloat16) if a.quant4 else None   # same base as training
-    model = Qwen3VLForConditionalGeneration.from_pretrained(a.model, quantization_config=q, dtype=torch.bfloat16,
+                           bnb_4bit_compute_dtype=dtype) if a.quant4 else None   # same base as training
+    model = Qwen3VLForConditionalGeneration.from_pretrained(a.model, quantization_config=q, dtype=dtype,
                                                             device_map="auto")
     if a.adapter:
         from peft import PeftModel
@@ -126,6 +127,8 @@ def main() -> None:
     r.add_argument("--adapter", default="", help="LoRA checkpoint dir; empty = base model")
     r.add_argument("--tag", default="base")
     r.add_argument("--image-tokens", type=int, default=int(os.environ.get("IMAGE_MAX_TOKEN_NUM", 768)))
+    r.add_argument("--dtype", default=os.environ.get("DTYPE", "float16"), choices=["float16", "bfloat16"],
+                   help="same as training (run_kaggle.sh: fp16 on T4, bf16 on A100/L4)")
     r.add_argument("--quant4", action="store_true", help="load the base in 4-bit (only if training used QUANT=1)")
     r.add_argument("--out", required=True)
     s = sub.add_parser("report")

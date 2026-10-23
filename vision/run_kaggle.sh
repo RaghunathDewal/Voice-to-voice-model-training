@@ -35,6 +35,10 @@ export IMAGE_MAX_TOKEN_NUM=${IMAGE_MAX_TOKEN_NUM:-768}
 # 4-bit base (QLoRA): QUANT=1. Off by default: on T4s (no native bf16) 4-bit ran ~165 s per update vs ~25-30 s
 # expected; the 4B in bf16 fits a 16 GB T4 with LoRA (~12 GB). Turn it on only on a GPU that runs out of memory.
 QUANT=${QUANT:-0}
+# precision, as in the voice trainer (s2s/utils.py resolve_dtype): bf16 only on GPUs with native bf16 (A100, L4,
+# RTX 30xx+); T4 / P100 / V100 emulate bf16, which is ~10x slower (the smoke test: 308 s per update) -> fp16 there
+DTYPE=${DTYPE:-$(python -c "import torch; print('bfloat16' if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8 else 'float16')" 2>/dev/null || echo float16)}
+export DTYPE
 
 # ----------------------------------------------------------------------------------------- time
 SESSION_HOURS=${SESSION_HOURS:-10}      # what one Kaggle session may run (commit limit is 12 h; keep a margin)
@@ -92,12 +96,12 @@ swift_sft() {
     local train_rows=$1 val_rows=$2 out=$3; shift 3
     local VAL=() QUANT_ARGS=()
     [ -n "$val_rows" ] && VAL=(--val_dataset "$val_rows")
-    [ "$QUANT" = 1 ] && QUANT_ARGS=(--quant_method bnb --quant_bits 4 --bnb_4bit_compute_dtype bfloat16)
+    [ "$QUANT" = 1 ] && QUANT_ARGS=(--quant_method bnb --quant_bits 4 --bnb_4bit_compute_dtype "$DTYPE")
     NPROC_PER_NODE=$NGPU swift sft \
         --model "$MODEL" \
         --dataset "$train_rows" "${VAL[@]}" \
         --model_type qwen3_vl --tuner_type lora --use_hf true \
-        --torch_dtype bfloat16 "${QUANT_ARGS[@]}" \
+        --torch_dtype "$DTYPE" "${QUANT_ARGS[@]}" \
         --lora_rank "$LORA_RANK" --lora_alpha "$LORA_ALPHA" --target_modules all-linear \
         --freeze_vit true \
         --num_train_epochs "$EPOCHS" \
@@ -115,7 +119,7 @@ swift_sft() {
 smoke() {
     # ~10 min: 3 real updates on 64 HomeObjects rows with the exact training setup (also downloads the model once).
     # Catches install / model / LoRA / memory problems BEFORE the 30 min data phase. Nothing is uploaded.
-    say ">>> smoke test: 3 updates, same settings as training"
+    say ">>> smoke test: 3 updates, same settings as training ($DTYPE, image tokens $IMAGE_MAX_TOKEN_NUM, 4-bit=$QUANT)"
     mkdir -p "$DATA" /tmp/vl_smoke
     if [ ! -d "$DATA/homeobjects-3K/images/train" ]; then
         curl -sSL -o "$DATA/ho.zip" https://github.com/ultralytics/assets/releases/download/v0.0.0/homeobjects-3K.zip
@@ -196,7 +200,7 @@ EOF
     export TOTAL_HOURS=${TOTAL_HOURS:-$TRAIN_HOURS}
     rows=$(wc -l < "$DATA/sft/train.jsonl")
     say ">>> train: $rows rows, $NGPU GPU(s), image tokens $IMAGE_MAX_TOKEN_NUM, $TRAIN_HOURS h in this session" \
-        "(run planned for $TOTAL_HOURS h), 4-bit=$QUANT, checkpoints every $SAVE_STEPS updates -> ${HF_CKPT_REPO:-local only}"
+        "(run planned for $TOTAL_HOURS h), $DTYPE, 4-bit=$QUANT, checkpoints every $SAVE_STEPS updates -> ${HF_CKPT_REPO:-local only}"
     swift_sft "$DATA/sft/train.jsonl" "$DATA/sft/val.jsonl" "$OUT" \
         --eval_steps 200 --save_steps "$SAVE_STEPS" --save_total_limit 2 --logging_steps 10 \
         "${RESUME[@]}"
