@@ -35,7 +35,7 @@ export IMAGE_MAX_TOKEN_NUM=${IMAGE_MAX_TOKEN_NUM:-768}
 
 # ----------------------------------------------------------------------------------------- time
 SESSION_HOURS=${SESSION_HOURS:-10}      # what one Kaggle session may run (commit limit is 12 h; keep a margin)
-EVAL_RESERVE_H=${EVAL_RESERVE_H:-0.6}   # kept free at the end for the eval phase (+ the last upload)
+EVAL_RESERVE_H=${EVAL_RESERVE_H:-0.8}   # kept free at the end for the eval phase (~580 images, base || finetuned)
 TOTAL_HOURS=${TOTAL_HOURS:-}            # empty = finish in this session; 18 = plan for two sessions
 
 # ----------------------------------------------------------------------------------------- data settings
@@ -44,6 +44,7 @@ LVIS_GROUPS=${LVIS_GROUPS:-"bedroom bathroom living kitchen building"}   # areas
 TOTAL_ROWS=${TOTAL_ROWS:-0}             # 0 = one counting row per image (+ grounding rows below)
 GROUND_SHARE=${GROUND_SHARE:-0.2}       # share of "locate every X" rows (boxes help counting)
 EXTRA=${EXTRA:-}                        # optional: your own rows, "path.jsonl:1.0 other.jsonl:1.0" (same format)
+EVAL_PER_SOURCE=${EVAL_PER_SOURCE:-250} # eval images per source (frozen 79 always all; HomeObjects val; LVIS held-out)
 EVAL_DIR=${EVAL_DIR:-}                  # folder with eval_frozen.json + images/; empty = fetched from HF (below)
 EVAL_ZIP_REPO=${EVAL_ZIP_REPO:-$HF_USER/s2s-checkpoints}             # where your fine-tune zip with eval_data/ is
 EVAL_ZIP=${EVAL_ZIP:-Yesterday_Qwen3VL_FineTune_2026-10-21.zip}
@@ -83,6 +84,7 @@ data() {
         mkdir -p "$DATA/homeobjects-3K" && unzip -q "$DATA/ho.zip" -d "$DATA/homeobjects-3K" && rm "$DATA/ho.zip"
     fi
     python "$HERE/prep_homeobjects.py" --root "$DATA/homeobjects-3K" --out "$DATA/home"
+    python "$HERE/prep_homeobjects.py" --root "$DATA/homeobjects-3K" --out "$DATA/home_val" --split val   # test only
 
     say ">>> LVIS: official train annotations (for VERIFIED zeros) + Voxel51 images"
     if [ ! -f "$DATA/lvis_v1_train.json" ]; then
@@ -100,6 +102,14 @@ data() {
         --count "$DATA/home/count_sft.jsonl" "$DATA/lvis/count_sft.jsonl" $EXTRA \
         --ground "$DATA/home/ground_sft.jsonl" "$DATA/lvis/ground_sft.jsonl"
     mkdir -p "$OUT" && cp "$DATA/lvis/stats.json" "$OUT/lvis_stats.json"
+
+    say ">>> eval set: your 79 frozen rooms + HomeObjects val + held-out LVIS (none of them trained on)"
+    hf_token
+    fetch_eval || say "frozen set not available: eval set without it"
+    python "$HERE/build_eval_set.py" --out "$DATA/eval/eval_set.jsonl" --test "$DATA/sft/test.jsonl" \
+        --home-val "$DATA/home_val/count_sft.jsonl" --max-per-source "$EVAL_PER_SOURCE" \
+        ${EVAL_DIR:+--frozen "$EVAL_DIR"}
+    cp "$DATA/eval/eval_set.jsonl" "$OUT/eval_set.jsonl"
 }
 
 latest_ckpt() { ls -d "$OUT"/checkpoint-* 2>/dev/null | sort -t- -k2 -n | tail -1 || true; }
@@ -166,16 +176,28 @@ from huggingface_hub import hf_hub_download
 print(hf_hub_download('$EVAL_ZIP_REPO', '$EVAL_ZIP', local_dir='/tmp/vl_eval'))"
         unzip -q -o "/tmp/vl_eval/$EVAL_ZIP" -d /tmp/vl_eval
     fi
-    EVAL_DIR=$(dirname "$(find /tmp/vl_eval -name eval_frozen.json | head -1)")
+    f=$(find /tmp/vl_eval -name eval_frozen.json | head -1)
+    [ -n "$f" ] || { EVAL_DIR=""; return 1; }
+    EVAL_DIR=$(dirname "$f")
     say "EVAL_DIR=$EVAL_DIR ($(ls "$EVAL_DIR/images" | wc -l) images)"
 }
 
 evaluate() {
-    fetch_eval
-    [ -f "$EVAL_DIR/eval_frozen.json" ] || { echo "no eval_frozen.json in $EVAL_DIR"; exit 1; }
+    ES=$DATA/eval/eval_set.jsonl
+    [ -f "$ES" ] || { echo "no $ES: run the data phase first (it builds the eval set)"; exit 1; }
     ck=${ADAPTER:-$(latest_ckpt)}
-    say ">>> eval: base vs $ck"
-    python "$HERE/eval_counts.py" --eval-dir "$EVAL_DIR" --model "$MODEL" --adapter "$ck" --out "$WORK/eval_results.json"
+    [ -n "$ck" ] || { echo "no checkpoint in $OUT"; exit 1; }
+    say ">>> eval on $(wc -l < "$ES") images: base (GPU 0) and $ck (GPU 1) at the same time"
+    G1=$([ "$NGPU" -gt 1 ] && echo 1 || echo 0)
+    CUDA_VISIBLE_DEVICES=0 python "$HERE/eval_counts.py" run --eval-set "$ES" --model "$MODEL" --tag base \
+        --out "$WORK/pred_base.json" > "$WORK/eval_base.log" 2>&1 &
+    P0=$!
+    [ "$G1" = 0 ] && wait $P0                         # one GPU: one after the other
+    CUDA_VISIBLE_DEVICES=$G1 python "$HERE/eval_counts.py" run --eval-set "$ES" --model "$MODEL" --tag finetuned \
+        --adapter "$ck" --out "$WORK/pred_ft.json" 2>&1 | tee "$WORK/eval_ft.log" | grep -E "done|/[0-9]+$" || true
+    wait $P0 || { tail -20 "$WORK/eval_base.log"; exit 1; }
+    [ -f "$WORK/pred_ft.json" ] || { tail -20 "$WORK/eval_ft.log"; exit 1; }
+    python "$HERE/eval_counts.py" report "$WORK/pred_base.json" "$WORK/pred_ft.json" --out "$WORK/eval_results.json"
     [ -z "${HF_CKPT_REPO:-}" ] || python -c "
 from huggingface_hub import HfApi
 HfApi().upload_file(path_or_fileobj='$WORK/eval_results.json', path_in_repo='eval_results.json', repo_id='$HF_CKPT_REPO')
@@ -187,7 +209,7 @@ case "${1:-}" in
     data) data ;;
     train) train ;;
     eval) hf_token; evaluate ;;
-    all) setup; data; train; hf_token; evaluate ;;
+    all) setup; data; train; evaluate ;;
     *) sed -n 2,19p "$0"; exit 1 ;;
 esac
 say "done ($(( ($(date +%s) - SESSION_START) / 60 )) min since the session started)"

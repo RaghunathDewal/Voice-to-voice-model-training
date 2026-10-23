@@ -1,10 +1,11 @@
 """(vision/prep_homeobjects.py) HomeObjects-3K TRAIN split -> Qwen3-VL counting + grounding rows.
 
-    python prep_homeobjects.py --root data/homeobjects-3K --out data/home
+    python prep_homeobjects.py --root data/homeobjects-3K --out data/home                    # training rows
+    python prep_homeobjects.py --root data/homeobjects-3K --out data/home_val --split val    # test rows (never trained)
 
 HomeObjects labels 12 classes on EVERY image (YOLO style), so for those 12 a missing box is a real 0.
 It has NO pillow / towel class: they are never asked here (that was the "always 0" bug).
-Only images/train is used: your eval set (eval_frozen.json) is built from images/val.
+Training uses images/train only; images/val is for the eval set (build_eval_set.py), like eval_frozen.json.
 """
 
 from __future__ import annotations
@@ -44,6 +45,7 @@ def main() -> None:
     p.add_argument("--out", default="data/home")
     p.add_argument("--names-per-row", type=int, default=5, help="classes asked in one count row")
     p.add_argument("--max-count", type=int, default=30)
+    p.add_argument("--split", default="train", choices=["train", "val"])
     p.add_argument("--seed", type=int, default=0)
     a = p.parse_args()
     random.seed(a.seed)
@@ -51,8 +53,8 @@ def main() -> None:
     st = Counter()
     f_cnt = open(f"{a.out}/count_sft.jsonl", "w")
     f_gnd = open(f"{a.out}/ground_sft.jsonl", "w")
-    for img in sorted(glob.glob(f"{a.root}/images/train/*.jpg")):
-        boxes = read_yolo(f"{a.root}/labels/train/{os.path.splitext(os.path.basename(img))[0]}.txt")
+    for img in sorted(glob.glob(f"{a.root}/images/{a.split}/*.jpg")):
+        boxes = read_yolo(f"{a.root}/labels/{a.split}/{os.path.splitext(os.path.basename(img))[0]}.txt")
         n = Counter(c for c, _ in boxes)
         img = os.path.abspath(img)
         # count row: chair + lamp always, then present classes, then a few true zeros
