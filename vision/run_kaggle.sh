@@ -7,7 +7,7 @@
 #     !git clone -q -b vision-qwen3vl https://github.com/RaghunathDewal/Voice-to-voice-model-training.git /tmp/repo
 #     !bash /tmp/repo/vision/run_kaggle.sh all      (eval set: fetched from HF, or EVAL_DIR=/kaggle/input/...)
 #  The cells, step by step: vision/README.md
-#  Phases: setup | data | train | eval | all
+#  Phases: setup | smoke | data | train | eval | all   (smoke = 3 real updates in ~10 min, before the long data phase)
 #
 #  Like the speech training (max_minutes):
 #     - the run measures its own speed and fits the cosine learning rate into the time it has (time_budget.py)
@@ -75,8 +75,60 @@ hf_token() {
 
 setup() {
     say ">>> setup"
-    pip install -q "ms-swift>=4.5" "transformers>=4.57" "qwen-vl-utils>=0.0.14" accelerate peft bitsandbytes requests
-    python -c "import swift, transformers, qwen_vl_utils; print('swift', swift.__version__, 'transformers', transformers.__version__)"
+    # ms-swift pinned to the version whose flags were checked (4.6 renamed --train_type to --tuner_type)
+    pip install -q "ms-swift==4.6.0" "transformers>=4.57" "qwen-vl-utils>=0.0.14" accelerate peft bitsandbytes requests
+    # Kaggle ships torchao 0.10; peft refuses any torchao < 0.16 when it adds LoRA layers (ImportError), and we do
+    # not use torchao at all: remove it
+    pip uninstall -q -y torchao 2>/dev/null || true
+    python -c "
+import swift, transformers, peft, qwen_vl_utils
+from peft.import_utils import is_torchao_available
+print('swift', swift.__version__, '| transformers', transformers.__version__, '| peft', peft.__version__,
+      '| torchao usable:', is_torchao_available())"
+}
+
+# the one swift command, shared by smoke and train:  swift_sft <train.jsonl> <val.jsonl or ""> <out dir> [extra flags]
+swift_sft() {
+    local train_rows=$1 val_rows=$2 out=$3; shift 3
+    local VAL=() QUANT_ARGS=()
+    [ -n "$val_rows" ] && VAL=(--val_dataset "$val_rows")
+    [ "$QUANT" = 1 ] && QUANT_ARGS=(--quant_method bnb --quant_bits 4 --bnb_4bit_compute_dtype bfloat16)
+    NPROC_PER_NODE=$NGPU swift sft \
+        --model "$MODEL" \
+        --dataset "$train_rows" "${VAL[@]}" \
+        --model_type qwen3_vl --tuner_type lora --use_hf true \
+        --torch_dtype bfloat16 "${QUANT_ARGS[@]}" \
+        --lora_rank "$LORA_RANK" --lora_alpha "$LORA_ALPHA" --target_modules all-linear \
+        --freeze_vit true \
+        --num_train_epochs "$EPOCHS" \
+        --per_device_train_batch_size 1 --per_device_eval_batch_size 1 \
+        --gradient_accumulation_steps "$ACCUM" \
+        --learning_rate "$LR" --warmup_ratio 0.03 --weight_decay 0.01 \
+        --max_length 2048 \
+        --gradient_checkpointing true \
+        --dataloader_num_workers 2 \
+        --external_plugins "$HERE/time_budget.py" --callbacks time_budget \
+        --add_version false --output_dir "$out" \
+        "$@"
+}
+
+smoke() {
+    # ~10 min: 3 real updates on 64 HomeObjects rows with the exact training setup (also downloads the model once).
+    # Catches install / model / LoRA / memory problems BEFORE the 30 min data phase. Nothing is uploaded.
+    say ">>> smoke test: 3 updates, same settings as training"
+    mkdir -p "$DATA" /tmp/vl_smoke
+    if [ ! -d "$DATA/homeobjects-3K/images/train" ]; then
+        curl -sSL -o "$DATA/ho.zip" https://github.com/ultralytics/assets/releases/download/v0.0.0/homeobjects-3K.zip
+        mkdir -p "$DATA/homeobjects-3K" && unzip -q "$DATA/ho.zip" -d "$DATA/homeobjects-3K" && rm "$DATA/ho.zip"
+    fi
+    python "$HERE/prep_homeobjects.py" --root "$DATA/homeobjects-3K" --out /tmp/vl_smoke/home > /dev/null
+    { head -48 /tmp/vl_smoke/home/count_sft.jsonl; head -16 /tmp/vl_smoke/home/ground_sft.jsonl; } > /tmp/vl_smoke/rows.jsonl
+    rm -rf /tmp/vl_smoke/out
+    HF_CKPT_REPO="" TRAIN_HOURS=5 swift_sft /tmp/vl_smoke/rows.jsonl "" /tmp/vl_smoke/out \
+        --max_steps 3 --save_steps 1000 --logging_steps 1 2>&1 | tee /tmp/vl_smoke/log.txt \
+        | grep -E "Error|error|'loss'" || true
+    python "$HERE/smoke_check.py" /tmp/vl_smoke/log.txt
+    rm -rf /tmp/vl_smoke/out
 }
 
 data() {
@@ -145,27 +197,8 @@ EOF
     rows=$(wc -l < "$DATA/sft/train.jsonl")
     say ">>> train: $rows rows, $NGPU GPU(s), image tokens $IMAGE_MAX_TOKEN_NUM, $TRAIN_HOURS h in this session" \
         "(run planned for $TOTAL_HOURS h), 4-bit=$QUANT, checkpoints every $SAVE_STEPS updates -> ${HF_CKPT_REPO:-local only}"
-    QUANT_ARGS=()
-    [ "$QUANT" = 1 ] && QUANT_ARGS=(--quant_method bnb --quant_bits 4 --bnb_4bit_compute_dtype bfloat16)
-    NPROC_PER_NODE=$NGPU swift sft \
-        --model "$MODEL" \
-        --dataset "$DATA/sft/train.jsonl" \
-        --val_dataset "$DATA/sft/val.jsonl" \
-        --model_type qwen3_vl --tuner_type lora --use_hf true \
-        --torch_dtype bfloat16 \
-        "${QUANT_ARGS[@]}" \
-        --lora_rank "$LORA_RANK" --lora_alpha "$LORA_ALPHA" --target_modules all-linear \
-        --freeze_vit true \
-        --num_train_epochs "$EPOCHS" \
-        --per_device_train_batch_size 1 --per_device_eval_batch_size 1 \
-        --gradient_accumulation_steps "$ACCUM" \
-        --learning_rate "$LR" --warmup_ratio 0.03 --weight_decay 0.01 \
-        --max_length 2048 \
-        --gradient_checkpointing true \
+    swift_sft "$DATA/sft/train.jsonl" "$DATA/sft/val.jsonl" "$OUT" \
         --eval_steps 200 --save_steps "$SAVE_STEPS" --save_total_limit 2 --logging_steps 10 \
-        --dataloader_num_workers 2 \
-        --external_plugins "$HERE/time_budget.py" --callbacks time_budget \
-        --add_version false --output_dir "$OUT" \
         "${RESUME[@]}"
     say "checkpoints: $(ls -d "$OUT"/checkpoint-* | tr '\n' ' ')"
 }
@@ -212,10 +245,11 @@ print('eval_results.json uploaded')" || true
 
 case "${1:-}" in
     setup) setup ;;
+    smoke) smoke ;;
     data) data ;;
     train) train ;;
     eval) hf_token; evaluate ;;
-    all) setup; data; train; evaluate ;;
+    all) setup; smoke; data; train; evaluate ;;
     *) sed -n 2,19p "$0"; exit 1 ;;
 esac
 say "done ($(( ($(date +%s) - SESSION_START) / 60 )) min since the session started)"

@@ -9,6 +9,7 @@ on Kaggle's free GPU T4 x2. One script, `run_kaggle.sh`, with the phases `setup`
 | `prep_homeobjects.py` | HomeObjects-3K **train** split -> count + box rows over its 12 classes (it has no pillow / towel, so they are never asked there) |
 | `prep_lvis.py` | Voxel51/LVIS -> 120 hotel classes in 5 areas (bedroom, bathroom, living, kitchen, building); zeros only where the official LVIS file says "verified absent" |
 | `mix_data.py` | all rows -> `train.jsonl` + `val.jsonl` (an image's rows stay in one split) |
+| `smoke_check.py` | reads the smoke-test log: did updates finish, speed, memory |
 | `time_budget.py` | ms-swift plugin: fits the cosine learning rate into the session time, saves and stops at the deadline, uploads every checkpoint to Hugging Face |
 | `build_eval_set.py` | the mixed eval set (below), built in the `data` phase |
 | `eval_counts.py` | base (GPU 0) and fine-tuned (GPU 1) at the same time on the eval set, same image size as training; reports present / absent accuracy and the "always 0" floor per source and per class |
@@ -43,6 +44,12 @@ os.environ["HF_TOKEN"] = UserSecretsClient().get_secret("HF_TOKEN")
 ```python
 !bash /tmp/repo/vision/run_kaggle.sh setup
 ```
+
+**Cell 2b: smoke test (~10 min): 3 real training updates on 64 rows, BEFORE the long data step**
+```python
+!bash /tmp/repo/vision/run_kaggle.sh smoke
+```
+Must end with `SMOKE TEST OK: ... s per update, GPU memory ... GiB`. If it says FAILED, stop and fix first.
 
 **Cell 3: data preparation (~30-40 min: HomeObjects, LVIS annotations, ~30k LVIS images, mix)**
 ```python
