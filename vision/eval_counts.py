@@ -22,7 +22,7 @@ import os
 import re
 from collections import defaultdict
 
-from common import COUNT_PROMPT
+from common import COUNT_PROMPT, EXTRA_PROMPT, same_object
 
 MAIN = ["pillow", "towel", "lamp", "chair"]
 
@@ -34,6 +34,32 @@ def parse(text: str) -> dict:
         return {str(o["label"]).lower(): int(o["detected_count"]) for o in objs}
     except Exception:  # noqa: BLE001
         return {}
+
+
+def parse_extra(text: str) -> dict:
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    try:
+        items = json.loads(m.group(0)).get("new_items", []) if m else []
+        return {str(o["label"]).lower(): int(o.get("count", 1)) for o in items}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def score_extra(rows: list[dict]) -> dict | None:
+    """New-items check: recall = real other objects the model lists, precision = listed objects that are real."""
+    rows = [r for r in rows if "extra_pred" in r]
+    if not rows:
+        return None
+    gt_n = hit_gt = pred_n = hit_pred = 0
+    for r in rows:
+        gt, pred = list(r["extra_gt"]), list(r["extra_pred"])
+        gt_n += len(gt)
+        pred_n += len(pred)
+        hit_gt += sum(any(same_object(g, p) for p in pred) for g in gt)
+        hit_pred += sum(any(same_object(p, g) for g in gt) for p in pred)
+    return {"images": len(rows), "recall": round(100 * hit_gt / max(1, gt_n), 1),
+            "precision": round(100 * hit_pred / max(1, pred_n), 1), "listed_per_image": round(pred_n / len(rows), 1),
+            "real_per_image": round(gt_n / len(rows), 1)}
 
 
 def run(a) -> None:
@@ -54,17 +80,24 @@ def run(a) -> None:
     processor = AutoProcessor.from_pretrained(a.model)
     max_pixels = a.image_tokens * 32 * 32
     out = []
-    for i, r in enumerate(rows):
+    def ask(path: str, prompt: str, max_new: int) -> str:
         msgs = [{"role": "user", "content": [
-            {"type": "image", "image": r["images"][0], "max_pixels": max_pixels},
-            {"type": "text", "text": COUNT_PROMPT.format(names=", ".join(r["classes"]))}]}]
+            {"type": "image", "image": path, "max_pixels": max_pixels}, {"type": "text", "text": prompt}]}]
         text = processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
         images, _ = process_vision_info(msgs, image_patch_size=16)
         inp = processor(text=[text], images=images, do_resize=False, return_tensors="pt").to(model.device)
         with torch.inference_mode():
-            gen = model.generate(**inp, max_new_tokens=60 + 25 * len(r["classes"]), do_sample=False)
-        reply = processor.batch_decode(gen[:, inp.input_ids.shape[1]:], skip_special_tokens=True)[0]
-        out.append({**r, "reply": reply, "pred": parse(reply)})
+            gen = model.generate(**inp, max_new_tokens=max_new, do_sample=False)
+        return processor.batch_decode(gen[:, inp.input_ids.shape[1]:], skip_special_tokens=True)[0]
+
+    for i, r in enumerate(rows):
+        names = ", ".join(r["classes"])
+        reply = ask(r["images"][0], COUNT_PROMPT.format(names=names), 60 + 25 * len(r["classes"]))
+        res = {**r, "reply": reply, "pred": parse(reply)}
+        if "extra_gt" in r:                            # "new items" check (frozen rooms: full inventory known)
+            extra_reply = ask(r["images"][0], EXTRA_PROMPT.format(names=names), 400)
+            res.update(extra_reply=extra_reply, extra_pred=parse_extra(extra_reply))
+        out.append(res)
         if (i + 1) % 25 == 0:
             print(f"  [{a.tag}] {i + 1}/{len(rows)}", flush=True)
             json.dump({"tag": a.tag, "adapter": a.adapter, "rows": out}, open(a.out, "w"))
@@ -107,6 +140,7 @@ def report(a) -> None:
             for c in r["gt"]:
                 per_cls[c].append(r)
         t["per class (all)"] = {c: score(rs, {c}) for c, rs in sorted(per_cls.items())}
+        t["new items (frozen rooms)"] = score_extra(run_["rows"])
         table[run_["tag"]] = t
     json.dump({"scores": table, "preds": {r["tag"]: r["rows"] for r in runs}}, open(a.out, "w"), indent=1)
     tags = [r["tag"] for r in runs]
@@ -117,13 +151,20 @@ def report(a) -> None:
     print(f"{'':30s}{'n':>6s}{'missing':>8s} " + "".join(f"{t:>{w}s}" for t in tags))
     print(f"{'':45s}" + "".join(f"{'':3s}" + "".join(f"{h:>6s}" for _, h in COLS) for _ in tags))
     for key in table[tags[0]]:
-        if key == "per class (all)":
+        if key in ("per class (all)", "new items (frozen rooms)"):
             continue
         s0 = table[tags[0]][key]
         line = f"{key[:30]:30s}{s0['n']:6d}{s0['n_missing']:8d} "
         for t in tags:
             line += f"{'':3s}" + "".join(f(table[t][key][k]) for k, _ in COLS)
         print(line)
+    ex = {t: table[t]["new items (frozen rooms)"] for t in tags}
+    if any(ex.values()):
+        print("\nNEW ITEMS (not in the expected list), 79 frozen rooms with a full inventory; labels matched loosely:")
+        for t, e in ex.items():
+            if e:
+                print(f"  {t:20s} finds {e['recall']:5.1f}% of the real other objects | {e['precision']:5.1f}% of what it "
+                      f"lists is real | lists {e['listed_per_image']} per room (real: {e['real_per_image']})")
     print(f"(per-class numbers for every class: {a.out})")
 
 

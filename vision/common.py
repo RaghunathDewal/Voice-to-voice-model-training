@@ -17,6 +17,37 @@ from collections import Counter
 COUNT_PROMPT = ("Expected items from the previous inspection: {names}. Count how many of each are in this image now "
                 '(0 if it is not there). Answer in JSON: {{"objects":[{{"label":...,"detected_count":...}}]}}')
 
+# "new items": anything in the after image that was not in the before inventory. NOT trained (our datasets only
+# label their own classes, so "everything else" answers would teach the model to leave unlabelled things out);
+# measured in the eval on the 79 frozen rooms, whose full_counts list every object.
+EXTRA_PROMPT = ("Expected items from the previous inspection: {names}. List every OTHER object you can see in this image "
+                "that is not one of those, with how many. Answer in JSON: "
+                '{{"new_items":[{{"label":...,"count":...}}]}}. If there are none: {{"new_items":[]}}')
+
+SYNONYMS = {"picture": "painting", "picture frame": "painting", "wall art": "painting", "photograph": "painting",
+            "poster": "painting", "frame": "painting", "photo frame": "painting", "artwork": "painting",
+            "plant": "potted plant", "plant pot": "potted plant", "houseplant": "potted plant", "flowers": "vase",
+            "tv": "television", "television set": "television", "bookshelf": "shelf", "bookcase": "shelf",
+            "couch": "sofa", "carpet": "rug", "drapes": "curtain", "blinds": "curtain", "nightstand": "bedside table",
+            "staircase": "stairs", "coffee machine": "coffee maker", "fridge": "refrigerator", "cushion": "pillow"}
+
+
+def norm_label(s: str) -> str:
+    s = str(s).lower().strip()
+    s = SYNONYMS.get(s, s)
+    if s.endswith(("sses", "xes", "ches", "shes")):      # glasses, boxes, benches, dishes
+        s = s[:-2]
+    elif s.endswith("s") and not s.endswith("ss"):
+        s = s[:-1]
+    return SYNONYMS.get(s, s)
+
+
+def same_object(a: str, b: str) -> bool:
+    """Loose match for open-vocabulary labels: equal after synonyms, or the same head noun ("coffee table" ~ "table")."""
+    a, b = norm_label(a), norm_label(b)
+    return a == b or a.split()[-1] == b.split()[-1]
+
+
 # which areas a missing item may come from, given the areas of the items that ARE in the image
 FITS = {"bedroom": {"bedroom", "living", "building"},
         "living": {"living", "bedroom", "building"},
