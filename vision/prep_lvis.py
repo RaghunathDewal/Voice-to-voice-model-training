@@ -30,13 +30,17 @@ from collections import Counter, defaultdict
 
 import requests
 
+from common import ZeroBudget, count_row
+
 REPO = "https://huggingface.co/datasets/Voxel51/LVIS/resolve/main"
 
 # YOUR class  <-  exact LVIS label names, by area (image counts in this 35k copy in the comments).
 # LVIS has NO door / window / stairs / floor / wall classes: take those from ADE20K or Open Images.
 GROUPS = {
     "bedroom": {
-        "pillow":         ["pillow", "cushion"],                              # 639 + 431: sofa cushions count as pillows
+        "pillow":         ["pillow"],                                         # 639 (cushion is NOT merged: it made
+                                                                              #  v1 count sofa seat cushions as pillows)
+        "cushion":        ["cushion"],                                        # 431
         "blanket":        ["blanket", "quilt", "bedspread"],                  # 596 + 138 + 31
         "bed":            ["bed", "bunk_bed", "crib"],                        # 615 + 7 + 14
         "headboard":      ["headboard"],                                      # 255
@@ -166,10 +170,9 @@ GROUPS = {
     },
 }
 CLASS_MAP = {mine: lvs for g in GROUPS.values() for mine, lvs in g.items()}
+AREA_OF = {mine: area for area, g in GROUPS.items() for mine in g}
 LVIS_TO_MINE = {lv: mine for mine, lvs in CLASS_MAP.items() for lv in lvs}
 
-COUNT_PROMPT = ("Count the following objects in this image: {names}. "
-                'Answer in JSON: {{"objects":[{{"label":...,"detected_count":...}}]}}')
 GROUND_PROMPT = 'Locate every {name} in the image. Answer in JSON: [{{"bbox_2d":[x1,y1,x2,y2],"label":"{name}"}}]'
 
 
@@ -218,14 +221,6 @@ def to_qwen_box(b: list[float]) -> list[int]:
     return [round(1000 * x), round(1000 * y), round(1000 * min(1, x + w)), round(1000 * min(1, y + h))]
 
 
-def count_row(img: str, counts: dict) -> dict:
-    names = list(counts)
-    random.shuffle(names)
-    answer = {"objects": [{"label": n, "detected_count": counts[n]} for n in names]}
-    return {"messages": [{"role": "user", "content": "<image>" + COUNT_PROMPT.format(names=", ".join(names))},
-                         {"role": "assistant", "content": json.dumps(answer)}], "images": [img]}
-
-
 def ground_row(img: str, name: str, boxes: list) -> dict:
     return {"messages": [{"role": "user", "content": "<image>" + GROUND_PROMPT.format(name=name)},
                          {"role": "assistant", "content": json.dumps([{"bbox_2d": b, "label": name} for b in boxes])}],
@@ -243,7 +238,8 @@ def main() -> None:
     p.add_argument("--max-images", type=int, default=0, help="keep at most N images (0 = all ~30k)")
     p.add_argument("--min-area", type=float, default=0.0005, help="boxes under this share of the image = too small")
     p.add_argument("--max-count", type=int, default=30, help="skip a count above this (too crowded to count)")
-    p.add_argument("--max-zeros", type=int, default=2, help="verified-zero classes added per count row")
+    p.add_argument("--zero-ratio", type=float, default=0.4,
+                   help="per class: zero answers <= ratio x rows where it is present (common.py)")
     p.add_argument("--max-names", type=int, default=8, help="classes asked about in one count row")
     p.add_argument("--download", action="store_true", help="download the kept images into OUT/images/")
     p.add_argument("--workers", type=int, default=32)
@@ -321,6 +317,10 @@ def main() -> None:
         paths = list(ex.map(fetch, cands))
 
     # ---- 4. rows
+    def countable(c):                                  # classes whose box count is the true count
+        return {n: len(bs) for n, bs in c["boxes"].items()
+                if n not in c["not_exhaustive"] and not c["small"].get(n) and len(bs) <= a.max_count}
+    budget = ZeroBudget(Counter(n for c, img in zip(cands, paths) if img for n in countable(c)), a.zero_ratio)
     st = defaultdict(Counter)
     f_man = open(f"{a.out}/manifest.jsonl", "w")
     f_cnt = open(f"{a.out}/count_sft.jsonl", "w")
@@ -330,7 +330,7 @@ def main() -> None:
             continue
         st["all"]["images"] += 1
         f_man.write(json.dumps({"image": img, **{k: v for k, v in c.items() if k != "filepath"}}) + "\n")
-        counts = {}
+        counts = countable(c)
         for name, bs in c["boxes"].items():
             st[name]["images"] += 1
             st[name]["boxes"] += len(bs)
@@ -341,24 +341,25 @@ def main() -> None:
             elif len(bs) > a.max_count:
                 st[name]["skip_too_many"] += 1
             else:
-                counts[name] = len(bs)
+                st[name]["present_rows"] += 1
                 f_gnd.write(json.dumps(ground_row(img, name, bs)) + "\n")
                 st["all"]["ground_rows"] += 1
+        if not counts:
+            continue                                   # nothing countable: no scene to ask "what is missing" in
         present = list(counts)
-        if len(present) > a.max_names - 1:            # leave room for at least one zero
+        if len(present) > a.max_names - 1:            # leave room for one missing item
             present = random.sample(present, a.max_names - 1)
         counts = {n: counts[n] for n in present}
-        zeros = c["verified_absent"][:]
-        random.shuffle(zeros)
-        zeros.sort(key=lambda z: z not in a.priority)  # true zeros of the main classes first
-        for z in zeros[:min(a.max_zeros, a.max_names - len(counts))]:
-            counts[z] = 0                              # verified absent (only with --lvis-json)
+        z = budget.pick(c["verified_absent"], AREA_OF, present, prefer=a.priority)
+        if z:
+            counts[z] = 0                              # a missing item that fits the scene (verified absent)
             st[z]["zero_rows"] += 1
-        if counts:
-            f_cnt.write(json.dumps(count_row(img, counts)) + "\n")
-            st["all"]["count_rows"] += 1
+            st["all"]["zero_answers"] += 1
+        st["all"]["answers"] += len(counts)
+        f_cnt.write(json.dumps(count_row(img, counts)) + "\n")
+        st["all"]["count_rows"] += 1
     json.dump({k: dict(v) for k, v in sorted(st.items())}, open(f"{a.out}/stats.json", "w"), indent=1)
-    print(json.dumps(dict(st["all"])))
+    print(json.dumps(dict(st["all"])), f"zero share {st['all']['zero_answers'] / max(1, st['all']['answers']):.0%}")
     for name in sorted(a.priority):
         print(f"  {name:10s} {dict(st[name])}")
 

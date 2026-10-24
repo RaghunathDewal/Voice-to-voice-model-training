@@ -7,11 +7,11 @@
 (run_kaggle.sh eval runs base on GPU 0 and finetuned on GPU 1 at the same time, then the report.)
 Same model loading as training (DTYPE, or 4-bit with --quant4), same prompt as training, same image size (IMAGE_MAX_TOKEN_NUM x 32 x 32 pixels, what
 ms-swift used in training), greedy decoding. Per source (frozen / homeobjects_val / lvis / ...) and per class:
-  acc        exact count right
-  present    exact count right on images that HAVE the object
-  absent     says 0 on images without it
-  off1       within +-1
-  floor      what "always answer 0" would score: a model must beat this to have learned anything
+  acc             exact count right
+  present         exact count right when the item is there
+  missing_recall  the item is gone and the model says 0: the alert is caught
+  false_alarm     the item is there but the model says 0 (lower is better)
+  off1            within +-1
 """
 
 from __future__ import annotations
@@ -22,8 +22,8 @@ import os
 import re
 from collections import defaultdict
 
-COUNT_PROMPT = ("Count the following objects in this image: {names}. "
-                'Answer in JSON: {{"objects":[{{"label":...,"detected_count":...}}]}}')
+from common import COUNT_PROMPT
+
 MAIN = ["pillow", "towel", "lamp", "chair"]
 
 
@@ -77,9 +77,16 @@ def score(rows: list[dict], cls_filter=None) -> dict:
     pres = [(g, p) for g, p in pairs if g > 0]
     absn = [(g, p) for g, p in pairs if g == 0]
     pct = lambda v: round(100 * sum(g == p for g, p in v) / len(v), 1) if v else None  # noqa: E731
-    return {"n": len(pairs), "n_present": len(pres), "acc": pct(pairs), "present": pct(pres), "absent": pct(absn),
+    return {"n": len(pairs), "n_present": len(pres), "n_missing": len(absn),
+            "acc": pct(pairs),                                    # exact count, every question
+            "present": pct(pres),                                 # exact count when the item is there
+            "missing_recall": pct(absn),                          # item gone -> says 0 (alert caught)
+            "false_alarm": round(100 * sum(p == 0 for _, p in pres) / len(pres), 1) if pres else None,  # there, says 0
             "off1": round(100 * sum(p is not None and abs(g - p) <= 1 for g, p in pairs) / len(pairs), 1) if pairs else None,
             "floor": round(100 * len(absn) / len(pairs), 1) if pairs else None}
+
+
+COLS = [("acc", "acc"), ("present", "pres"), ("missing_recall", "miss"), ("false_alarm", "f.al"), ("off1", "off1")]
 
 
 def report(a) -> None:
@@ -91,8 +98,8 @@ def report(a) -> None:
             by_src[r["source"]].append(r)
         t = {"ALL: every class": score(run_["rows"]),
              "ALL: pillow towel lamp chair": score(run_["rows"], MAIN)}
-        for s, rs in sorted(by_src.items()):
-            t[f"{s}"] = score(rs)
+        for s_, rs in sorted(by_src.items()):
+            t[s_] = score(rs)
         for c in MAIN:
             t[f"class {c}"] = score(run_["rows"], {c})
         per_cls = defaultdict(list)
@@ -103,19 +110,21 @@ def report(a) -> None:
         table[run_["tag"]] = t
     json.dump({"scores": table, "preds": {r["tag"]: r["rows"] for r in runs}}, open(a.out, "w"), indent=1)
     tags = [r["tag"] for r in runs]
-    print(f"\n{'':38s}" + "".join(f"{t:>40s}" for t in tags))
-    print(f"{'':38s}" + "".join(f"{'acc  present absent  off1  floor':>40s}" for _ in tags))
     f = lambda v: f"{v:6.1f}" if v is not None else "     -"  # noqa: E731
+    w = 6 * len(COLS) + 3
+    print("\nacc = exact count | pres = exact when the item is there | miss = item gone and the model says 0 (alert "
+          "caught) | f.al = item there but the model says 0 (false alarm, lower is better) | off1 = within +-1")
+    print(f"{'':30s}{'n':>6s}{'missing':>8s} " + "".join(f"{t:>{w}s}" for t in tags))
+    print(f"{'':45s}" + "".join(f"{'':3s}" + "".join(f"{h:>6s}" for _, h in COLS) for _ in tags))
     for key in table[tags[0]]:
         if key == "per class (all)":
             continue
-        n = table[tags[0]][key]["n"]
-        line = f"{key[:30]:30s}{n:7d} "
+        s0 = table[tags[0]][key]
+        line = f"{key[:30]:30s}{s0['n']:6d}{s0['n_missing']:8d} "
         for t in tags:
-            s = table[t][key]
-            line += f"{'':6s}{f(s['acc'])}{f(s['present'])}{f(s['absent'])}{f(s['off1'])}{f(s['floor'])}"
+            line += f"{'':3s}" + "".join(f(table[t][key][k]) for k, _ in COLS)
         print(line)
-    print(f"(n = class questions; per-class numbers for every class are in {a.out})")
+    print(f"(per-class numbers for every class: {a.out})")
 
 
 def main() -> None:

@@ -10,9 +10,19 @@ on Kaggle's free GPU T4 x2. One script, `run_kaggle.sh`, with the phases `setup`
 | `prep_lvis.py` | Voxel51/LVIS -> 120 hotel classes in 5 areas (bedroom, bathroom, living, kitchen, building); zeros only where the official LVIS file says "verified absent" |
 | `mix_data.py` | all rows -> `train.jsonl` + `val.jsonl` (an image's rows stay in one split) |
 | `smoke_check.py` | reads the smoke-test log: did updates finish, speed, memory |
+| `common.py` | the production counting prompt and the rule for zeros (scene-matched, capped), shared by the preps and the eval |
 | `time_budget.py` | ms-swift plugin: fits the cosine learning rate into the session time, saves and stops at the deadline, uploads every checkpoint to Hugging Face |
 | `build_eval_set.py` | the mixed eval set (below), built in the `data` phase |
 | `eval_counts.py` | base (GPU 0) and fine-tuned (GPU 1) at the same time on the eval set, same image size as training; reports present / absent accuracy and the "always 0" floor per source and per class |
+
+## Runs
+
+| Run | Data | Starts from | Saved to (HF) | Result |
+|---|---|---|---|---|
+| v1 | "Count the following objects" prompt, LVIS cushion merged into pillow, ~3 zero answers per present one for some classes | zero | `qwen3vl-room-lora` | 65 -> 79% exact overall; pillow over-counted (sofa cushions), towel said 0 when there |
+| **v2** (default) | production prompt ("Expected items from the previous inspection: ... 0 if it is not there"), at most one missing item per question and only one that fits the scene (common.py), zeros per class <= 0.4 x present, cushion its own class | v1's LoRA (`--adapters`), lr 5e-5 | `qwen3vl-room-lora-v2` | eval: v2 vs v1 vs base |
+
+`RUN=v3 INIT_FROM=ThunderBlade7773/qwen3vl-room-lora-v2` for a next round; `INIT_FROM=` (empty) to start from zero.
 
 ## Before the first run
 
@@ -56,12 +66,12 @@ Must end with `SMOKE TEST OK: ... s per update, GPU memory ... GiB`. If it says 
 !bash /tmp/repo/vision/run_kaggle.sh data
 ```
 
-**Cell 4: training (uses the rest of the session minus ~40 min kept for the eval)**
+**Cell 4: training (~7 h: the rest of the session minus ~2 h kept for the eval)**
 ```python
 !bash /tmp/repo/vision/run_kaggle.sh train
 ```
 
-**Cell 5: eval, base vs fine-tuned (~35-45 min for ~580 images, both GPUs at once)**
+**Cell 5: eval, v2 vs v1 vs base (~2 h for ~480 images: v2 then base on GPU 0, v1 on GPU 1)**
 ```python
 !bash /tmp/repo/vision/run_kaggle.sh eval
 ```
@@ -73,17 +83,27 @@ repo), checkpoints in `/kaggle/working/out/qwen3vl-room/` and on HF as `last-che
 
 | Setting | Default | Meaning |
 |---|---|---|
+| `RUN` | v2 | run name: output folder and HF repo `qwen3vl-room-lora-<RUN>` |
+| `INIT_FROM` | `ThunderBlade7773/qwen3vl-room-lora` (v1) | LoRA to start from (its `last-checkpoint`); empty = from zero |
+| `LR` | 5e-5 when continuing, 1e-4 from zero | learning rate |
 | `SESSION_HOURS` | 10 | what one session may use in total (Kaggle stops a commit at 12 h) |
-| `TOTAL_HOURS` | = this session's training time | `18` = one run over two commits; the second continues and finishes the learning-rate decay |
-| `IMAGE_MAX_TOKEN_NUM` | 768 | image size (1 token = 32x32 px); `512` is ~30% faster, less detail |
-| `LVIS_IMAGES` | 0 (all, ~30k) | cap on LVIS images |
-| `LVIS_GROUPS` | all 5 areas | e.g. `"bedroom bathroom"` |
+| `EVAL_BASE` | 1 | 0 = skip the base model in the eval (saves ~1 h, more training) |
+| `EVAL_PER_SOURCE` | 200 | eval images per source (the 79 frozen rooms always all) |
+| `TOTAL_HOURS` | = this session's training time | `14` = one run over two commits |
+| `IMAGE_MAX_TOKEN_NUM` | 768 | image size (1 token = 32x32 px); `512` is ~30% faster |
+| `DTYPE` | float16 on T4, bfloat16 on A100/L4/H100 | precision (bf16 is emulated and ~10x slower on a T4) |
+| `QUANT` | 0 | 1 = 4-bit base (only if out of memory) |
+| `LVIS_IMAGES`, `LVIS_GROUPS` | all | which LVIS images / areas |
 | `GROUND_SHARE` | 0.2 | share of "locate every X" rows |
-| `EPOCHS`, `LR`, `LORA_RANK` | 1, 1e-4, 16 | training |
-| `SAVE_STEPS` | 50 | updates between checkpoints (~20-25 min) |
+| `SAVE_STEPS` | 50 | updates between checkpoints |
 | `EXTRA` | empty | your own rows, `"/kaggle/input/x/rows.jsonl:1.0"` (same `messages` + `images` format) |
 
-Example: `!SESSION_HOURS=11 IMAGE_MAX_TOKEN_NUM=512 bash /tmp/repo/vision/run_kaggle.sh train`
+## What the eval reports
+
+Per model, for all sources, each source, and pillow / towel / lamp / chair:
+`acc` exact count | `pres` exact when the item is there | `miss` the item is gone and the model says 0 (the alert is
+caught) | `f.al` the item is there but the model says 0 (a false alarm, lower is better) | `off1` within +-1.
+The model only counts; comparing with the "before" inventory and deciding what to alert on is done in code.
 
 ## If the session stops before the end
 
