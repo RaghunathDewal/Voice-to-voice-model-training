@@ -20,7 +20,7 @@ set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 WORK=${WORK:-/kaggle/working}
 DATA=${DATA:-/tmp/vl_data}              # images live outside /kaggle/working so the saved output stays small
-RUN=${RUN:-v2}                          # run name: v2 = rebuilt data (production prompt, scene-matched zeros)
+RUN=${RUN:-v3}                          # run name -> output folder and HF repo qwen3vl-room-lora-<RUN> (README: Runs)
 OUT=${OUT:-$WORK/out/qwen3vl-room-$RUN}
 mkdir -p "$WORK" && cd "$WORK"
 # session clock: started by the first phase run in this session (cells are separate processes)
@@ -31,7 +31,9 @@ MODEL=${MODEL:-Qwen/Qwen3-VL-4B-Instruct}
 HF_USER=${HF_USER:-ThunderBlade7773}
 export HF_CKPT_REPO=${HF_CKPT_REPO:-$HF_USER/qwen3vl-room-lora-$RUN}   # private repo of THIS run (v1 stays untouched)
 # start from an earlier run's LoRA (its last-checkpoint on HF) instead of from zero; empty = from zero
-INIT_FROM=${INIT_FROM-$HF_USER/qwen3vl-room-lora}
+INIT_FROM=${INIT_FROM-$HF_USER/qwen3vl-room-lora-v2}
+# earlier runs to evaluate next to this one, on the SAME eval set (the only fair comparison)
+COMPARE=${COMPARE-"$HF_USER/qwen3vl-room-lora $HF_USER/qwen3vl-room-lora-v2"}
 INIT_DIR=/tmp/vl_init
 INIT_ARGS=()
 # image size: Qwen3-VL makes 1 token per 32x32 pixels. 768 tokens = ~0.79 MP (e.g. 1024x768). The SAME value is
@@ -47,8 +49,11 @@ export DTYPE
 
 # ----------------------------------------------------------------------------------------- time
 SESSION_HOURS=${SESSION_HOURS:-10}      # what one Kaggle session may run (commit limit is 12 h; keep a margin)
-EVAL_RESERVE_H=${EVAL_RESERVE_H:-2.1}   # kept for the eval: ~480 images x (this run, v1, base) on 2 GPUs (~2 h)
-EVAL_BASE=${EVAL_BASE:-1}               # 0 = skip the base model in the eval (saves ~1 h)
+EVAL_BASE=${EVAL_BASE:-0}               # 1 = also the base model (its frozen-room numbers are known: 73.1% exact)
+EVAL_BATCH=${EVAL_BATCH:-4}             # questions per generate call in the eval
+EVAL_JOB_H=${EVAL_JOB_H:-0.8}           # hours one model needs for the eval on one GPU (batched; 1.1 h unbatched)
+# kept free at the end of the session for the eval: rounds of models on the GPUs x EVAL_JOB_H
+N_EVAL_JOBS=$(( 1 + $(echo $COMPARE | wc -w) + EVAL_BASE ))
 TOTAL_HOURS=${TOTAL_HOURS:-}            # empty = finish in this session; 18 = plan for two sessions
 
 # ----------------------------------------------------------------------------------------- data settings
@@ -63,7 +68,7 @@ EVAL_ZIP_REPO=${EVAL_ZIP_REPO:-$HF_USER/s2s-checkpoints}             # where you
 EVAL_ZIP=${EVAL_ZIP:-Yesterday_Qwen3VL_FineTune_2026-10-21.zip}
 
 # ----------------------------------------------------------------------------------------- training settings
-EPOCHS=${EPOCHS:-1}                     # one pass over all images; the time budget may end it earlier
+EPOCHS=${EPOCHS:-2}                     # up to two passes; the time budget fits the cosine to what the session allows
 LR=${LR:-$([ -n "$INIT_FROM" ] && echo 5e-5 || echo 1e-4)}   # continuing from a trained LoRA: half the step size
 LORA_RANK=${LORA_RANK:-16}
 LORA_ALPHA=${LORA_ALPHA:-32}
@@ -72,6 +77,8 @@ SAVE_STEPS=${SAVE_STEPS:-50}            # ~20-25 min of training between checkpo
 NGPU=${NGPU:-$(python -c "import torch; print(max(1, torch.cuda.device_count()))" 2>/dev/null || echo 1)}
 
 say() { echo "[$(date '+%H:%M:%S')] $*"; }
+EVAL_RESERVE_H=${EVAL_RESERVE_H:-$(python -c "import math; print(round(math.ceil($N_EVAL_JOBS / $NGPU) * $EVAL_JOB_H + 0.2, 2))")}
+export EVAL_BATCH
 
 hf_token() {
     if [ -z "${HF_TOKEN:-}" ]; then
@@ -97,23 +104,30 @@ print('swift', swift.__version__, '| transformers', transformers.__version__, '|
       '| torchao usable:', is_torchao_available())"
 }
 
-fetch_init() {
-    INIT_ARGS=()
-    [ -n "$INIT_FROM" ] || return 0
-    if [ ! -f "$INIT_DIR/adapter_config.json" ]; then
-        say ">>> starting LoRA: $INIT_FROM/last-checkpoint"
-        python - "$INIT_FROM" "$INIT_DIR" <<'EOF'
+# download a run's LoRA (its last-checkpoint on HF, adapter files only) once:  fetch_lora <repo> <dir>
+fetch_lora() {
+    [ -f "$2/adapter_config.json" ] && return 0
+    say ">>> LoRA: $1/last-checkpoint -> $2"
+    python - "$1" "$2" <<'EOF'
 import os, shutil, sys
 from huggingface_hub import snapshot_download
 repo, out = sys.argv[1:]
-d = snapshot_download(repo, allow_patterns=["last-checkpoint/*"], local_dir=out + "_dl")
+d = snapshot_download(repo, allow_patterns=["last-checkpoint/adapter_*", "last-checkpoint/*.json"], local_dir=out + "_dl")
 os.makedirs(out, exist_ok=True)
 for f in os.listdir(f"{d}/last-checkpoint"):            # the LoRA only: no optimizer, no trainer state
     if f.startswith("adapter_") or f in ("args.json", "additional_config.json"):
         shutil.copy(f"{d}/last-checkpoint/{f}", out)
 print("LoRA files:", sorted(os.listdir(out)))
 EOF
-    fi
+}
+
+# eval name of a run's repo: qwen3vl-room-lora -> v1, qwen3vl-room-lora-v2 -> v2
+run_tag() { local n; n=$(basename "$1"); case "$n" in *-lora) echo v1 ;; *-lora-*) echo "${n##*-lora-}" ;; *) echo "$n" ;; esac; }
+
+fetch_init() {
+    INIT_ARGS=()
+    [ -n "$INIT_FROM" ] || return 0
+    fetch_lora "$INIT_FROM" "$INIT_DIR"
     INIT_ARGS=(--adapters "$INIT_DIR")
 }
 
@@ -197,12 +211,15 @@ data() {
         --home-val "$DATA/home_val/count_sft.jsonl" --max-per-source "$EVAL_PER_SOURCE" \
         ${EVAL_DIR:+--frozen "$EVAL_DIR"}
     cp "$DATA/eval/eval_set.jsonl" "$OUT/eval_set.jsonl"
+    say ">>> data check (stops here if the mix repeats a known mistake)"
+    python "$HERE/check_data.py" "$DATA/sft/train.jsonl" --eval "$DATA/eval/eval_set.jsonl"
 }
 
 latest_ckpt() { ls -d "$OUT"/checkpoint-* 2>/dev/null | sort -t- -k2 -n | tail -1 || true; }
 
 train() {
     [ -f "$DATA/sft/train.jsonl" ] || { echo "no $DATA/sft/train.jsonl: run the data phase first"; exit 1; }
+    python "$HERE/check_data.py" "$DATA/sft/train.jsonl" > /dev/null || { echo "data check failed: see the data phase"; exit 1; }
     hf_token
     # continue from the last checkpoint: local one, else the one on Hugging Face (a previous session)
     if [ -z "$(latest_ckpt)" ] && [ -n "$HF_CKPT_REPO" ]; then
@@ -230,7 +247,7 @@ EOF
     export TOTAL_HOURS=${TOTAL_HOURS:-$TRAIN_HOURS}
     rows=$(wc -l < "$DATA/sft/train.jsonl")
     say ">>> train: $rows rows, $NGPU GPU(s), image tokens $IMAGE_MAX_TOKEN_NUM, $TRAIN_HOURS h in this session" \
-        "(run planned for $TOTAL_HOURS h), run $RUN from ${INIT_FROM:-zero}, lr $LR, $DTYPE, 4-bit=$QUANT, checkpoints every $SAVE_STEPS updates -> ${HF_CKPT_REPO:-local only}"
+        "(run planned for $TOTAL_HOURS h, $EVAL_RESERVE_H h kept for $N_EVAL_JOBS eval jobs), run $RUN from ${INIT_FROM:-zero}, lr $LR, $EPOCHS epochs max, $DTYPE, 4-bit=$QUANT, checkpoints every $SAVE_STEPS updates -> ${HF_CKPT_REPO:-local only}"
     swift_sft "$DATA/sft/train.jsonl" "$DATA/sft/val.jsonl" "$OUT" \
         --eval_steps 200 --save_steps "$SAVE_STEPS" --save_total_limit 2 --logging_steps 10 \
         "${RESUME[@]}"
@@ -259,10 +276,13 @@ evaluate() {
     [ -f "$ES" ] || { echo "no $ES: run the data phase first (it builds the eval set)"; exit 1; }
     ck=${ADAPTER:-$(latest_ckpt)}
     [ -n "$ck" ] || { echo "no checkpoint in $OUT"; exit 1; }
-    fetch_init
-    # jobs: this run, the run it started from, the base model; spread over the GPUs, each GPU one after the other
+    # jobs: this run, the runs in COMPARE, optionally the base; spread over the GPUs, each GPU one after the other
     JOBS=("$RUN|$ck")
-    [ -n "$INIT_FROM" ] && JOBS+=("$(basename "$INIT_FROM")|$INIT_DIR")
+    for r in $COMPARE; do
+        t=$(run_tag "$r")
+        if [ "$r" = "$INIT_FROM" ]; then fetch_lora "$r" "$INIT_DIR"; d=$INIT_DIR; else d=/tmp/vl_cmp/$t; fetch_lora "$r" "$d"; fi
+        JOBS+=("$t|$d")
+    done
     [ "$EVAL_BASE" = 1 ] && JOBS+=("base|")
     Q4=$([ "$QUANT" = 1 ] && echo --quant4 || true)
     say ">>> eval on $(wc -l < "$ES") images: ${JOBS[*]%%|*} on $NGPU GPU(s)"
@@ -273,7 +293,7 @@ evaluate() {
                 [ $((i % NGPU)) = "$g" ] || continue
                 tag=${JOBS[$i]%%|*}; ad=${JOBS[$i]#*|}
                 CUDA_VISIBLE_DEVICES=$g python "$HERE/eval_counts.py" run --eval-set "$ES" --model "$MODEL" --tag "$tag" \
-                    ${ad:+--adapter "$ad"} $Q4 --out "$WORK/pred_$tag.json" > "$WORK/eval_$tag.log" 2>&1 \
+                    ${ad:+--adapter "$ad"} $Q4 --batch "$EVAL_BATCH" --out "$WORK/pred_$tag.json" > "$WORK/eval_$tag.log" 2>&1 \
                     && echo "  [$tag] done" || { echo "  [$tag] FAILED:"; tail -15 "$WORK/eval_$tag.log"; }
             done
         ) &

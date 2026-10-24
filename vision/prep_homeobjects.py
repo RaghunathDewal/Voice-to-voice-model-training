@@ -17,7 +17,7 @@ import os
 import random
 from collections import Counter
 
-from common import ZeroBudget, count_row
+from common import MAX_PRESENT, ZERO_SHARE, allocate_zeros, count_row, print_zero_report
 
 # HomeObjects class id -> YOUR class name (same names as prep_lvis.py)
 NAMES = ["bed", "sofa", "chair", "table", "lamp", "television", "laptop", "wardrobe",
@@ -43,46 +43,43 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--root", default="data/homeobjects-3K")
     p.add_argument("--out", default="data/home")
-    p.add_argument("--max-names", type=int, default=6, help="classes asked in one count row")
-    p.add_argument("--zero-ratio", type=float, default=0.4, help="see common.py")
+    p.add_argument("--zero-share", type=float, default=ZERO_SHARE, help="per class share of 0 answers (common.py)")
     p.add_argument("--max-count", type=int, default=30)
     p.add_argument("--split", default="train", choices=["train", "val"])
     p.add_argument("--seed", type=int, default=0)
     a = p.parse_args()
     random.seed(a.seed)
     os.makedirs(a.out, exist_ok=True)
-    items = []
-    for img in sorted(glob.glob(f"{a.root}/images/{a.split}/*.jpg")):
-        boxes = read_yolo(f"{a.root}/labels/{a.split}/{os.path.splitext(os.path.basename(img))[0]}.txt")
-        items.append((os.path.abspath(img), boxes, Counter(c for c, _ in boxes)))
-    budget = ZeroBudget(Counter(c for _, _, n in items for c in n), a.zero_ratio)
-    st = Counter()
-    f_cnt = open(f"{a.out}/count_sft.jsonl", "w")
-    f_gnd = open(f"{a.out}/ground_sft.jsonl", "w")
-    for img, boxes, n in items:
-        present = [c for c in n if n[c] <= a.max_count]
-        if not present:
-            continue
-        if len(present) > a.max_names - 1:
-            present = random.sample(present, a.max_names - 1)
-        counts = {c: n[c] for c in present}
-        # HomeObjects labels all 12 classes on every image: any absent one is a real missing item
-        z = budget.pick([c for c in NAMES if n[c] == 0], AREA_OF, present)
-        if z:
-            counts[z] = 0
-        f_cnt.write(json.dumps(count_row(img, counts)) + "\n")
-        st["count_rows"] += 1
-        for c in counts:
-            st[f"{c}_{'present' if counts[c] else 'zero'}"] += 1
-        for c in sorted(n):
-            f_gnd.write(json.dumps({"messages": [
-                {"role": "user", "content": "<image>" + GROUND_PROMPT.format(name=c)},
-                {"role": "assistant", "content": json.dumps([{"bbox_2d": b, "label": c} for k, b in boxes if k == c])}],
-                "images": [img]}) + "\n")
-            st["ground_rows"] += 1
-    zeros = sum(v for k, v in st.items() if k.endswith("_zero"))
-    answers = sum(v for k, v in st.items() if k.endswith("_zero") or k.endswith("_present"))
-    print(json.dumps(dict(sorted(st.items()))), f"zero share {zeros / max(1, answers):.0%}")
+    imgs, present, visible, absent = [], [], [], []
+    n_ground = 0
+    with open(f"{a.out}/ground_sft.jsonl", "w") as f_gnd:
+        for img in sorted(glob.glob(f"{a.root}/images/{a.split}/*.jpg")):
+            boxes = read_yolo(f"{a.root}/labels/{a.split}/{os.path.splitext(os.path.basename(img))[0]}.txt")
+            n = Counter(c for c, _ in boxes)
+            img = os.path.abspath(img)
+            for c in sorted(n):
+                f_gnd.write(json.dumps({"messages": [
+                    {"role": "user", "content": "<image>" + GROUND_PROMPT.format(name=c)},
+                    {"role": "assistant", "content": json.dumps([{"bbox_2d": b, "label": c} for k, b in boxes if k == c])}],
+                    "images": [img]}) + "\n")
+                n_ground += 1
+            counts = {c: k for c, k in n.items() if k <= a.max_count}
+            if not counts:
+                continue
+            if len(counts) > MAX_PRESENT:
+                counts = {c: counts[c] for c in random.sample(list(counts), MAX_PRESENT)}
+            imgs.append(img)
+            present.append(counts)
+            visible.append(set(n))
+            absent.append([c for c in NAMES if n[c] == 0])   # all 12 labelled on every image: absent = really absent
+    zeros, report = allocate_zeros(present, visible, absent, AREA_OF, share=a.zero_share)
+    with open(f"{a.out}/count_sft.jsonl", "w") as f_cnt:
+        for img, counts, zs in zip(imgs, present, zeros):
+            if counts or zs:
+                f_cnt.write(json.dumps(count_row(img, {**counts, **{z: 0 for z in zs}})) + "\n")
+    json.dump(report, open(f"{a.out}/zero_report.json", "w"), indent=1)
+    print(f"{len(imgs)} counting rows, {n_ground} grounding rows ({a.split})")
+    print_zero_report(report, f"HomeObjects {a.split}")
 
 
 if __name__ == "__main__":

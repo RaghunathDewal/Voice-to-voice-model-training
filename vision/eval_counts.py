@@ -4,9 +4,9 @@
     python eval_counts.py run --eval-set data/eval/eval_set.jsonl --tag finetuned --adapter out/.../checkpoint-N --out pred_ft.json
     python eval_counts.py report pred_base.json pred_ft.json --out eval_results.json
 
-(run_kaggle.sh eval runs base on GPU 0 and finetuned on GPU 1 at the same time, then the report.)
-Same model loading as training (DTYPE, or 4-bit with --quant4), same prompt as training, same image size (IMAGE_MAX_TOKEN_NUM x 32 x 32 pixels, what
-ms-swift used in training), greedy decoding. Per source (frozen / homeobjects_val / lvis / ...) and per class:
+(run_kaggle.sh eval spreads the models over the GPUs, then writes one report.)
+Everything goes through vl_infer.RoomModel (the same path production uses): same loading as training, same prompts
+(common.py), same image size (IMAGE_MAX_TOKEN_NUM x 32 x 32), greedy decoding, batched. Per source (frozen / homeobjects_val / lvis / ...) and per class:
   acc             exact count right
   present         exact count right when the item is there
   missing_recall  the item is gone and the model says 0: the alert is caught
@@ -19,40 +19,20 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 from collections import defaultdict
 
-from common import COUNT_PROMPT, EXTRA_PROMPT, same_object
-
-MAIN = ["pillow", "towel", "lamp", "chair"]
-
-
-def parse(text: str) -> dict:
-    m = re.search(r"\{.*\}", text, re.DOTALL)
-    try:
-        objs = json.loads(m.group(0)).get("objects", []) if m else []
-        return {str(o["label"]).lower(): int(o["detected_count"]) for o in objs}
-    except Exception:  # noqa: BLE001
-        return {}
-
-
-def parse_extra(text: str) -> dict:
-    m = re.search(r"\{.*\}", text, re.DOTALL)
-    try:
-        items = json.loads(m.group(0)).get("new_items", []) if m else []
-        return {str(o["label"]).lower(): int(o.get("count", 1)) for o in items}
-    except Exception:  # noqa: BLE001
-        return {}
+from common import MAIN, clean_new_items, same_object
 
 
 def score_extra(rows: list[dict]) -> dict | None:
-    """New-items check: recall = real other objects the model lists, precision = listed objects that are real."""
+    """New-items check on what production code would keep (count > 0, not an expected item, not a room part):
+    recall = real other objects found, precision = listed objects that are real."""
     rows = [r for r in rows if "extra_pred" in r]
     if not rows:
         return None
     gt_n = hit_gt = pred_n = hit_pred = 0
     for r in rows:
-        gt, pred = list(r["extra_gt"]), list(r["extra_pred"])
+        gt, pred = list(r["extra_gt"]), list(clean_new_items(r["extra_pred"], r["classes"]))
         gt_n += len(gt)
         pred_n += len(pred)
         hit_gt += sum(any(same_object(g, p) for p in pred) for g in gt)
@@ -63,44 +43,25 @@ def score_extra(rows: list[dict]) -> dict | None:
 
 
 def run(a) -> None:
-    import torch
-    from qwen_vl_utils import process_vision_info
-    from transformers import AutoProcessor, BitsAndBytesConfig, Qwen3VLForConditionalGeneration
+    from vl_infer import RoomModel
 
     rows = [json.loads(l) for l in open(a.eval_set)]
-    dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16}[a.dtype]
-    q = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True,
-                           bnb_4bit_compute_dtype=dtype) if a.quant4 else None   # same base as training
-    model = Qwen3VLForConditionalGeneration.from_pretrained(a.model, quantization_config=q, dtype=dtype,
-                                                            device_map="auto")
-    if a.adapter:
-        from peft import PeftModel
-        model = PeftModel.from_pretrained(model, a.adapter)
-    model.eval()
-    processor = AutoProcessor.from_pretrained(a.model)
-    max_pixels = a.image_tokens * 32 * 32
+    m = RoomModel(a.model, adapter=a.adapter or None, dtype=a.dtype, quant4=a.quant4, image_tokens=a.image_tokens)
     out = []
-    def ask(path: str, prompt: str, max_new: int) -> str:
-        msgs = [{"role": "user", "content": [
-            {"type": "image", "image": path, "max_pixels": max_pixels}, {"type": "text", "text": prompt}]}]
-        text = processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-        images, _ = process_vision_info(msgs, image_patch_size=16)
-        inp = processor(text=[text], images=images, do_resize=False, return_tensors="pt").to(model.device)
-        with torch.inference_mode():
-            gen = model.generate(**inp, max_new_tokens=max_new, do_sample=False)
-        return processor.batch_decode(gen[:, inp.input_ids.shape[1]:], skip_special_tokens=True)[0]
-
-    for i, r in enumerate(rows):
-        names = ", ".join(r["classes"])
-        reply = ask(r["images"][0], COUNT_PROMPT.format(names=names), 60 + 25 * len(r["classes"]))
-        res = {**r, "reply": reply, "pred": parse(reply)}
-        if "extra_gt" in r:                            # "new items" check (frozen rooms: full inventory known)
-            extra_reply = ask(r["images"][0], EXTRA_PROMPT.format(names=names), 400)
-            res.update(extra_reply=extra_reply, extra_pred=parse_extra(extra_reply))
-        out.append(res)
-        if (i + 1) % 25 == 0:
-            print(f"  [{a.tag}] {i + 1}/{len(rows)}", flush=True)
-            json.dump({"tag": a.tag, "adapter": a.adapter, "rows": out}, open(a.out, "w"))
+    step = 24
+    for i in range(0, len(rows), step):                # chunks: progress + partial results on disk
+        chunk = rows[i:i + step]
+        counted = m.count([r["images"][0] for r in chunk], [r["classes"] for r in chunk], batch=a.batch)
+        res = [{**r, "reply": rep, "pred": pred} for r, (pred, rep) in zip(chunk, counted)]
+        extra = [k for k, r in enumerate(chunk) if "extra_gt" in r]   # frozen rooms: full inventory known
+        if extra:
+            found = m.new_items([chunk[k]["images"][0] for k in extra], [chunk[k]["classes"] for k in extra],
+                                batch=a.batch)
+            for k, (pred, rep) in zip(extra, found):
+                res[k].update(extra_reply=rep, extra_pred=pred)
+        out += res
+        print(f"  [{a.tag}] {len(out)}/{len(rows)}", flush=True)
+        json.dump({"tag": a.tag, "adapter": a.adapter, "rows": out}, open(a.out, "w"))
     json.dump({"tag": a.tag, "adapter": a.adapter, "image_tokens": a.image_tokens, "rows": out}, open(a.out, "w"))
     print(f"[{a.tag}] done -> {a.out}")
 
@@ -177,7 +138,8 @@ def main() -> None:
     r.add_argument("--adapter", default="", help="LoRA checkpoint dir; empty = base model")
     r.add_argument("--tag", default="base")
     r.add_argument("--image-tokens", type=int, default=int(os.environ.get("IMAGE_MAX_TOKEN_NUM", 768)))
-    r.add_argument("--dtype", default=os.environ.get("DTYPE", "float16"), choices=["float16", "bfloat16"],
+    r.add_argument("--batch", type=int, default=int(os.environ.get("EVAL_BATCH", 4)), help="questions per generate call")
+    r.add_argument("--dtype", default=os.environ.get("DTYPE") or None, choices=["float16", "bfloat16"],
                    help="same as training (run_kaggle.sh: fp16 on T4, bf16 on A100/L4)")
     r.add_argument("--quant4", action="store_true", help="load the base in 4-bit (only if training used QUANT=1)")
     r.add_argument("--out", required=True)

@@ -34,10 +34,12 @@ def frozen_rows(d: str) -> list[dict]:
             continue
         full = item.get("full_counts") or {}
         gt = {c: item["baseline"].get(c, 0) for c in ("pillow", "towel", "chair")}
-        # training has ONE lamp class (LVIS and HomeObjects cannot tell bedside from floor lamps)
-        gt["lamp"] = sum(v for k, v in full.items() if k.endswith("lamp")) if full else item["baseline"].get("bedside lamp", 0)
+        # training has ONE lamp class: movable lamps (bedside / desk / floor); LVIS and HomeObjects cannot tell them
+        # apart. Ceiling and pendant fixtures are not "lamp" (LVIS has chandelier for those).
+        is_lamp = lambda k: k.endswith("lamp") and not k.startswith(("ceiling", "pendant"))  # noqa: E731
+        gt["lamp"] = sum(v for k, v in full.items() if is_lamp(k)) if full else item["baseline"].get("bedside lamp", 0)
         # every OTHER object in the room (full_counts is a full inventory): the "new items" check
-        extra = {k: v for k, v in full.items() if v and not (k in ("pillow", "towel", "chair") or k.endswith("lamp"))}
+        extra = {k: v for k, v in full.items() if v and not (k in ("pillow", "towel", "chair") or is_lamp(k))}
         out.append({"source": "frozen", "images": [path], "classes": MAIN, "gt": {c: gt[c] for c in MAIN},
                     "extra_gt": extra})
     return out

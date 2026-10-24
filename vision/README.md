@@ -1,47 +1,79 @@
-# Qwen3-VL-4B room inventory fine-tune (Kaggle)
+# Qwen3-VL-4B room inventory (Kaggle)
 
-Counting and box-finding ("how many pillows", "locate every towel") for hotel rooms, trained with QLoRA in ms-swift
-on Kaggle's free GPU T4 x2. One script, `run_kaggle.sh`, with the phases `setup`, `data`, `train` and `eval`.
+Hotel room check after a stay: the **before** inventory (`pillow 4, towel 2, lamp 2, kettle 1 ...`) and the **after**
+photo(s) go in; **missing / changed / new** items come out. Qwen3-VL-4B with a LoRA trained in ms-swift on Kaggle's free
+GPU T4 x2. One script, `run_kaggle.sh`: `setup`, `smoke`, `data`, `train`, `eval`.
 
-| File | What it does |
-|---|---|
-| `run_kaggle.sh` | the four phases, every setting at the top |
-| `prep_homeobjects.py` | HomeObjects-3K **train** split -> count + box rows over its 12 classes (it has no pillow / towel, so they are never asked there) |
-| `prep_lvis.py` | Voxel51/LVIS -> 120 hotel classes in 5 areas (bedroom, bathroom, living, kitchen, building); zeros only where the official LVIS file says "verified absent" |
-| `mix_data.py` | all rows -> `train.jsonl` + `val.jsonl` (an image's rows stay in one split) |
-| `smoke_check.py` | reads the smoke-test log: did updates finish, speed, memory |
-| `common.py` | the production counting prompt and the rule for zeros (scene-matched, capped), shared by the preps and the eval |
-| `time_budget.py` | ms-swift plugin: fits the cosine learning rate into the session time, saves and stops at the deadline, uploads every checkpoint to Hugging Face |
-| `build_eval_set.py` | the mixed eval set (below), built in the `data` phase |
-| `eval_counts.py` | base (GPU 0) and fine-tuned (GPU 1) at the same time on the eval set, same image size as training; reports present / absent accuracy and the "always 0" floor per source and per class |
+## How it works in production (`infer_room.py`)
+
+| Call | Question to the model | Model | Catches |
+|---|---|---|---|
+| 1 | "Expected items from the previous inspection: pillow, towel, lamp, kettle. Count how many of each are in this image now (0 if it is not there)." | **fine-tuned LoRA** | missing items (0) and changed counts |
+| 2 | "... List every OTHER object you can see that is not one of those, with how many." | **base model** (LoRA switched off) | new / left-behind items |
+
+The model only counts; the comparison with the before inventory is code you control (tolerance per item, several
+photos per room: max count over the photos). A count is per photo: an item out of frame counts 0, so take the after
+photos like the before ones.
+```
+python infer_room.py --before before.json --images after_1.jpg after_2.jpg --adapter ThunderBlade7773/qwen3vl-room-lora-v3
+```
 
 ## Runs
 
-| Run | Data | Starts from | Saved to (HF) | Result |
-|---|---|---|---|---|
-| v1 | "Count the following objects" prompt, LVIS cushion merged into pillow, ~3 zero answers per present one for some classes | zero | `qwen3vl-room-lora` | 65 -> 79% exact overall; pillow over-counted (sofa cushions), towel said 0 when there |
-| **v2** (default) | production prompt ("Expected items from the previous inspection: ... 0 if it is not there"), at most one missing item per question and only one that fits the scene (common.py), zeros per class <= 0.4 x present, cushion its own class | v1's LoRA (`--adapters`), lr 5e-5 | `qwen3vl-room-lora-v2` | eval: v2 vs v1 vs base |
+| Run | Data | Starts from | HF repo | Frozen rooms (exact) | Missing caught (main 4) |
+|---|---|---|---|---|---|
+| base | - | - | - | 73.1 | 76.3 |
+| v1 | old prompt, zeros from any class (towel ~75% zeros), cushion merged into pillow | zero | `qwen3vl-room-lora` | **75.3** | **85.9** |
+| v2 | production prompt, ~13% zeros, only "scene-matched" ones | v1 | `qwen3vl-room-lora-v2` | 50.3 | 53.8: claimed pillows in 31 of 40 rooms without |
+| **v3** | production prompt, **~1/3 zeros for every class**, any item can be missing in any indoor photo, data gate | v2 | `qwen3vl-room-lora-v3` | this run | this run |
 
-`RUN=v3 INIT_FROM=ThunderBlade7773/qwen3vl-room-lora-v2` for a next round; `INIT_FROM=` (empty) to start from zero.
+(v1 / v2 numbers: the v2 run's eval, same frozen questions as v3. v3's eval runs v1 and v2 again on its eval set.)
+
+## Rules learned (do / do not)
+
+1. **Only real zeros.** A class that is not labelled in a photo is unknown, not 0 (v0 answered 0 for everything).
+   Zeros come from LVIS "verified absent" or HomeObjects (all 12 classes labelled on every image).
+2. **Every class answered 0 in about 1/3 of the questions about it.** Too many zeros -> "towel = 0" (v1); too few ->
+   "on the list = there" (v2). `common.allocate_zeros` gives each class its share; a class that cannot get enough
+   real zeros (LVIS rarely verifies "no pillow") is asked less often where it is present, down to 25%.
+3. **A missing item can be any item in any indoor photo** (a towel or a kettle asked in a living room: hotel
+   checklists do that). Never an item whose near-twin is visible (pillow / cushion, lamp / lampshade ...).
+4. **Same prompt in training, eval and production** (`common.py`), same image size (`IMAGE_MAX_TOKEN_NUM`), same
+   inference code (`vl_infer.py`).
+5. **Compare models only on the same eval set**, in the same run. The 79 frozen rooms (real rooms, checked inventory)
+   decide; HomeObjects val / LVIS held-out look like the training data and flatter the fine-tune.
+6. **"New items" are not trained** on partial labels (it would teach leaving unlabelled things out). Fine-tuning
+   narrows open listing (v2 found 33% of other objects vs base 48%), so call 2 uses the base model.
+7. **fp16 on T4, never bf16** (emulated, 12x slower). No 4-bit on T4 (slower, and the 4B fits in fp16).
+8. **Gate before GPU hours:** `check_data.py` stops the run if a main class has <15% or >50% zeros, a question is not
+   the production prompt, or an eval image is in training. `smoke` runs 3 real updates before the data phase.
+
+## Files
+
+| File | What it does |
+|---|---|
+| `run_kaggle.sh` | the phases, every setting at the top |
+| `common.py` | prompts, the zero policy (`allocate_zeros`), near-twins, label matching for new items |
+| `prep_lvis.py` | Voxel51/LVIS -> 120 hotel classes in 5 areas; boxes -> counts; LVIS verified absences -> zeros |
+| `prep_homeobjects.py` | HomeObjects-3K train (training) and val (eval) -> counting + box rows over its 12 classes |
+| `mix_data.py` | all rows -> `train.jsonl` / `val.jsonl` / held-out `test.jsonl` (an image's rows stay in one split) |
+| `build_eval_set.py` | eval set: 79 frozen rooms + HomeObjects val + held-out LVIS |
+| `check_data.py` | the data gate (rule 8) |
+| `smoke_check.py` | reads the smoke test: updates finished, speed, memory |
+| `time_budget.py` | ms-swift plugin: fits the cosine schedule into the session, stops at the deadline, uploads every checkpoint |
+| `vl_infer.py` | the one inference path (eval and production): batched, LoRA on/off |
+| `eval_counts.py` | runs a model on the eval set; report: acc / present / missing caught / false alarms / new items |
+| `infer_room.py` | production: before inventory + after photos -> alerts + new items |
 
 ## Before the first run
 
 1. Notebook settings: **Accelerator GPU T4 x2**, **Internet on**.
-2. Add-ons -> Secrets -> **`HF_TOKEN`** (a token with WRITE access), switched on for this notebook.
-   Checkpoints go to the private repo `ThunderBlade7773/qwen3vl-room-lora` (created on the first save).
-3. Eval set: nothing to upload. The `data` phase builds it from images that are never trained on:
+2. Add-ons -> Secrets -> **`HF_TOKEN`** (WRITE access), switched on for this notebook.
+3. Nothing to upload: the eval set is built in the `data` phase (79 frozen rooms from
+   `Yesterday_Qwen3VL_FineTune_2026-10-21.zip` in `ThunderBlade7773/s2s-checkpoints`, HomeObjects val, held-out LVIS).
 
-   | Source | Images | Classes asked |
-   |---|---|---|
-   | `frozen`: your 79 checked rooms, from `eval_data/` in `Yesterday_Qwen3VL_FineTune_2026-10-21.zip` (downloaded from `ThunderBlade7773/s2s-checkpoints`) | 79 | pillow, towel, lamp, chair |
-   | `homeobjects_val`: HomeObjects **val** split (training uses train only) | 250 | its 12 classes, real zeros |
-   | `lvis`: LVIS images held out by `mix_data.py` (2% of images, never in train or val) | 250 | the hotel classes, zeros only where LVIS verified them |
+## Cells (Save Version -> Save & Run All)
 
-   `EVAL_PER_SOURCE=400` for more; `EVAL_DIR=/kaggle/input/...` to use another frozen folder.
-
-## Cells
-
-**Cell 1: token and code**
 ```python
 import os
 from kaggle_secrets import UserSecretsClient
@@ -49,77 +81,56 @@ os.environ["HF_TOKEN"] = UserSecretsClient().get_secret("HF_TOKEN")
 !rm -rf /tmp/repo && git clone -q -b vision-qwen3vl https://github.com/RaghunathDewal/Voice-to-voice-model-training.git /tmp/repo
 !ls /tmp/repo/vision
 ```
-
-**Cell 2: install (~5-10 min)**
 ```python
-!bash /tmp/repo/vision/run_kaggle.sh setup
+!bash /tmp/repo/vision/run_kaggle.sh setup      # ~2 min
 ```
-
-**Cell 2b: smoke test (~10 min): 3 real training updates on 64 rows, BEFORE the long data step**
 ```python
-!bash /tmp/repo/vision/run_kaggle.sh smoke
+!bash /tmp/repo/vision/run_kaggle.sh smoke      # ~4 min: 3 real updates from the starting LoRA, must say SMOKE TEST OK
 ```
-Must end with `SMOKE TEST OK: ... s per update, GPU memory ... GiB`. If it says FAILED, stop and fix first.
-
-**Cell 3: data preparation (~30-40 min: HomeObjects, LVIS annotations, ~30k LVIS images, mix)**
 ```python
-!bash /tmp/repo/vision/run_kaggle.sh data
+!bash /tmp/repo/vision/run_kaggle.sh data       # ~35 min, ends with DATA CHECK OK
 ```
-
-**Cell 4: training (~7 h: the rest of the session minus ~2 h kept for the eval)**
 ```python
-!bash /tmp/repo/vision/run_kaggle.sh train
+!bash /tmp/repo/vision/run_kaggle.sh train      # the rest of the session minus the eval reserve (~7.5 h)
 ```
-
-**Cell 5: eval, v2 vs v1 vs base (~2 h for ~480 images: v2 then base on GPU 0, v1 on GPU 1)**
 ```python
-!bash /tmp/repo/vision/run_kaggle.sh eval
+!bash /tmp/repo/vision/run_kaggle.sh eval       # ~1.6-2 h: v3 and v1 on the two GPUs, then v2
 ```
+If the session dies: run the same cells again; `train` continues from `last-checkpoint` on HF.
 
-Then **Save Version -> Save & Run All (Commit)**. Results: `/kaggle/working/eval_results.json` (also uploaded to the HF
-repo), checkpoints in `/kaggle/working/out/qwen3vl-room/` and on HF as `last-checkpoint/`.
-
-## Settings you may change (put them in front of the command)
+## Settings (put them in front of the command, e.g. `!EVAL_BASE=1 bash ... eval`)
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `RUN` | v2 | run name: output folder and HF repo `qwen3vl-room-lora-<RUN>` |
-| `INIT_FROM` | `ThunderBlade7773/qwen3vl-room-lora` (v1) | LoRA to start from (its `last-checkpoint`); empty = from zero |
-| `LR` | 5e-5 when continuing, 1e-4 from zero | learning rate |
+| `RUN` | v3 | run name: output folder and HF repo `qwen3vl-room-lora-<RUN>` |
+| `INIT_FROM` | `qwen3vl-room-lora-v2` | LoRA to start from (its `last-checkpoint`); empty = from zero |
+| `COMPARE` | v1 and v2 repos | earlier runs evaluated next to this one |
+| `EVAL_BASE` | 0 | 1 = also the base model (+~0.8 h) |
+| `EVAL_BATCH`, `EVAL_JOB_H` | 4, 0.8 | eval batch; hours per model, used to reserve time for the eval |
+| `EPOCHS` | 2 | at most; the time budget fits what the session allows |
+| `LR` | 5e-5 continuing, 1e-4 from zero | learning rate |
 | `SESSION_HOURS` | 10 | what one session may use in total (Kaggle stops a commit at 12 h) |
-| `EVAL_BASE` | 1 | 0 = skip the base model in the eval (saves ~1 h, more training) |
-| `EVAL_PER_SOURCE` | 200 | eval images per source (the 79 frozen rooms always all) |
-| `TOTAL_HOURS` | = this session's training time | `14` = one run over two commits |
-| `IMAGE_MAX_TOKEN_NUM` | 768 | image size (1 token = 32x32 px); `512` is ~30% faster |
-| `DTYPE` | float16 on T4, bfloat16 on A100/L4/H100 | precision (bf16 is emulated and ~10x slower on a T4) |
-| `QUANT` | 0 | 1 = 4-bit base (only if out of memory) |
-| `LVIS_IMAGES`, `LVIS_GROUPS` | all | which LVIS images / areas |
-| `GROUND_SHARE` | 0.2 | share of "locate every X" rows |
-| `SAVE_STEPS` | 50 | updates between checkpoints |
-| `EXTRA` | empty | your own rows, `"/kaggle/input/x/rows.jsonl:1.0"` (same `messages` + `images` format) |
+| `TOTAL_HOURS` | this session | `16` = one run over two commits |
+| `IMAGE_MAX_TOKEN_NUM` | 768 | image size (1 token = 32x32 px) |
+| `DTYPE` / `QUANT` | fp16 on T4 / 0 | precision / 4-bit base |
+| `LVIS_IMAGES`, `LVIS_GROUPS`, `GROUND_SHARE` | all, all, 0.2 | data |
+| `EXTRA` | empty | your own rows `"/kaggle/input/x/rows.jsonl:1.0"` (same `messages` + `images` format) |
 
-## What the eval reports
+## The eval report
 
-Per model, for all sources, each source, and pillow / towel / lamp / chair:
-`acc` exact count | `pres` exact when the item is there | `miss` the item is gone and the model says 0 (the alert is
-caught) | `f.al` the item is there but the model says 0 (a false alarm, lower is better) | `off1` within +-1.
-The model only counts; comparing with the "before" inventory and deciding what to alert on is done in code.
+Per model: `acc` exact count | `pres` exact when the item is there | `miss` the item is gone and the model says 0
+(alert caught) | `f.al` the item is there but the model says 0 (false alarm, lower is better) | `off1` within +-1;
+for all sources, each source, and pillow / towel / lamp / chair. Then **new items** on the 79 frozen rooms (full
+inventory): share of the real other objects found, share of what is listed that is real (after the cleaning
+production does: count > 0, not an expected item, not a wall / floor / ceiling).
 
-## If the session stops before the end
+## Next (beyond public data)
 
-Run the same cells again (or commit again). `data` rebuilds the same rows (fixed seed), `train` downloads
-`last-checkpoint` from Hugging Face and continues from that update with the same learning-rate plan.
-
-## Expected numbers
-
-- ~32k counting rows (one per image) + ~8k box rows = ~40k rows; ~16 rows per update on 2 GPUs.
-- One 10 h session reaches roughly half of them; `TOTAL_HOURS=18` and two commits covers all.
-- The eval prints base and fine-tuned side by side, for all sources together, each source on its own, and
-  pillow / towel / lamp / chair: exact-count accuracy, accuracy on images that HAVE the object, on images without
-  it, off-by-one, and the "always 0" floor. A model has learned something only if it beats that floor. Every
-  class's numbers are in `eval_results.json`.
+The biggest gain left is **your own hotel photos**: a few thousand, labelled with a full inventory by a teacher model
+(as the frozen set was), added with `EXTRA`. That also allows training call 2 (new items) properly, and pairs of
+before / after photos would allow the visual-difference task.
 
 ## Licences
 
 LVIS annotations CC BY 4.0, COCO images mixed Flickr licences; HomeObjects-3K AGPL-3.0 (Ultralytics). Check both
-before any commercial use of the trained adapter.
+before commercial use of the trained adapter.

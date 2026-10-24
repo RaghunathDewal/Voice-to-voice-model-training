@@ -30,7 +30,7 @@ from collections import Counter, defaultdict
 
 import requests
 
-from common import ZeroBudget, count_row
+from common import MAX_PRESENT, ZERO_SHARE, allocate_zeros, count_row, print_zero_report
 
 REPO = "https://huggingface.co/datasets/Voxel51/LVIS/resolve/main"
 
@@ -238,9 +238,7 @@ def main() -> None:
     p.add_argument("--max-images", type=int, default=0, help="keep at most N images (0 = all ~30k)")
     p.add_argument("--min-area", type=float, default=0.0005, help="boxes under this share of the image = too small")
     p.add_argument("--max-count", type=int, default=30, help="skip a count above this (too crowded to count)")
-    p.add_argument("--zero-ratio", type=float, default=0.4,
-                   help="per class: zero answers <= ratio x rows where it is present (common.py)")
-    p.add_argument("--max-names", type=int, default=8, help="classes asked about in one count row")
+    p.add_argument("--zero-share", type=float, default=ZERO_SHARE, help="per class share of 0 answers (common.py)")
     p.add_argument("--download", action="store_true", help="download the kept images into OUT/images/")
     p.add_argument("--workers", type=int, default=32)
     p.add_argument("--limit", type=int, default=0, help="stop after N samples (testing)")
@@ -316,21 +314,17 @@ def main() -> None:
     with ThreadPoolExecutor(a.workers) as ex:
         paths = list(ex.map(fetch, cands))
 
-    # ---- 4. rows
-    def countable(c):                                  # classes whose box count is the true count
-        return {n: len(bs) for n, bs in c["boxes"].items()
-                if n not in c["not_exhaustive"] and not c["small"].get(n) and len(bs) <= a.max_count}
-    budget = ZeroBudget(Counter(n for c, img in zip(cands, paths) if img for n in countable(c)), a.zero_ratio)
+    # ---- 4. rows: first what each photo can answer, then the missing items for the whole set (common.py)
     st = defaultdict(Counter)
     f_man = open(f"{a.out}/manifest.jsonl", "w")
-    f_cnt = open(f"{a.out}/count_sft.jsonl", "w")
     f_gnd = open(f"{a.out}/ground_sft.jsonl", "w")
+    imgs, present, visible, absent = [], [], [], []
     for c, img in zip(cands, paths):
         if img is None:
             continue
         st["all"]["images"] += 1
         f_man.write(json.dumps({"image": img, **{k: v for k, v in c.items() if k != "filepath"}}) + "\n")
-        counts = countable(c)
+        counts = {}
         for name, bs in c["boxes"].items():
             st[name]["images"] += 1
             st[name]["boxes"] += len(bs)
@@ -341,25 +335,27 @@ def main() -> None:
             elif len(bs) > a.max_count:
                 st[name]["skip_too_many"] += 1
             else:
-                st[name]["present_rows"] += 1
+                counts[name] = len(bs)
                 f_gnd.write(json.dumps(ground_row(img, name, bs)) + "\n")
                 st["all"]["ground_rows"] += 1
         if not counts:
-            continue                                   # nothing countable: no scene to ask "what is missing" in
-        present = list(counts)
-        if len(present) > a.max_names - 1:            # leave room for one missing item
-            present = random.sample(present, a.max_names - 1)
-        counts = {n: counts[n] for n in present}
-        z = budget.pick(c["verified_absent"], AREA_OF, present, prefer=a.priority)
-        if z:
-            counts[z] = 0                              # a missing item that fits the scene (verified absent)
-            st[z]["zero_rows"] += 1
-            st["all"]["zero_answers"] += 1
-        st["all"]["answers"] += len(counts)
-        f_cnt.write(json.dumps(count_row(img, counts)) + "\n")
-        st["all"]["count_rows"] += 1
+            continue                                   # nothing countable in this photo: no question about it
+        if len(counts) > MAX_PRESENT:
+            counts = {n: counts[n] for n in random.sample(list(counts), MAX_PRESENT)}
+        imgs.append(img)
+        present.append(counts)
+        visible.append(set(c["boxes"]) | set(c["small"]))
+        absent.append(c["verified_absent"])
+    zeros, report = allocate_zeros(present, visible, absent, AREA_OF, share=a.zero_share)
+    with open(f"{a.out}/count_sft.jsonl", "w") as f_cnt:
+        for img, counts, zs in zip(imgs, present, zeros):
+            if counts or zs:
+                f_cnt.write(json.dumps(count_row(img, {**counts, **{z: 0 for z in zs}})) + "\n")
+                st["all"]["count_rows"] += 1
+    json.dump(report, open(f"{a.out}/zero_report.json", "w"), indent=1)
     json.dump({k: dict(v) for k, v in sorted(st.items())}, open(f"{a.out}/stats.json", "w"), indent=1)
-    print(json.dumps(dict(st["all"])), f"zero share {st['all']['zero_answers'] / max(1, st['all']['answers']):.0%}")
+    print(json.dumps(dict(st["all"])))
+    print_zero_report(report, "LVIS counting rows")
     for name in sorted(a.priority):
         print(f"  {name:10s} {dict(st[name])}")
 
