@@ -11,7 +11,6 @@ checkpoint's config, and thinking is switched off (Qwen3.5 thinks by default; Qw
 from __future__ import annotations
 
 import contextlib
-import json
 import os
 import re
 
@@ -29,22 +28,30 @@ def default_dtype() -> str:
     return os.environ.get("DTYPE") or ("bfloat16" if ok else "float16")
 
 
+_ITEM = re.compile(r'\{[^{}]*?"label"\s*:\s*"([^"]+)"[^{}]*?\}', re.DOTALL)
+
+
+def _items(text: str, keys: tuple) -> dict:
+    """Every {"label": ..., <count key>: n} object in the answer, however it is wrapped: {"objects": [...]}, a bare
+    list, a code fence, numbers as strings ("2"), or a list cut off by the token limit (complete objects are kept).
+    Qwen3-VL writes {"objects": [...]}; Qwen3.5 writes a bare list in a ```json fence."""
+    out = {}
+    for m in _ITEM.finditer(THINK.sub("", text)):
+        obj = m.group(0)
+        for k in keys:
+            n = re.search(r'"%s"\s*:\s*"?\s*(-?\d+)' % k, obj)
+            if n:
+                out[m.group(1).strip().lower()] = int(n.group(1))
+                break
+    return out
+
+
 def parse_counts(text: str) -> dict:
-    m = re.search(r"\{.*\}", THINK.sub("", text), re.DOTALL)
-    try:
-        objs = json.loads(m.group(0)).get("objects", []) if m else []
-        return {str(o["label"]).lower(): int(o["detected_count"]) for o in objs}
-    except Exception:  # noqa: BLE001
-        return {}
+    return _items(text, ("detected_count", "count", "number", "quantity"))
 
 
 def parse_new_items(text: str) -> dict:
-    m = re.search(r"\{.*\}", THINK.sub("", text), re.DOTALL)
-    try:
-        items = json.loads(m.group(0)).get("new_items", []) if m else []
-        return {str(o["label"]).lower(): int(o.get("count", 1)) for o in items}
-    except Exception:  # noqa: BLE001
-        return {}
+    return _items(text, ("count", "detected_count", "number", "quantity"))
 
 
 def _iou(a: list, b: list) -> float:
@@ -131,5 +138,6 @@ class RoomModel:
                   base_only: bool = False) -> list[tuple[dict, str]]:
         """Call 2: objects NOT on the expected list. base_only=True switches the LoRA off for this call."""
         items = [(img, EXTRA_PROMPT.format(names=", ".join(names))) for img, names in zip(images, expected)]
-        replies = self.generate(items, max_new=400, batch=batch, base_only=base_only)
+        # 800: rooms have 10+ other objects and pretty-printed JSON is long (400 cut answers off in the bench)
+        replies = self.generate(items, max_new=800, batch=batch, base_only=base_only)
         return [(parse_new_items(r), r) for r in replies]

@@ -108,7 +108,29 @@ def box_variants(run_: dict) -> list[dict]:
 
 
 def report(a) -> None:
-    runs = [json.load(open(f)) for f in a.preds]
+    report_runs([json.load(open(f)) for f in a.preds], a.out)
+
+
+def rescore(a) -> None:
+    """Score saved answers again with the current parsers (no model run): a results file from `report`
+    (eval_results.json / bench_results.json) or per-model pred files."""
+    from vl_infer import parse_counts, parse_new_items
+
+    runs = []
+    for f in a.files:
+        d = json.load(open(f))
+        runs += [{"tag": t, "rows": rows} for t, rows in d["preds"].items()] if "preds" in d else [d]
+    for run_ in runs:
+        for r in run_["rows"]:
+            r["pred"] = parse_counts(r.get("reply", ""))
+            if "extra_reply" in r:
+                r["extra_pred"] = parse_new_items(r["extra_reply"])
+        parsed = sum(bool(r["pred"]) for r in run_["rows"])
+        print(f"  {run_['tag']}: {parsed}/{len(run_['rows'])} counting answers parsed")
+    report_runs(runs, a.out)
+
+
+def report_runs(runs: list[dict], out_path: str) -> None:
     runs = [v for r in runs for v in [r] + box_variants(r)]
     table = {}
     for run_ in runs:
@@ -128,8 +150,8 @@ def report(a) -> None:
         t["per class (all)"] = {c: score(rs, {c}) for c, rs in sorted(per_cls.items())}
         t["new items (frozen rooms)"] = score_extra(run_["rows"])
         table[run_["tag"]] = t
-    json.dump({"scores": table, "preds": {r["tag"]: r["rows"] for r in runs if "+" not in r["tag"]}}, open(a.out, "w"),
-              indent=1)
+    json.dump({"scores": table, "preds": {r["tag"]: r["rows"] for r in runs if "+" not in r["tag"]}},
+              open(out_path, "w"), indent=1)
     tags = [r["tag"] for r in runs]
     f = lambda v: f"{v:6.1f}" if v is not None else "     -"  # noqa: E731
     # one line per model: the numbers that decide (frozen rooms first: real rooms, checked inventory)
@@ -164,7 +186,7 @@ def report(a) -> None:
             if e:
                 print(f"  {t:20s} finds {e['recall']:5.1f}% of the real other objects | {e['precision']:5.1f}% of what it "
                       f"lists is real | lists {e['listed_per_image']} per room (real: {e['real_per_image']})")
-    print(f"(per-class numbers for every class: {a.out})")
+    print(f"(per-class numbers for every class: {out_path})")
 
 
 def main() -> None:
@@ -186,8 +208,11 @@ def main() -> None:
     s = sub.add_parser("report")
     s.add_argument("preds", nargs="+")
     s.add_argument("--out", default="eval_results.json")
+    s = sub.add_parser("rescore", help="score saved answers again with the current parsers, no model run")
+    s.add_argument("files", nargs="+")
+    s.add_argument("--out", default="rescored_results.json")
     a = p.parse_args()
-    run(a) if a.cmd == "run" else report(a)
+    {"run": run, "report": report, "rescore": rescore}[a.cmd](a)
 
 
 if __name__ == "__main__":
