@@ -30,7 +30,7 @@ from collections import Counter, defaultdict
 
 import requests
 
-from common import MAX_PRESENT, ZERO_SHARE, allocate_zeros, count_row, print_zero_report
+from common import GROUND_PROMPT, MAX_PRESENT, ZERO_SHARE, allocate_zeros, count_row, print_zero_report
 
 REPO = "https://huggingface.co/datasets/Voxel51/LVIS/resolve/main"
 
@@ -173,7 +173,6 @@ CLASS_MAP = {mine: lvs for g in GROUPS.values() for mine, lvs in g.items()}
 AREA_OF = {mine: area for area, g in GROUPS.items() for mine in g}
 LVIS_TO_MINE = {lv: mine for mine, lvs in CLASS_MAP.items() for lv in lvs}
 
-GROUND_PROMPT = 'Locate every {name} in the image. Answer in JSON: [{{"bbox_2d":[x1,y1,x2,y2],"label":"{name}"}}]'
 
 
 def stream_samples(url: str, limit: int = 0):

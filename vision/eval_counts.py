@@ -59,6 +59,12 @@ def run(a) -> None:
                                 batch=a.batch)
             for k, (pred, rep) in zip(extra, found):
                 res[k].update(extra_reply=rep, extra_pred=pred)
+        if a.boxes != "none":                          # "locate every X", count the boxes in code
+            pairs = [(k, c) for k, r in enumerate(chunk) for c in r["classes"] if a.boxes == "all" or c in MAIN]
+            located = m.locate([(chunk[k]["images"][0], c) for k, c in pairs], batch=a.batch)
+            for (k, c), (boxes, rep) in zip(pairs, located):
+                res[k].setdefault("box_counts", {})[c] = None if boxes is None else len(boxes)
+                res[k].setdefault("box_replies", {})[c] = rep[:600]
         out += res
         print(f"  [{a.tag}] {len(out)}/{len(rows)}", flush=True)
         json.dump({"tag": a.tag, "adapter": a.adapter, "rows": out}, open(a.out, "w"))
@@ -83,8 +89,27 @@ def score(rows: list[dict], cls_filter=None) -> dict:
 COLS = [("acc", "acc"), ("present", "pres"), ("missing_recall", "miss"), ("false_alarm", "f.al"), ("off1", "off1")]
 
 
+def box_variants(run_: dict) -> list[dict]:
+    """From a run with box counts: "<tag>+boxes" = the number of boxes; "<tag>+hybrid" = 0 if the counting answer
+    says 0 (it is trained on real zeros; box rows never were), else the number of boxes. Classes without a box count
+    keep the counting answer, so all variants are scored on the same questions."""
+    if not any("box_counts" in r for r in run_["rows"]):
+        return []
+    out = []
+    for name, pick in [("boxes", lambda p, b: b), ("hybrid", lambda p, b: 0 if p == 0 else b)]:
+        rows = []
+        for r in run_["rows"]:
+            bc = r.get("box_counts", {})
+            pred = {c: (pick(r["pred"].get(c), bc[c]) if bc.get(c) is not None else r["pred"].get(c))
+                    for c in r["classes"]}
+            rows.append({**r, "pred": pred})
+        out.append({"tag": f"{run_['tag']}+{name}", "rows": rows})
+    return out
+
+
 def report(a) -> None:
     runs = [json.load(open(f)) for f in a.preds]
+    runs = [v for r in runs for v in [r] + box_variants(r)]
     table = {}
     for run_ in runs:
         by_src = defaultdict(list)
@@ -103,9 +128,22 @@ def report(a) -> None:
         t["per class (all)"] = {c: score(rs, {c}) for c, rs in sorted(per_cls.items())}
         t["new items (frozen rooms)"] = score_extra(run_["rows"])
         table[run_["tag"]] = t
-    json.dump({"scores": table, "preds": {r["tag"]: r["rows"] for r in runs}}, open(a.out, "w"), indent=1)
+    json.dump({"scores": table, "preds": {r["tag"]: r["rows"] for r in runs if "+" not in r["tag"]}}, open(a.out, "w"),
+              indent=1)
     tags = [r["tag"] for r in runs]
     f = lambda v: f"{v:6.1f}" if v is not None else "     -"  # noqa: E731
+    # one line per model: the numbers that decide (frozen rooms first: real rooms, checked inventory)
+    summ = [("frozen", "acc", "frozen"), ("frozen", "present", "fr.pres"), ("frozen", "missing_recall", "fr.miss"),
+            ("ALL: pillow towel lamp chair", "acc", "main4"), ("ALL: every class", "acc", "all"),
+            ("ALL: every class", "missing_recall", "miss"), ("ALL: every class", "false_alarm", "f.al")]
+    summ += [(f"class {c}", "acc", c) for c in MAIN]
+    print("\nSUMMARY (exact count %; fr. = your 79 frozen rooms; miss = missing item caught; f.al = false alarm)")
+    print(f"{'model':24s}" + "".join(f"{h:>8s}" for _, _, h in summ))
+    for t in tags:
+        print(f"{t[:24]:24s}" + "".join(f"{table[t][k][m]:8.1f}" if table[t].get(k, {}).get(m) is not None
+                                        else f"{'-':>8s}" for k, m, _ in summ))
+    if len(tags) > 3:
+        tags = [t for t in tags if "+" not in t]       # the wide table only for the plain runs
     w = 6 * len(COLS) + 3
     print("\nacc = exact count | pres = exact when the item is there | miss = item gone and the model says 0 (alert "
           "caught) | f.al = item there but the model says 0 (false alarm, lower is better) | off1 = within +-1")
@@ -142,6 +180,8 @@ def main() -> None:
     r.add_argument("--dtype", default=os.environ.get("DTYPE") or None, choices=["float16", "bfloat16"],
                    help="same as training (run_kaggle.sh: fp16 on T4, bf16 on A100/L4)")
     r.add_argument("--quant4", action="store_true", help="load the base in 4-bit (only if training used QUANT=1)")
+    r.add_argument("--boxes", choices=["none", "main", "all"], default="none",
+                   help="also count by boxes ('locate every X'): for pillow/towel/lamp/chair, or every class")
     r.add_argument("--out", required=True)
     s = sub.add_parser("report")
     s.add_argument("preds", nargs="+")

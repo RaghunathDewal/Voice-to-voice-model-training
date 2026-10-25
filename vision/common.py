@@ -31,6 +31,9 @@ EXTRA_PROMPT = ("Expected items from the previous inspection: {names}. List ever
                 "that is not one of those, with how many. Answer in JSON: "
                 '{{"new_items":[{{"label":...,"count":...}}]}}. If there are none: {{"new_items":[]}}')
 
+# the box-finding question the training rows use; inference can count boxes with it (vl_infer.RoomModel.locate)
+GROUND_PROMPT = 'Locate every {name} in the image. Answer in JSON: [{{"bbox_2d":[x1,y1,x2,y2],"label":"{name}"}}]'
+
 ZERO_SHARE = 1 / 3          # per class: share of the questions about it whose answer is 0
 MAX_PRESENT = 6             # items that ARE there, per question
 MAX_ZEROS = 2               # missing items per question

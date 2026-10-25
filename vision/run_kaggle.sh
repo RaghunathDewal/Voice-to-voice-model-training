@@ -8,6 +8,7 @@
 #     !bash /tmp/repo/vision/run_kaggle.sh all      (eval set: fetched from HF, or EVAL_DIR=/kaggle/input/...)
 #  The cells, step by step: vision/README.md
 #  Phases: setup | smoke | data | train | eval | all   (smoke = 3 real updates in ~10 min, before the long data phase)
+#          bench: no training; the same eval set (built alone in ~6 min) for several models / ways of counting
 #
 #  Like the speech training (max_minutes):
 #     - the run measures its own speed and fits the cosine learning rate into the time it has (time_budget.py)
@@ -309,12 +310,100 @@ HfApi().upload_file(path_or_fileobj='$WORK/eval_results.json', path_in_repo='eva
 print('eval_results.json uploaded to $HF_CKPT_REPO')" || true
 }
 
+# ===================================================================================================== bench
+# BENCH: one job per entry "tag|base model|LoRA repo on HF (or empty)|boxes", ';'-separated. boxes = main counts
+# pillow/towel/lamp/chair also by "locate every X" (report rows <tag>+boxes and <tag>+hybrid), none = counting only.
+BENCH=${BENCH:-"v3|Qwen/Qwen3-VL-4B-Instruct|$HF_USER/qwen3vl-room-lora-v3|main;qwen3.5-4b|Qwen/Qwen3.5-4B||main;qwen3vl-4b-base|Qwen/Qwen3-VL-4B-Instruct||none"}
+BENCH_REPO=${BENCH_REPO:-$HF_USER/qwen3vl-room-lora-v3}      # where bench_results.json is uploaded
+BENCH_FLA=${BENCH_FLA:-0}               # 1 = install flash-linear-attention (fast Qwen3.5 kernels; T4 support unknown)
+
+data_eval() {
+    # only what the eval set needs: HomeObjects val, the frozen rooms, and the held-out LVIS images (not all 30k)
+    [ -f "$DATA/eval/eval_set.jsonl" ] && { say "eval set already built: $DATA/eval/eval_set.jsonl"; return 0; }
+    mkdir -p "$DATA"
+    if [ ! -d "$DATA/homeobjects-3K/images/val" ]; then
+        curl -sSL -o "$DATA/ho.zip" https://github.com/ultralytics/assets/releases/download/v0.0.0/homeobjects-3K.zip
+        mkdir -p "$DATA/homeobjects-3K" && unzip -q "$DATA/ho.zip" -d "$DATA/homeobjects-3K" && rm "$DATA/ho.zip"
+    fi
+    python "$HERE/prep_homeobjects.py" --root "$DATA/homeobjects-3K" --out "$DATA/home_val" --split val
+    if [ ! -f "$DATA/lvis_v1_train.json" ]; then
+        curl -sSL -o "$DATA/lvis.zip" https://dl.fbaipublicfiles.com/LVIS/lvis_v1_train.json.zip
+        unzip -q "$DATA/lvis.zip" -d "$DATA" && rm "$DATA/lvis.zip"
+    fi
+    # shellcheck disable=SC2086
+    python "$HERE/prep_lvis.py" --out "$DATA/lvis" --groups $LVIS_GROUPS --lvis-json "$DATA/lvis_v1_train.json" \
+        --max-images "$LVIS_IMAGES" > /dev/null      # no --download: rows point at the Hub, held-out ones fetched below
+    python "$HERE/mix_data.py" --out "$DATA/sft" --count "$DATA/lvis/count_sft.jsonl" > /dev/null
+    hf_token
+    fetch_eval || say "frozen set not available: eval set without it"
+    python "$HERE/build_eval_set.py" --out "$DATA/eval/eval_set.jsonl" --test "$DATA/sft/test.jsonl" \
+        --home-val "$DATA/home_val/count_sft.jsonl" --max-per-source "$EVAL_PER_SOURCE" ${EVAL_DIR:+--frozen "$EVAL_DIR"}
+    python - "$DATA/eval/eval_set.jsonl" "$DATA/lvis/images" <<'EOF'
+import json, os, sys, requests
+from concurrent.futures import ThreadPoolExecutor
+es, d = sys.argv[1:]
+os.makedirs(d, exist_ok=True)
+rows = [json.loads(l) for l in open(es)]
+h = {"Authorization": f"Bearer {os.environ['HF_TOKEN']}"} if os.environ.get("HF_TOKEN") else {}
+def get(url):
+    p = os.path.join(d, os.path.basename(url))
+    if not os.path.exists(p):
+        r = requests.get(url, headers=h, timeout=60); r.raise_for_status(); open(p, "wb").write(r.content)
+    return p
+urls = sorted({r["images"][0] for r in rows if r["images"][0].startswith("http")})
+local = dict(zip(urls, ThreadPoolExecutor(16).map(get, urls)))
+with open(es, "w") as f:
+    for r in rows:
+        r["images"] = [local.get(r["images"][0], r["images"][0])]
+        f.write(json.dumps(r) + "\n")
+print(f"eval images downloaded: {len(urls)} LVIS")
+EOF
+}
+
+bench() {
+    data_eval
+    hf_token
+    [ "$BENCH_FLA" = 1 ] && pip install -q flash-linear-attention || true
+    ES=$DATA/eval/eval_set.jsonl
+    Q4=$([ "$QUANT" = 1 ] && echo --quant4 || true)
+    IFS=';' read -r -a JOBS <<< "$BENCH"
+    say ">>> bench on $(wc -l < "$ES") images: $(for j in "${JOBS[@]}"; do printf '%s ' "${j%%|*}"; done)on $NGPU GPU(s)"
+    for j in "${JOBS[@]}"; do                          # LoRAs first, so the GPU jobs start together
+        IFS='|' read -r tag model repo boxes <<< "$j"
+        [ -n "$repo" ] && fetch_lora "$repo" "/tmp/vl_cmp/$tag"
+    done
+    PIDS=()
+    for g in $(seq 0 $((NGPU - 1))); do
+        (
+            for i in "${!JOBS[@]}"; do
+                [ $((i % NGPU)) = "$g" ] || continue
+                IFS='|' read -r tag model repo boxes <<< "${JOBS[$i]}"
+                CUDA_VISIBLE_DEVICES=$g python "$HERE/eval_counts.py" run --eval-set "$ES" --model "$model" --tag "$tag" \
+                    ${repo:+--adapter "/tmp/vl_cmp/$tag"} --boxes "${boxes:-none}" --batch "$EVAL_BATCH" $Q4 \
+                    --out "$WORK/bench_$tag.json" > "$WORK/bench_$tag.log" 2>&1 \
+                    && echo "  [$tag] done" || { echo "  [$tag] FAILED:"; tail -25 "$WORK/bench_$tag.log"; }
+            done
+        ) &
+        PIDS+=($!)
+    done
+    wait "${PIDS[@]}"
+    PREDS=()
+    for j in "${JOBS[@]}"; do t=${j%%|*}; [ -f "$WORK/bench_$t.json" ] && PREDS+=("$WORK/bench_$t.json"); done
+    [ "${#PREDS[@]}" -gt 0 ] || exit 1
+    python "$HERE/eval_counts.py" report "${PREDS[@]}" --out "$WORK/bench_results.json"
+    [ -z "${HF_TOKEN:-}" ] || python -c "
+from huggingface_hub import HfApi
+HfApi().upload_file(path_or_fileobj='$WORK/bench_results.json', path_in_repo='bench_results.json', repo_id='$BENCH_REPO')
+print('bench_results.json uploaded to $BENCH_REPO')" || true
+}
+
 case "${1:-}" in
     setup) setup ;;
     smoke) smoke ;;
     data) data ;;
     train) train ;;
     eval) hf_token; evaluate ;;
+    bench) bench ;;
     all) setup; smoke; data; train; evaluate ;;
     *) sed -n 2,19p "$0"; exit 1 ;;
 esac

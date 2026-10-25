@@ -17,14 +17,13 @@ import os
 import random
 from collections import Counter
 
-from common import MAX_PRESENT, ZERO_SHARE, allocate_zeros, count_row, print_zero_report
+from common import GROUND_PROMPT, MAX_PRESENT, ZERO_SHARE, allocate_zeros, count_row, print_zero_report
 
 # HomeObjects class id -> YOUR class name (same names as prep_lvis.py)
 NAMES = ["bed", "sofa", "chair", "table", "lamp", "television", "laptop", "wardrobe",
          "window", "door", "plant pot", "painting"]          # tv -> television, potted plant, photo frame -> painting
 AREA_OF = {c: "living" for c in NAMES}                       # all indoor room classes: any of them fits a room
 
-GROUND_PROMPT = 'Locate every {name} in the image. Answer in JSON: [{{"bbox_2d":[x1,y1,x2,y2],"label":"{name}"}}]'
 
 
 def read_yolo(txt: str) -> list[tuple[str, list[int]]]:

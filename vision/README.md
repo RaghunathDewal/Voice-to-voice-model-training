@@ -61,8 +61,8 @@ python infer_room.py --before before.json --images after_1.jpg after_2.jpg --ada
 | `check_data.py` | the data gate (rule 8) |
 | `smoke_check.py` | reads the smoke test: updates finished, speed, memory |
 | `time_budget.py` | ms-swift plugin: fits the cosine schedule into the session, stops at the deadline, uploads every checkpoint |
-| `vl_infer.py` | the one inference path (eval and production): batched, LoRA on/off |
-| `eval_counts.py` | runs a model on the eval set; report: acc / present / missing caught / false alarms / new items |
+| `vl_infer.py` | the one inference path (eval and production): Qwen3-VL and Qwen3.5, batched, LoRA on/off, counting / box-finding / new items |
+| `eval_counts.py` | runs a model on the eval set (optionally also counting by boxes); report: summary + acc / present / missing caught / false alarms / new items |
 | `infer_room.py` | production: before inventory + after photos -> alerts + new items |
 
 ## Before the first run
@@ -97,6 +97,26 @@ os.environ["HF_TOKEN"] = UserSecretsClient().get_secret("HF_TOKEN")
 !bash /tmp/repo/vision/run_kaggle.sh eval       # ~1.6-2 h: v3 and v1 on the two GPUs, then v2
 ```
 If the session dies: run the same cells again; `train` continues from `last-checkpoint` on HF.
+
+## Bench: compare models and ways of counting, no training (~2-2.5 h)
+
+Same cells 1-2 (token + code, `setup`), then:
+```python
+!bash /tmp/repo/vision/run_kaggle.sh bench
+```
+It builds only the eval set (~6 min: HomeObjects val, the 79 frozen rooms, the 200 held-out LVIS images) and runs,
+spread over the two GPUs:
+
+| Job | Model | How it counts |
+|---|---|---|
+| `v3` | Qwen3-VL-4B + v3 LoRA | the counting answer; plus `v3+boxes` ("locate every pillow", count the boxes) and `v3+hybrid` (0 if the counting answer says 0, else the boxes) for pillow / towel / lamp / chair |
+| `qwen3.5-4b` | Qwen3.5-4B, no training (thinking off) | same three ways |
+| `qwen3vl-4b-base` | Qwen3-VL-4B, no training | the counting answer (the reference) |
+
+The log ends with a SUMMARY table (one line per model and way of counting); `bench_results.json` goes to
+`qwen3vl-room-lora-v3` on HF. Other candidates: `BENCH="name|model id|LoRA repo or empty|main or none;..."`, e.g.
+`qwen3.5-9b|Qwen/Qwen3.5-9B||main` (fp16 does not fit one T4: add `QUANT=1` for 4-bit). Qwen3.5 runs its new
+attention layers without the fast kernels by default (slower, safe); `BENCH_FLA=1` tries them.
 
 ## Settings (put them in front of the command, e.g. `!EVAL_BASE=1 bash ... eval`)
 
