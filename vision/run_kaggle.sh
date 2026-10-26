@@ -8,6 +8,7 @@
 #     !bash /tmp/repo/vision/run_kaggle.sh all      (eval set: fetched from HF, or EVAL_DIR=/kaggle/input/...)
 #  The cells, step by step: vision/README.md
 #  Phases: setup | smoke | data | train | eval | all   (smoke = 3 real updates in ~10 min, before the long data phase)
+#          demo: browser demo of v3 (single vs hybrid, new items) with a public trycloudflare.com link
 #          bench: no training; the same eval set (built alone in ~6 min) for several models / ways of counting
 #
 #  Like the speech training (max_minutes):
@@ -397,6 +398,18 @@ HfApi().upload_file(path_or_fileobj='$WORK/bench_results.json', path_in_repo='be
 print('bench_results.json uploaded to $BENCH_REPO')" || true
 }
 
+# ===================================================================================================== demo
+# browser demo of the latest model (v3): single vs hybrid counting + new items, public link via a Cloudflare tunnel
+DEMO_LORA=${DEMO_LORA:-$HF_USER/qwen3vl-room-lora-v3}
+demo() {
+    hf_token
+    pip install -q gradio
+    fetch_lora "$DEMO_LORA" /tmp/vl_cmp/demo
+    fetch_eval || true                                 # your frozen rooms as clickable examples
+    say ">>> demo: wait for the line 'OPEN THIS: https://....trycloudflare.com' (model load ~1-2 min)"
+    python "$HERE/demo_app.py" --adapter /tmp/vl_cmp/demo ${EVAL_DIR:+--examples "$EVAL_DIR/images"}
+}
+
 case "${1:-}" in
     setup) setup ;;
     smoke) smoke ;;
@@ -404,6 +417,7 @@ case "${1:-}" in
     train) train ;;
     eval) hf_token; evaluate ;;
     bench) bench ;;
+    demo) demo ;;
     all) setup; smoke; data; train; evaluate ;;
     *) sed -n 2,19p "$0"; exit 1 ;;
 esac

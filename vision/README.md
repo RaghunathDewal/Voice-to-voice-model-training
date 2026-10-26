@@ -63,6 +63,7 @@ python infer_room.py --before before.json --images after_1.jpg after_2.jpg --ada
 | `time_budget.py` | ms-swift plugin: fits the cosine schedule into the session, stops at the deadline, uploads every checkpoint |
 | `vl_infer.py` | the one inference path (eval and production): Qwen3-VL and Qwen3.5, batched, LoRA on/off, counting / box-finding / new items |
 | `eval_counts.py` | runs a model on the eval set (optionally also counting by boxes); report: summary + acc / present / missing caught / false alarms / new items |
+| `demo_app.py` | browser demo (Gradio + Cloudflare link): single vs hybrid, boxes on the photo, new items |
 | `infer_room.py` | production: before inventory + after photos -> alerts + new items |
 
 ## Before the first run
@@ -97,6 +98,22 @@ os.environ["HF_TOKEN"] = UserSecretsClient().get_secret("HF_TOKEN")
 !bash /tmp/repo/vision/run_kaggle.sh eval       # ~1.6-2 h: v3 and v1 on the two GPUs, then v2
 ```
 If the session dies: run the same cells again; `train` continues from `last-checkpoint` on HF.
+
+## Demo in the browser (latest model, v3)
+
+Same cell 1 (token + code), then:
+```python
+!bash /tmp/repo/vision/run_kaggle.sh setup
+```
+```python
+!bash /tmp/repo/vision/run_kaggle.sh demo
+```
+Wait for `OPEN THIS: https://....trycloudflare.com` (model load ~1-2 min) and open it on any device. Upload an
+AFTER photo (and optionally a BEFORE photo), type the expected items (`pillow 4, towel 2, lamp 2`, or names only to
+read the counts from the BEFORE photo), pick **single**, **hybrid** or **both**. You get the counts with status
+(ok / MISSING / fewer / more), the hybrid boxes drawn on the photo, and the new items (base model; with a BEFORE
+photo only what is new). Your 79 frozen rooms are clickable examples. The link lives while the cell runs.
+`DEMO_LORA=ThunderBlade7773/qwen3vl-room-lora-v2` for another run.
 
 ## Bench: compare models and ways of counting, no training (~2-2.5 h)
 
