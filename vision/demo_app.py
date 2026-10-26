@@ -123,10 +123,13 @@ def count_photo(model, img: str, names: list[str], mode: str):
     return single, hybrid, boxes, " | ".join(raw)
 
 
-def detect_photo(model, img: str, area: str, prompt: str | None) -> tuple[dict, str]:
+def detect_photo(model, img: str, area: str, prompt: str | None, image_tokens: int | None = None) -> tuple[dict, str]:
     """Open detection, no item list (base model): {label: [boxes]}, the biggest groups first."""
-    found, raw = model.detect([img], area=area, prompt=prompt)[0]
+    found, raw = model.detect([img], area=area, prompt=prompt, image_tokens=image_tokens)[0]
     return dict(sorted(found.items(), key=lambda kv: -len(kv[1]))), raw
+
+
+DETECT_TOKENS = 1536   # BEFORE detection only: bigger image -> more small objects found (counting stays at 768)
 
 
 def detect_before(model, prompt, before_img, area, mode):
@@ -134,7 +137,8 @@ def detect_before(model, prompt, before_img, area, mode):
     t0 = time.time()
     if not before_img:
         return None, [], "", "Upload a BEFORE photo."
-    found, raw = detect_photo(model, before_img, area, prompt)
+    found, raw = detect_photo(model, before_img, area, prompt, DETECT_TOKENS)
+    t_det = time.time() - t0
     if not found:
         return None, [], "", f"Nothing detected.\n\nraw answer: `{raw.strip()[:400]}`"
     names = list(found)
@@ -143,7 +147,8 @@ def detect_before(model, prompt, before_img, area, mode):
         single, _, _, _ = count_photo(model, before_img, names, "single")
         rows = [r + [single.get(r[0], "?")] for r in rows]
     inventory = ", ".join(f"{n} {len(found[n])}" for n in names)
-    info = (f"{time.time() - t0:.1f} s | {len(names)} kinds of objects, {sum(map(len, found.values()))} boxes. "
+    info = (f"{time.time() - t0:.1f} s (detection {t_det:.1f} s at {DETECT_TOKENS} image tokens, "
+            f"{len(model.processor.tokenizer(raw).input_ids)} tokens written) | {len(names)} kinds of objects, {sum(map(len, found.values()))} boxes. "
             "The inventory box is filled in: delete what you do not want checked, fix a wrong count, then step 2."
             f"\n\nraw detection answer: `{raw.strip()[:400]}`")
     return draw_boxes(before_img, found), rows, inventory, info
@@ -216,12 +221,15 @@ def build(model, examples: list[str], prompt: str | None = None):
 
 
 def main() -> None:
+    global DETECT_TOKENS
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--model", default="Qwen/Qwen3-VL-4B-Instruct")
     p.add_argument("--adapter", required=True, help="the v3 LoRA folder (run_kaggle.sh demo downloads it)")
     p.add_argument("--examples", default="", help="folder of example photos")
     p.add_argument("--port", type=int, default=7860)
     p.add_argument("--no-tunnel", action="store_true")
+    p.add_argument("--detect-tokens", type=int, default=int(os.environ.get("DETECT_TOKENS", DETECT_TOKENS)),
+                   help="image size for the BEFORE detection (1 token = 32x32 px)")
     p.add_argument("--detect-prompt", default=os.environ.get("DETECT_PROMPT_FILE", ""),
                    help="text file with your own detection prompt for step 1 ({area} is replaced by the area line)")
     a = p.parse_args()
@@ -231,6 +239,7 @@ def main() -> None:
     model = RoomModel(a.model, adapter=a.adapter)
     ex = sorted(glob.glob(os.path.join(a.examples, "*.jpg")))[:12] if a.examples else []
     prompt = open(a.detect_prompt).read() if a.detect_prompt else None
+    DETECT_TOKENS = a.detect_tokens
     app = build(model, ex, prompt)
     if not a.no_tunnel:
         start_tunnel(a.port)

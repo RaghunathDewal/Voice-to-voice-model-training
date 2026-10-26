@@ -16,7 +16,7 @@ import re
 
 import torch
 from qwen_vl_utils import process_vision_info
-from transformers import AutoModelForImageTextToText, AutoProcessor, BitsAndBytesConfig
+from transformers import AutoModelForImageTextToText, AutoProcessor, BitsAndBytesConfig, StoppingCriteria
 
 from common import COUNT_PROMPT, DETECT_PROMPT, EXTRA_PROMPT, GROUND_PROMPT, STRUCTURE, norm_label
 
@@ -98,6 +98,29 @@ def parse_detections(text: str, iou_dup: float = 0.85) -> dict:
     return out
 
 
+class RepeatStop(StoppingCriteria):
+    """Ends a box answer once it repeats itself (small VLMs can write the same boxes again and again until the token
+    limit: minutes on a T4 for nothing). Every `every` new tokens: a row with >= `dups` boxes that nearly match an
+    earlier box of the same answer is finished; the boxes before the loop are kept."""
+
+    def __init__(self, tokenizer, start: int, every: int = 32, dups: int = 3, iou_dup: float = 0.85):
+        self.tok, self.start, self.every, self.dups, self.iou_dup = tokenizer, start, every, dups, iou_dup
+
+    def __call__(self, input_ids, scores, **kw):
+        done = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
+        n = input_ids.shape[1] - self.start
+        if n == 0 or n % self.every:
+            return done
+        for i, row in enumerate(input_ids[:, self.start:]):
+            seen, rep = [], 0
+            for b in _BOX.findall(self.tok.decode(row, skip_special_tokens=True)):
+                b = [float(v) for v in b]
+                rep += any(_iou(b, k) > self.iou_dup for k in seen)
+                seen.append(b)
+            done[i] = rep >= self.dups
+        return done
+
+
 class RoomModel:
     def __init__(self, model: str = "Qwen/Qwen3-VL-4B-Instruct", adapter: str | None = None, dtype: str | None = None,
                  quant4: bool = False, image_tokens: int | None = None, device_map="auto"):
@@ -115,8 +138,10 @@ class RoomModel:
         self.processor.tokenizer.padding_side = "left"      # batched generation
         self.max_pixels = (image_tokens or int(os.environ.get("IMAGE_MAX_TOKEN_NUM", 768))) * 32 * 32
 
-    def _generate(self, items: list[tuple[str, str]], max_new: int, base_only: bool) -> list[str]:
-        msgs = [[{"role": "user", "content": [{"type": "image", "image": img, "max_pixels": self.max_pixels},
+    def _generate(self, items: list[tuple[str, str]], max_new: int, base_only: bool, image_tokens: int | None = None,
+                  stop_repeat: bool = False) -> list[str]:
+        px = image_tokens * 32 * 32 if image_tokens else self.max_pixels
+        msgs = [[{"role": "user", "content": [{"type": "image", "image": img, "max_pixels": px},
                                               {"type": "text", "text": prompt}]}] for img, prompt in items]
         texts = [self.processor.apply_chat_template(m, tokenize=False, add_generation_prompt=True,
                                                     enable_thinking=False) for m in msgs]
@@ -125,22 +150,24 @@ class RoomModel:
                              return_tensors="pt").to(self.model.device)
         off = self.model.disable_adapter() if (base_only and self.has_adapter) else contextlib.nullcontext()
         with torch.inference_mode(), off:
-            gen = self.model.generate(**inp, max_new_tokens=max_new, do_sample=False)
+            stop = [RepeatStop(self.processor.tokenizer, inp.input_ids.shape[1])] if stop_repeat else None
+            gen = self.model.generate(**inp, max_new_tokens=max_new, do_sample=False, stopping_criteria=stop)
         return [THINK.sub("", r) for r in
                 self.processor.batch_decode(gen[:, inp.input_ids.shape[1]:], skip_special_tokens=True)]
 
-    def generate(self, items: list[tuple[str, str]], max_new: int = 300, batch: int = 4, base_only: bool = False):
+    def generate(self, items: list[tuple[str, str]], max_new: int = 300, batch: int = 4, base_only: bool = False,
+                 **kw):
         out = []
         for i in range(0, len(items), batch):
             chunk = items[i:i + batch]
             try:
-                out += self._generate(chunk, max_new, base_only)
+                out += self._generate(chunk, max_new, base_only, **kw)
             except Exception as e:  # noqa: BLE001  (e.g. out of memory on a big batch)
                 if len(chunk) == 1:
                     raise
                 print(f"  batch of {len(chunk)} failed ({type(e).__name__}), one by one", flush=True)
                 torch.cuda.empty_cache()
-                out += [self._generate([it], max_new, base_only)[0] for it in chunk]
+                out += [self._generate([it], max_new, base_only, **kw)[0] for it in chunk]
         return out
 
     def count(self, images: list[str], expected: list[list[str]], batch: int = 4) -> list[tuple[dict, str]]:
@@ -153,15 +180,17 @@ class RoomModel:
     def locate(self, pairs: list[tuple[str, str]], batch: int = 4, max_new: int = 600) -> list[tuple[list | None, str]]:
         """"Locate every <item>" per (image, item): the boxes (None if the answer has none parsable)."""
         replies = self.generate([(img, GROUND_PROMPT.format(name=name)) for img, name in pairs], max_new=max_new,
-                                batch=batch)
+                                batch=batch, stop_repeat=True)
         return [(parse_boxes(r), r) for r in replies]
 
     def detect(self, images: list[str], area: str = "", prompt: str | None = None, batch: int = 2,
-               base_only: bool = True, max_new: int = 2048) -> list[tuple[dict, str]]:
+               base_only: bool = True, max_new: int = 2048, image_tokens: int | None = None) -> list[tuple[dict, str]]:
         """Open detection, no item list: every object with its boxes -> ({label: [boxes]}, raw answer). Base model by
-        default (the LoRA was trained on counting a given list and lists other objects worse)."""
+        default (the LoRA was trained on counting a given list and lists other objects worse). image_tokens: a bigger
+        image than the counting one finds more small objects (1536 = ~1250x1250 px, twice the 768 of training)."""
         q = (prompt or DETECT_PROMPT).replace("{area}", f"Area being inspected: {area}. " if area else "")
-        replies = self.generate([(img, q) for img in images], max_new=max_new, batch=batch, base_only=base_only)
+        replies = self.generate([(img, q) for img in images], max_new=max_new, batch=batch, base_only=base_only,
+                                image_tokens=image_tokens, stop_repeat=True)
         return [(parse_detections(r), r) for r in replies]
 
     def new_items(self, images: list[str], expected: list[list[str]], batch: int = 4,

@@ -113,6 +113,9 @@ Wait for `OPEN THIS: https://....trycloudflare.com` (model load ~1-2 min) and op
    **1. Detect BEFORE**. Nothing to type: the base model detects every object with boxes (open detection, no list),
    the boxes are drawn, and the inventory is filled in (`pillow 4, lamp 2, towel 2, ...`) with v3's count next to it
    as a cross-check. Delete what you do not want checked or fix a wrong count.
+   The detection sees a bigger image (1536 image tokens, ~1250x1250 px, `DETECT_TOKENS`) to find more small
+   objects; counting stays at the 768 of training. An answer that starts repeating its boxes is stopped there.
+   The demo runs on one T4 (`DEMO_GPU=0`): split over two, every token crosses the GPUs.
 2. **Step 2, AFTER:** upload the after photo, click **2. Check AFTER**: v3 counts every inventory item (single /
    hybrid) -> ok / MISSING / fewer / more, and the same detection on the after photo gives the **NEW** objects
    (nothing in the inventory matches them), drawn as `NEW ...` boxes.

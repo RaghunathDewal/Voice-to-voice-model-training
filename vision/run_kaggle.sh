@@ -407,7 +407,8 @@ demo() {
     fetch_lora "$DEMO_LORA" /tmp/vl_cmp/demo
     fetch_eval || true                                 # your frozen rooms as clickable examples
     say ">>> demo: wait for the line 'OPEN THIS: https://....trycloudflare.com' (model load ~1-2 min)"
-    python "$HERE/demo_app.py" --adapter /tmp/vl_cmp/demo ${EVAL_DIR:+--examples "$EVAL_DIR/images"}
+    # one T4 (the 4B fits in fp16): split over two, every new token crosses the GPUs and decoding gets slower
+    CUDA_VISIBLE_DEVICES=${DEMO_GPU:-0} python "$HERE/demo_app.py" --adapter /tmp/vl_cmp/demo ${EVAL_DIR:+--examples "$EVAL_DIR/images"}
 }
 
 case "${1:-}" in
