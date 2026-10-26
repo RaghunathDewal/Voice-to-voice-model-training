@@ -109,14 +109,17 @@ Same cell 1 (token + code), then:
 !bash /tmp/repo/vision/run_kaggle.sh demo
 ```
 Wait for `OPEN THIS: https://....trycloudflare.com` (model load ~1-2 min) and open it on any device.
-1. **Step 1, BEFORE:** upload the before photo, type the items to count (`pillow, towel, lamp, chair`), click
-   **1. Count BEFORE**. No after photo needed: you get the counts (single and hybrid), the boxes, and the inventory
-   is filled in (`pillow 3, towel 0, ...`, edit it if a count is wrong), plus the other objects on the photo.
-2. **Step 2, AFTER:** upload the after photo, click **2. Check AFTER**: ok / MISSING / fewer / more per item, and the
-   objects that are new since the before photo.
+1. **Step 1, BEFORE:** upload the before photo (optionally type the area: bedroom, bathroom ...), click
+   **1. Detect BEFORE**. Nothing to type: the base model detects every object with boxes (open detection, no list),
+   the boxes are drawn, and the inventory is filled in (`pillow 4, lamp 2, towel 2, ...`) with v3's count next to it
+   as a cross-check. Delete what you do not want checked or fix a wrong count.
+2. **Step 2, AFTER:** upload the after photo, click **2. Check AFTER**: v3 counts every inventory item (single /
+   hybrid) -> ok / MISSING / fewer / more, and the same detection on the after photo gives the **NEW** objects
+   (nothing in the inventory matches them), drawn as `NEW ...` boxes.
 
-You can skip step 1 by typing the inventory yourself (`pillow 4, towel 2`). **single**, **hybrid** or **both**
-applies to both steps. Your 79 frozen rooms are clickable examples. The link lives while the cell runs.
+Your own detection prompt instead of the built-in one (`common.DETECT_PROMPT`): put it in a text file on Kaggle (not
+in this repo), with `{area}` where the area line goes, and run `!DETECT_PROMPT_FILE=/kaggle/working/detect.txt bash
+/tmp/repo/vision/run_kaggle.sh demo`. Your 79 frozen rooms are clickable examples. The link lives while the cell runs.
 `DEMO_LORA=ThunderBlade7773/qwen3vl-room-lora-v2` for another run.
 
 ## Bench: compare models and ways of counting, no training (~2-2.5 h)

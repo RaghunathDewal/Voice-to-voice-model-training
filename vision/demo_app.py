@@ -1,16 +1,16 @@
-"""(vision/demo_app.py) Room check demo in the browser: step 1 BEFORE photo -> inventory, step 2 AFTER photo ->
-missing / changed / new. v3 counting (single) vs hybrid, plus new items.
+"""(vision/demo_app.py) Room check demo in the browser: step 1 BEFORE photo -> every object detected (no list to type)
+-> inventory, step 2 AFTER photo -> missing / changed / new. v3 counting (single) vs hybrid.
 
-    python demo_app.py --adapter /tmp/vl_cmp/v3 [--examples DIR] [--port 7860] [--no-tunnel]
+    python demo_app.py --adapter /tmp/vl_cmp/v3 [--examples DIR] [--detect-prompt FILE] [--port 7860] [--no-tunnel]
     (on Kaggle: bash run_kaggle.sh demo -> prints "OPEN THIS: https://....trycloudflare.com")
 
-One Qwen3-VL-4B in memory; the v3 LoRA is switched on for counting / boxes and off for "new items" (the base model
-lists other objects better: 80% vs 26% in the bench).
-  single  the v3 counting answer
-  hybrid  the v3 counting answer decides 0 / not 0; if not 0, "locate every X" and count the boxes
-Step 1 counts the items on the BEFORE photo and fills the inventory (editable); or type the inventory yourself
-("pillow 4, towel 2, lamp 2") and go straight to step 2. New items: objects listed on the AFTER photo and not on the
-BEFORE photo (without a BEFORE photo everything is listed).
+One Qwen3-VL-4B in memory; the LoRA is off for open detection (the base model lists objects better: 80% vs 26% in the
+bench) and on for counting / boxes of the inventory items.
+  step 1  "detect every object" (common.DETECT_PROMPT, or your own prompt with --detect-prompt) -> boxes per label
+          -> inventory "pillow 4, towel 2, ..." (editable)
+  step 2  single  the v3 counting answer for each inventory item
+          hybrid  the v3 answer decides 0 / not 0; if not 0, "locate every X" and count the boxes
+          new     the same open detection on the AFTER photo; labels matching nothing in the inventory
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ import threading
 import time
 import urllib.request
 
-from common import clean_new_items, same_object
+from common import same_object
 
 COLORS = ["#e6194b", "#3cb44b", "#4363d8", "#f58231", "#911eb4", "#42d4f4", "#f032e6", "#9a6324", "#469990", "#000075"]
 
@@ -102,9 +102,17 @@ def status(before, after, tol: int) -> str:
     return "fewer" if after < before else "more"
 
 
+CHUNK = 8          # items per counting question: v3 was trained on lists of up to 8 (MAX_PRESENT + MAX_ZEROS)
+
+
 def count_photo(model, img: str, names: list[str], mode: str):
-    """single = the v3 counting answer; hybrid = 0 if single says 0, else the number of "locate every X" boxes."""
-    single, raw = model.count([img], [names])[0]
+    """single = the v3 counting answer; hybrid = 0 if single says 0, else the number of "locate every X" boxes.
+    A long inventory is asked in groups of CHUNK items, the list length v3 was trained on."""
+    single, raw = {}, []
+    groups = [names[i:i + CHUNK] for i in range(0, len(names), CHUNK)]
+    for counts, r in model.count([img] * len(groups), groups):
+        single.update(counts)
+        raw.append(r.strip())
     hybrid, boxes = dict(single), {}
     if mode != "single":
         ask = [n for n in names if single.get(n)]                    # only items the count says are there
@@ -112,42 +120,44 @@ def count_photo(model, img: str, names: list[str], mode: str):
             boxes[n] = bs or []
             if bs is not None:
                 hybrid[n] = len(bs)
-    return single, hybrid, boxes, raw
+    return single, hybrid, boxes, " | ".join(raw)
 
 
-def other_objects(model, img: str, names: list[str]) -> dict:
-    """Objects NOT on the list (base model, LoRA off), minus room parts and listed items."""
-    return clean_new_items(model.new_items([img], [names], base_only=True)[0][0], names)
+def detect_photo(model, img: str, area: str, prompt: str | None) -> tuple[dict, str]:
+    """Open detection, no item list (base model): {label: [boxes]}, the biggest groups first."""
+    found, raw = model.detect([img], area=area, prompt=prompt)[0]
+    return dict(sorted(found.items(), key=lambda kv: -len(kv[1]))), raw
 
 
-def count_before(model, before_img, items_text, mode, want_new):
-    """Step 1: count the items on the BEFORE photo -> the before inventory (filled into the text box)."""
+def detect_before(model, prompt, before_img, area, mode):
+    """Step 1: detect every object on the BEFORE photo -> the inventory (filled into the text box, editable)."""
     t0 = time.time()
     if not before_img:
-        return None, [], items_text, {}, "", "Upload a BEFORE photo."
-    names, _ = parse_expected(items_text)
-    if not names:
-        return None, [], items_text, {}, "", "Type the items to count, e.g. pillow, towel, lamp, chair"
-    single, hybrid, boxes, raw = count_photo(model, before_img, names, mode)
-    use = single if mode == "single" else hybrid                   # what goes into the inventory
-    rows = [[n, single.get(n, "?"), hybrid.get(n, "?") if mode != "single" else "-"] for n in names]
-    inventory = ", ".join(f"{n} {use[n]}" if use.get(n) is not None else n for n in names)
-    others = other_objects(model, before_img, names) if want_new else {}
-    others_md = ("**Other objects in the BEFORE photo** (kept to find new items after): "
-                 + (", ".join(f"{k} ({v})" for k, v in others.items()) or "none")) if want_new else ""
-    info = (f"{time.time() - t0:.1f} s | inventory = the {'single' if mode == 'single' else 'hybrid'} counts "
-            f"(edit them if a count is wrong), now upload the AFTER photo\n\nraw count answer: `{raw.strip()[:300]}`")
-    return draw_boxes(before_img, boxes) if boxes else None, rows, inventory, others, others_md, info
+        return None, [], "", "Upload a BEFORE photo."
+    found, raw = detect_photo(model, before_img, area, prompt)
+    if not found:
+        return None, [], "", f"Nothing detected.\n\nraw answer: `{raw.strip()[:400]}`"
+    names = list(found)
+    rows = [[n, len(found[n])] for n in names]
+    if mode != "single":                                           # cross-check: what v3 counts for the same items
+        single, _, _, _ = count_photo(model, before_img, names, "single")
+        rows = [r + [single.get(r[0], "?")] for r in rows]
+    inventory = ", ".join(f"{n} {len(found[n])}" for n in names)
+    info = (f"{time.time() - t0:.1f} s | {len(names)} kinds of objects, {sum(map(len, found.values()))} boxes. "
+            "The inventory box is filled in: delete what you do not want checked, fix a wrong count, then step 2."
+            f"\n\nraw detection answer: `{raw.strip()[:400]}`")
+    return draw_boxes(before_img, found), rows, inventory, info
 
 
-def check_after(model, after_img, inventory_text, before_others, mode, want_new, tolerance):
-    """Step 2: count the AFTER photo against the inventory -> ok / MISSING / fewer / more, and new items."""
+def check_after(model, prompt, after_img, inventory_text, area, mode, want_new, tolerance):
+    """Step 2: count the inventory items on the AFTER photo (v3) -> ok / MISSING / fewer / more; new items = objects
+    detected on the AFTER photo that match nothing in the inventory."""
     t0 = time.time()
     if not after_img:
         return None, [], "", "Upload an AFTER photo."
     names, before = parse_expected(inventory_text)
     if not names:
-        return None, [], "", "No inventory: count a BEFORE photo first (step 1) or type it, e.g. pillow 4, towel 2"
+        return None, [], "", "No inventory yet: run step 1 on the BEFORE photo (or type it, e.g. pillow 4, towel 2)."
     single, hybrid, boxes, raw = count_photo(model, after_img, names, mode)
     rows = []
     for n in names:
@@ -156,57 +166,49 @@ def check_after(model, after_img, inventory_text, before_others, mode, want_new,
                     + ([hybrid.get(n, "?"), status(b, hybrid.get(n), tolerance)] if mode != "single" else ["-", "-"]))
     new_txt = ""
     if want_new:
-        after_new = other_objects(model, after_img, names)
-        if before_others:
-            fresh = {k: v for k, v in after_new.items() if not any(same_object(k, o) for o in before_others)}
-            more = {k: v for k, v in after_new.items() if k in before_others and v > before_others[k]}
-            new_txt = ("**New since the BEFORE photo:** " + (", ".join(f"{k} ({v})" for k, v in fresh.items()) or "none")
-                       + ("\n\n**More than before:** " + ", ".join(f"{k} {before_others[k]} -> {v}"
-                                                                   for k, v in more.items()) if more else ""))
-        else:
-            new_txt = ("**Other objects in the AFTER photo** (no BEFORE photo counted, so everything is listed): "
-                       + (", ".join(f"{k} ({v})" for k, v in after_new.items()) or "none"))
-    info = f"{time.time() - t0:.1f} s\n\nraw count answer: `{raw.strip()[:300]}`"
+        found, _ = detect_photo(model, after_img, area, prompt)
+        fresh = {k: v for k, v in found.items() if not any(same_object(k, n) for n in names)}
+        new_txt = "**New since the BEFORE photo:** " + (", ".join(f"{k} ({len(v)})" for k, v in fresh.items()) or "none")
+        boxes.update({f"NEW {k}": v for k, v in fresh.items()})
+    info = f"{time.time() - t0:.1f} s\n\nraw count answer: `{raw[:400]}`"
     return draw_boxes(after_img, boxes) if boxes else None, rows, new_txt, info
 
 
-def build(model, examples: list[str]):
+def build(model, examples: list[str], prompt: str | None = None):
     import gradio as gr
 
     with gr.Blocks(title="Room check") as app:
-        gr.Markdown("## Room check (v3)\n**Step 1** count the BEFORE photo -> inventory. **Step 2** check the AFTER "
-                    "photo -> missing / changed / new. You can also skip step 1 and type the inventory.")
+        gr.Markdown("## Room check (v3)\n**Step 1** detect every object on the BEFORE photo -> inventory (no list to "
+                    "type). **Step 2** check the AFTER photo -> missing / changed / new.")
         with gr.Row():
-            mode = gr.Radio(["single", "hybrid", "both"], value="both", label="Counting",
+            area = gr.Textbox(label="Area being inspected (optional)", placeholder="bedroom, bathroom, kitchen ...")
+            mode = gr.Radio(["single", "hybrid", "both"], value="both", label="Counting on the AFTER photo",
                             info="single = v3 answer | hybrid = v3 decides 0 / not 0, boxes give how many")
-            want_new = gr.Checkbox(value=True, label="New items (base model, LoRA off)")
+            want_new = gr.Checkbox(value=True, label="New items on the AFTER photo")
             tol = gr.Slider(0, 2, value=0, step=1, label="Tolerance (difference still 'ok')")
-        items = gr.Textbox(label="Items / inventory", value="pillow, towel, lamp, chair", lines=2,
-                           info="step 1 fills the counts in (edit if wrong); or type them: pillow 4, towel 2, lamp 2")
-        before_others = gr.State({})
+        items = gr.Textbox(label="Inventory (filled by step 1, editable)", lines=3,
+                           placeholder="filled by step 1, e.g. pillow 4, towel 2, lamp 2")
         with gr.Row():
             with gr.Column():
                 gr.Markdown("### Step 1: BEFORE")
                 before = gr.Image(type="filepath", label="BEFORE photo")
-                go1 = gr.Button("1. Count BEFORE", variant="primary")
-                before_boxed = gr.Image(label="Boxes on the BEFORE photo")
-                before_table = gr.Dataframe(headers=["item", "single", "hybrid"], label="BEFORE counts")
-                before_md = gr.Markdown()
+                go1 = gr.Button("1. Detect BEFORE", variant="primary")
+                before_boxed = gr.Image(label="Everything detected on the BEFORE photo")
+                before_table = gr.Dataframe(headers=["item", "detected (boxes)", "v3 count"], label="BEFORE inventory")
                 before_info = gr.Markdown()
             with gr.Column():
                 gr.Markdown("### Step 2: AFTER")
                 after = gr.Image(type="filepath", label="AFTER photo")
                 go2 = gr.Button("2. Check AFTER", variant="primary")
-                after_boxed = gr.Image(label="Boxes on the AFTER photo")
+                after_boxed = gr.Image(label="Boxes on the AFTER photo (NEW = not in the inventory)")
                 after_table = gr.Dataframe(headers=["item", "before", "single", "single status", "hybrid",
                                                     "hybrid status"], label="AFTER vs inventory", wrap=True)
                 after_md = gr.Markdown()
                 after_info = gr.Markdown()
-        go1.click(lambda *a: count_before(model, *a), [before, items, mode, want_new],
-                  [before_boxed, before_table, items, before_others, before_md, before_info])
-        go2.click(lambda *a: check_after(model, *a), [after, items, before_others, mode, want_new, tol],
+        go1.click(lambda *a: detect_before(model, prompt, *a), [before, area, mode],
+                  [before_boxed, before_table, items, before_info])
+        go2.click(lambda *a: check_after(model, prompt, *a), [after, items, area, mode, want_new, tol],
                   [after_boxed, after_table, after_md, after_info])
-        before.clear(lambda: {}, None, before_others)                  # a new room: forget the old "other objects"
         if examples:
             gr.Examples([[e] for e in examples[:12]], [before], label="Example rooms (your frozen eval set): "
                         "click one as BEFORE, then upload an AFTER photo")
@@ -220,13 +222,16 @@ def main() -> None:
     p.add_argument("--examples", default="", help="folder of example photos")
     p.add_argument("--port", type=int, default=7860)
     p.add_argument("--no-tunnel", action="store_true")
+    p.add_argument("--detect-prompt", default=os.environ.get("DETECT_PROMPT_FILE", ""),
+                   help="text file with your own detection prompt for step 1 ({area} is replaced by the area line)")
     a = p.parse_args()
     from vl_infer import RoomModel
 
     print("loading the model ...", flush=True)
     model = RoomModel(a.model, adapter=a.adapter)
     ex = sorted(glob.glob(os.path.join(a.examples, "*.jpg")))[:12] if a.examples else []
-    app = build(model, ex)
+    prompt = open(a.detect_prompt).read() if a.detect_prompt else None
+    app = build(model, ex, prompt)
     if not a.no_tunnel:
         start_tunnel(a.port)
     app.queue().launch(server_name="0.0.0.0", server_port=a.port, allowed_paths=[a.examples or tempfile.gettempdir()])

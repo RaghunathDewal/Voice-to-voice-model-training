@@ -18,7 +18,7 @@ import torch
 from qwen_vl_utils import process_vision_info
 from transformers import AutoModelForImageTextToText, AutoProcessor, BitsAndBytesConfig
 
-from common import COUNT_PROMPT, EXTRA_PROMPT, GROUND_PROMPT
+from common import COUNT_PROMPT, DETECT_PROMPT, EXTRA_PROMPT, GROUND_PROMPT, STRUCTURE, norm_label
 
 THINK = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
 
@@ -74,6 +74,28 @@ def parse_boxes(text: str, iou_dup: float = 0.85) -> list[list[int]] | None:
         if b[2] > b[0] and b[3] > b[1] and all(_iou(b, k) <= iou_dup for k in boxes):
             boxes.append(b)
     return boxes
+
+
+_OBJ = re.compile(r"\{[^{}]*\}", re.DOTALL)
+_BOX = re.compile(r'"bbox_2d"\s*:\s*\[\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*\]')
+_LABEL = re.compile(r'"label"\s*:\s*"([^"]+)"')
+
+
+def parse_detections(text: str, iou_dup: float = 0.85) -> dict:
+    """Open detection answer -> {label: [boxes]}: labels merged by norm_label (pillows = pillow), room parts (wall,
+    floor ...) dropped, near-identical boxes of one label kept once. Tolerates fences and a list cut off at the end."""
+    out: dict[str, list] = {}
+    for obj in _OBJ.findall(THINK.sub("", text)):
+        b, lab = _BOX.search(obj), _LABEL.search(obj)
+        if not (b and lab):
+            continue
+        box = [int(float(v)) for v in b.groups()]
+        name = norm_label(lab.group(1))
+        if not name or name in STRUCTURE or box[2] <= box[0] or box[3] <= box[1]:
+            continue
+        if all(_iou(box, k) <= iou_dup for k in out.get(name, [])):
+            out.setdefault(name, []).append(box)
+    return out
 
 
 class RoomModel:
@@ -133,6 +155,14 @@ class RoomModel:
         replies = self.generate([(img, GROUND_PROMPT.format(name=name)) for img, name in pairs], max_new=max_new,
                                 batch=batch)
         return [(parse_boxes(r), r) for r in replies]
+
+    def detect(self, images: list[str], area: str = "", prompt: str | None = None, batch: int = 2,
+               base_only: bool = True, max_new: int = 2048) -> list[tuple[dict, str]]:
+        """Open detection, no item list: every object with its boxes -> ({label: [boxes]}, raw answer). Base model by
+        default (the LoRA was trained on counting a given list and lists other objects worse)."""
+        q = (prompt or DETECT_PROMPT).replace("{area}", f"Area being inspected: {area}. " if area else "")
+        replies = self.generate([(img, q) for img in images], max_new=max_new, batch=batch, base_only=base_only)
+        return [(parse_detections(r), r) for r in replies]
 
     def new_items(self, images: list[str], expected: list[list[str]], batch: int = 4,
                   base_only: bool = False) -> list[tuple[dict, str]]:
