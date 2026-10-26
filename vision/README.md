@@ -108,11 +108,15 @@ Same cell 1 (token + code), then:
 ```python
 !bash /tmp/repo/vision/run_kaggle.sh demo
 ```
-Wait for `OPEN THIS: https://....trycloudflare.com` (model load ~1-2 min) and open it on any device. Upload an
-AFTER photo (and optionally a BEFORE photo), type the expected items (`pillow 4, towel 2, lamp 2`, or names only to
-read the counts from the BEFORE photo), pick **single**, **hybrid** or **both**. You get the counts with status
-(ok / MISSING / fewer / more), the hybrid boxes drawn on the photo, and the new items (base model; with a BEFORE
-photo only what is new). Your 79 frozen rooms are clickable examples. The link lives while the cell runs.
+Wait for `OPEN THIS: https://....trycloudflare.com` (model load ~1-2 min) and open it on any device.
+1. **Step 1, BEFORE:** upload the before photo, type the items to count (`pillow, towel, lamp, chair`), click
+   **1. Count BEFORE**. No after photo needed: you get the counts (single and hybrid), the boxes, and the inventory
+   is filled in (`pillow 3, towel 0, ...`, edit it if a count is wrong), plus the other objects on the photo.
+2. **Step 2, AFTER:** upload the after photo, click **2. Check AFTER**: ok / MISSING / fewer / more per item, and the
+   objects that are new since the before photo.
+
+You can skip step 1 by typing the inventory yourself (`pillow 4, towel 2`). **single**, **hybrid** or **both**
+applies to both steps. Your 79 frozen rooms are clickable examples. The link lives while the cell runs.
 `DEMO_LORA=ThunderBlade7773/qwen3vl-room-lora-v2` for another run.
 
 ## Bench: compare models and ways of counting, no training (~2-2.5 h)
